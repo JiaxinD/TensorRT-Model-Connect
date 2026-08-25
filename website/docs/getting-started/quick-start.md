@@ -31,6 +31,11 @@ The bounded cache profile is intended for the first portable native-attention
 build. The first build may download model files and compile TensorRT engines.
 `qwen3-0.6b.bundle` is the runnable output.
 
+This native-KV path is blocked on SM121 with TensorRT ABI 11.1 or 11.2 because
+the affected combination can build an engine that produces incorrect output.
+See [Limitations / Known Issues](../release-support/known-issues.md) for the
+exact boundary and alternatives.
+
 ## 3. Inspect the bundle
 
 ```bash

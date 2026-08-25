@@ -10,6 +10,8 @@ Qwen3 modes fail closed. Other Qwen variants retain their legacy graph routes.
 
 from __future__ import annotations
 
+from tensorrt_model_connect import trt_compat
+
 from .config import ModelConfig
 from .checkpoint_mapper import WeightDict, load_standard_weights
 from ...parallel_config import ParallelConfig, normalize_parallel_config
@@ -18,6 +20,7 @@ from .build_routing import (
     native_kv_architecture_capability,
     native_kv_build_capability,
     native_kv_cache_geometry,
+    validate_native_kv_platform,
 )
 from .native_kv_contract import validate_native_kv_weights
 from .dual_profile_decoder_builder import build_dual_profile_decoder_engine
@@ -136,8 +139,13 @@ class QwenPlugin:
         """Keep quantized Qwen routes on the family-owned single-engine path."""
         return not bool(config.raw.get("_quantized_build_requested"))
 
-    def validate_build_request(self, config: ModelConfig) -> None:
-        """Reject Qwen3 runtime-sized KV before loading checkpoint weights."""
+    def validate_build_request(
+        self,
+        config: ModelConfig,
+        *,
+        native_kv_requested: bool | None = None,
+    ) -> None:
+        """Reject unsafe Qwen3 native-KV requests before loading weights."""
         if str(config.model_type).lower() != "qwen3":
             return
         if (
@@ -149,6 +157,20 @@ class QwenPlugin:
                 "--dynamic-kv-cache or set dynamic_kv_cache=False to use "
                 "the fixed-capacity native KV path"
             )
+        if native_kv_requested is None:
+            precision = str(
+                config.raw.get("_resolved_build_precision", "")
+            ).lower()
+            native_kv_requested = (
+                not config.raw.get("_quantized_build_requested")
+                and not config.raw.get("_parallel_build_enabled")
+                and not config.raw.get("_rtx_build_requested")
+                and (not precision or precision in {"fp16", "bf16"})
+                and native_kv_architecture_capability(config).eligible
+            )
+        if not native_kv_requested:
+            return
+        validate_native_kv_platform(tensorrt_abi=trt_compat.tensorrt_abi())
 
     def load_weights(
         self, model_dir: str, config: ModelConfig,
@@ -164,7 +186,6 @@ class QwenPlugin:
     ) -> bytes:
         parallel = normalize_parallel_config(parallel_config)
         config.raw.pop("_native_kv_cache_metadata", None)
-        self.validate_build_request(config)
         capability = native_kv_build_capability(
             config,
             precision=precision,
@@ -172,6 +193,10 @@ class QwenPlugin:
             parallel_enabled=parallel.enabled,
             quantized=quant_ctx is not None,
             debug_layer_outputs=debug_layer_outputs,
+        )
+        self.validate_build_request(
+            config,
+            native_kv_requested=capability.eligible,
         )
         qualified_fp8 = _uses_qualified_qwen3_fp8_path(
             config,

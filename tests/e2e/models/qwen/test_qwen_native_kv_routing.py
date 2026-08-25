@@ -14,11 +14,14 @@ from types import SimpleNamespace
 import pytest
 
 from tensorrt_model_connect.families.qwen.build_routing import (
+    active_cuda_compute_capability,
     native_kv_architecture_capability,
     native_kv_build_capability,
     native_kv_cache_geometry,
+    native_kv_platform_capability,
     prefer_native_default,
     resolved_head_dim,
+    validate_native_kv_platform,
 )
 from tensorrt_model_connect.families.qwen.config import ModelConfig
 from tensorrt_model_connect.families.qwen.native_kv_contract import (
@@ -212,6 +215,80 @@ def test_unqualified_build_modes_fail_closed(kwargs, raw_updates, reason):
     assert reason in decision.reason
 
 
+@pytest.mark.parametrize(
+    ("compute_capability", "tensorrt_abi", "eligible"),
+    [
+        ((12, 1), "11.1", False),
+        ((12, 1), "11.2", False),
+        ((12, 0), "11.2", True),
+        ((10, 3), "11.2", True),
+        ((12, 1), "11.0", True),
+        ((12, 1), "12.0", True),
+        ((12, 1), "", False),
+    ],
+    ids=(
+        "sm121-trt-11.1",
+        "sm121-trt-11.2",
+        "sm120-trt-11.2",
+        "sm103-trt-11.2",
+        "sm121-trt-11.0",
+        "sm121-trt-12.0",
+        "sm121-trt-unknown",
+    ),
+)
+def test_native_kv_platform_rejects_only_confirmed_unsafe_combinations(
+    compute_capability,
+    tensorrt_abi,
+    eligible,
+):
+    decision = native_kv_platform_capability(
+        compute_capability=compute_capability,
+        tensorrt_abi=tensorrt_abi,
+    )
+
+    assert decision.eligible is eligible
+    if not eligible:
+        assert "incorrect output" in decision.reason
+        assert "#955" in decision.reason
+
+
+def test_active_cuda_compute_capability_reads_process_device():
+    runtime = SimpleNamespace(
+        cudaError_t=SimpleNamespace(cudaSuccess=0),
+        cudaGetDevice=lambda: (0, 3),
+        cudaGetDeviceProperties=lambda device: (
+            0,
+            SimpleNamespace(major=12, minor=1) if device == 3 else None,
+        ),
+    )
+
+    assert active_cuda_compute_capability(runtime) == (12, 1)
+
+
+def test_active_cuda_compute_capability_fails_closed_on_probe_error():
+    runtime = SimpleNamespace(
+        cudaError_t=SimpleNamespace(cudaSuccess=0),
+        cudaGetDevice=lambda: (17, None),
+    )
+
+    with pytest.raises(RuntimeError, match="cudaGetDevice failed with status 17"):
+        active_cuda_compute_capability(runtime)
+
+
+def test_native_kv_platform_validation_rejects_unsafe_active_device():
+    runtime = SimpleNamespace(
+        cudaError_t=SimpleNamespace(cudaSuccess=0),
+        cudaGetDevice=lambda: (0, 0),
+        cudaGetDeviceProperties=lambda _device: (
+            0,
+            SimpleNamespace(major=12, minor=1),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="SM121.*TensorRT ABI 11.2.*incorrect output"):
+        validate_native_kv_platform(runtime=runtime, tensorrt_abi="11.2")
+
+
 @dataclass
 class _Tensor:
     shape: tuple[int, ...]
@@ -394,6 +471,69 @@ def test_qwen3_dynamic_kv_fails_before_legacy_builder(monkeypatch):
     assert plugin_module.plugin.get_bundle_config_overrides(config) is None
 
 
+def test_qwen3_sm121_guard_runs_in_plugin_validation(monkeypatch):
+    pytest.importorskip("tensorrt")
+    plugin_module = importlib.import_module(
+        "tensorrt_model_connect.families.qwen.plugin"
+    )
+    routing_module = importlib.import_module(
+        "tensorrt_model_connect.families.qwen.build_routing"
+    )
+    config = _small_config()
+    config.raw["_resolved_build_precision"] = "bf16"
+
+    monkeypatch.setattr(
+        routing_module,
+        "active_cuda_compute_capability",
+        lambda: (12, 1),
+    )
+    monkeypatch.setattr(plugin_module.trt_compat, "tensorrt_abi", lambda: "11.2")
+
+    with pytest.raises(ValueError, match="SM121.*incorrect output"):
+        plugin_module.plugin.validate_build_request(config)
+
+
+def _simulate_unsafe_sm121(monkeypatch, plugin_module):
+    routing_module = importlib.import_module(
+        "tensorrt_model_connect.families.qwen.build_routing"
+    )
+    monkeypatch.setattr(
+        routing_module,
+        "active_cuda_compute_capability",
+        lambda: (12, 1),
+    )
+    monkeypatch.setattr(plugin_module.trt_compat, "tensorrt_abi", lambda: "11.2")
+
+
+@pytest.mark.parametrize(
+    "raw_updates",
+    [
+        {"_quantized_build_requested": True},
+        {"_parallel_build_enabled": True},
+        {"_resolved_build_precision": "fp32"},
+    ],
+    ids=("quantized", "tensor-parallel", "fp32"),
+)
+def test_non_native_qwen3_requests_skip_platform_guard(monkeypatch, raw_updates):
+    pytest.importorskip("tensorrt")
+    plugin_module = importlib.import_module(
+        "tensorrt_model_connect.families.qwen.plugin"
+    )
+    config = _small_config()
+    config.raw.update(raw_updates)
+
+    def _unexpected_validation(**_kwargs):
+        raise AssertionError("non-native Qwen3 request must not use the platform guard")
+
+    monkeypatch.setattr(
+        plugin_module,
+        "validate_native_kv_platform",
+        _unexpected_validation,
+    )
+
+    plugin_module.plugin.validate_build_request(config)
+
+
 def test_qwen3_qualified_fp8_uses_family_quantized_builder(monkeypatch):
     pytest.importorskip("tensorrt")
     plugin_module = importlib.import_module(
@@ -404,6 +544,7 @@ def test_qwen3_qualified_fp8_uses_family_quantized_builder(monkeypatch):
     config.raw["_native_kv_cache_metadata"] = {"stale": True}
     quant_ctx = _quant_ctx("fp8")
     captured: dict[str, object] = {}
+    _simulate_unsafe_sm121(monkeypatch, plugin_module)
 
     def _build(*args, **kwargs):
         captured.update(args=args, kwargs=kwargs)
@@ -439,6 +580,7 @@ def test_qwen3_qualified_fp8_retains_tensor_parallel_builder(monkeypatch):
     quant_ctx = _quant_ctx("fp8")
     parallel = ParallelConfig(mode="tensor_parallel", tp_size=4, rank=0)
     captured: dict[str, object] = {}
+    _simulate_unsafe_sm121(monkeypatch, plugin_module)
 
     def _build(*args, **kwargs):
         captured.update(args=args, kwargs=kwargs)

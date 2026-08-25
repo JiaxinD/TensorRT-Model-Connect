@@ -21,6 +21,12 @@ description: Current boundaries that users must account for when interpreting fe
   TP/CP flags do not establish blanket support.
 - The public detection API does not establish a supported detector without a
   model-owned runtime strategy and E2E manifest.
+- Qwen3 native-KV builds are blocked on SM121 with TensorRT ABI 11.1 or 11.2.
+  Engines for this combination can build successfully but produce incorrect
+  output ([issue #955](https://github.com/NVIDIA/TensorRT-Model-Connect/issues/955)).
+  Use a different supported GPU or backend for Qwen3 on SM121. Qwen2 and
+  Qwen2.5 routes, SM120 and SM103, and qualified FP8 routes are not
+  covered by this restriction.
 
 Use the current source, exact manifest, and test evidence when this page and a
 newer implementation differ.

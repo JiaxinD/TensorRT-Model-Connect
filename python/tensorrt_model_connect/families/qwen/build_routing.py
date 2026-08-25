@@ -10,6 +10,7 @@ import operator
 
 _INT32_MAX = (1 << 31) - 1
 _UINT64_MAX = (1 << 64) - 1
+_UNSAFE_NATIVE_KV_TRT_ABIS = {(12, 1): frozenset({"11.1", "11.2"})}
 
 
 class NativeKvCapability:
@@ -38,6 +39,91 @@ def _result(
         applicable and not reasons,
         "; ".join(reasons) or "supported",
     )
+
+
+def native_kv_platform_capability(
+    *,
+    compute_capability: tuple[int, int],
+    tensorrt_abi: str,
+) -> NativeKvCapability:
+    """Reject target/runtime pairs known to produce incorrect native-KV output."""
+
+    unsupported_abis = _UNSAFE_NATIVE_KV_TRT_ABIS.get(compute_capability, ())
+    if unsupported_abis and not tensorrt_abi:
+        return _result(
+            reasons=[
+                "Qwen3 native KV cannot determine the TensorRT ABI on SM121; "
+                "TensorRT ABI 11.1 and 11.2 can produce incorrect output. Use "
+                "a different supported GPU or backend; see GitHub issue #955"
+            ]
+        )
+    if tensorrt_abi not in unsupported_abis:
+        return _result()
+    sm = f"SM{compute_capability[0]}{compute_capability[1]}"
+    return _result(
+        reasons=[
+            f"Qwen3 native KV on {sm} with TensorRT ABI {tensorrt_abi} "
+            "can produce incorrect output. Use a different supported GPU or "
+            "backend for Qwen3 on SM121; see GitHub issue #955"
+        ]
+    )
+
+
+def active_cuda_compute_capability(runtime: object | None = None) -> tuple[int, int]:
+    """Return the active CUDA device's validated compute capability."""
+
+    if runtime is None:
+        try:
+            from cuda.bindings import runtime as binding_runtime
+
+            runtime = binding_runtime
+        except ImportError:
+            try:
+                from cuda import cudart
+
+                runtime = cudart
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Qwen3 native KV target validation requires CUDA Python"
+                ) from exc
+
+    success = getattr(getattr(runtime, "cudaError_t", None), "cudaSuccess", 0)
+    try:
+        status, device = runtime.cudaGetDevice()
+        if status not in (success, 0):
+            raise RuntimeError(f"cudaGetDevice failed with status {status}")
+        status, properties = runtime.cudaGetDeviceProperties(int(device))
+        if status not in (success, 0):
+            raise RuntimeError(
+                f"cudaGetDeviceProperties({device}) failed with status {status}"
+            )
+        major = getattr(properties, "major", None)
+        minor = getattr(properties, "minor", None)
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            f"Unable to inspect the active CUDA device for Qwen3 native KV: {exc}"
+        ) from exc
+
+    if type(major) is not int or type(minor) is not int or major <= 0 or minor < 0:
+        raise RuntimeError("CUDA returned an invalid compute capability")
+    return major, minor
+
+
+def validate_native_kv_platform(
+    *,
+    tensorrt_abi: str,
+    runtime: object | None = None,
+) -> None:
+    """Fail before build when the active target has a known correctness defect."""
+
+    decision = native_kv_platform_capability(
+        compute_capability=active_cuda_compute_capability(runtime),
+        tensorrt_abi=tensorrt_abi,
+    )
+    if not decision.eligible:
+        raise ValueError(decision.reason)
 
 
 def _raw(config: object) -> dict:

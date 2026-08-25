@@ -33,6 +33,11 @@ trtmc run ./qwen3-0.6b.bundle --prompt "What is the capital of France? Answer in
 # Generated text: Paris
 ```
 
+Qwen3 native-KV builds are blocked on SM121 with TensorRT ABI 11.1 or 11.2
+because that combination can produce incorrect output. See
+[Known Issues](https://nvidia.github.io/TensorRT-Model-Connect/release-support/known-issues)
+for the exact boundary and alternatives.
+
 The same bundle works from
 [C++](https://nvidia.github.io/TensorRT-Model-Connect/api/cpp-api):
 
