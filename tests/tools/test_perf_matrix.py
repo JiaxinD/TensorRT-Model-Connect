@@ -62,6 +62,7 @@ TASK_ADAPTERS = {
     "locateanything.generate": "hf-transformers-vlm",
     "magpie_tts.generate_audio": "nemo-tts",
     "nemotron_speech_streaming.transcribe": "nemo-asr",
+    "parakeet_tdt.transcribe": "hf-transformers-asr",
     "patchtsmixer.solve": "pytorch-timeseries",
     "patchtst.solve": "pytorch-timeseries",
     "personaplex.speak": "pytorch-personaplex",
@@ -296,8 +297,8 @@ def test_release_suite_covers_every_non_l0_ready_model_profile() -> None:
         "rerank",
     ]
     assert Counter(perf_matrix._candidate_timing_scope(case) for case in cases) == {
-        "model_call_wall": 25,
-        "public_pipeline_call_wall": 86,
+        "model_call_wall": 26,
+        "public_pipeline_call_wall": 85,
     }
     assert {case["id"] for case in cases if case["baseline"]["asset_loading_included"]} == {
         "canary.transcribe",
@@ -321,6 +322,21 @@ def test_release_suite_covers_every_non_l0_ready_model_profile() -> None:
         "intrinsics": "assets/demo_0_intrinsics.npy",
     }
     assert by_id["sana_wm.generate_image"]["baseline"]["python_profile"] == "sana_wm_reference"
+    parakeet_baseline = by_id["parakeet_tdt.transcribe"]["baseline"]
+    assert {
+        key: parakeet_baseline[key]
+        for key in ("runner", "adapter", "mode", "reference_backend")
+    } == {
+        "runner": "task-reference",
+        "adapter": "hf-transformers-asr",
+        "mode": "hf-eager",
+        "reference_backend": "hf_transformers",
+    }
+    assert parakeet_baseline["adapter_options"] == {
+        "auto_model_class": "AutoModelForTDT"
+    }
+    assert parakeet_baseline["timing_scope"] == "task-model-call-wall"
+    assert parakeet_baseline["input_preparation_included"] is False
     locateanything_baseline = by_id["locateanything.generate"]["baseline"]
     assert locateanything_baseline["output_contract"] == "localization"
     assert locateanything_baseline["min_localization_box_iou"] == 0.9
