@@ -127,8 +127,8 @@ class ModelConfig:
 
         # Handle non-standard config key names:
         #   GPT-2: n_embd, n_head, n_layer, n_inner
-        #   Decoder variants: d_model, attention_heads, num_layers, ffn_dim
-        #   Encoder variants: dim, n_heads, n_layers, hidden_dim
+        #   XGLM/Bloom: d_model, attention_heads, num_layers, ffn_dim
+        #   DistilBERT: dim, n_heads, n_layers, hidden_dim
         hidden_size = (d.get("hidden_size", 0) or d.get("n_embd", 0)
                        or d.get("d_model", 0) or d.get("n_embed", 0)
                        or d.get("dim", 0))
@@ -213,16 +213,5 @@ class ModelConfig:
         model_path = Path(model_dir)
         config_path = model_path / "config.json"
         if config_path.exists():
-            config = ModelConfig.from_json(config_path.read_text())
-            config.raw["_model_dir"] = str(model_path)
-            return config
-
-        from .families import resolve_config_from_model_dir
-
-        family_config = resolve_config_from_model_dir(model_path)
-        if family_config is not None:
-            config = ModelConfig.from_json(json.dumps(family_config))
-            config.raw["_model_dir"] = str(model_path)
-            return config
-
+            return ModelConfig.from_json(config_path.read_text())
         return ModelConfig.from_json(config_path.read_text())

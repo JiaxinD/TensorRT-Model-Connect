@@ -67,6 +67,7 @@ TASK_ADAPTERS = {
     "personaplex.speak": "pytorch-personaplex",
     "phi4_multimodal.generate": "hf-transformers-vlm",
     "pixart.generate_image": "hf-diffusers",
+    "qwen3_embedding.embed": "hf-transformers-embedding",
     "qwen3_omni.generate_audio": "hf-qwen3-omni",
     "qwen_image.generate_image": "hf-diffusers",
     "qwen_vl.generate": "hf-transformers-vlm",
@@ -296,8 +297,8 @@ def test_release_suite_covers_every_non_l0_ready_model_profile() -> None:
         "rerank",
     ]
     assert Counter(perf_matrix._candidate_timing_scope(case) for case in cases) == {
-        "model_call_wall": 25,
-        "public_pipeline_call_wall": 86,
+        "model_call_wall": 26,
+        "public_pipeline_call_wall": 85,
     }
     assert {case["id"] for case in cases if case["baseline"]["asset_loading_included"]} == {
         "canary.transcribe",
@@ -2662,6 +2663,10 @@ def test_suite_has_explicit_eager_and_task_reference_rows() -> None:
     assert rows["pixart.generate_image"]["baseline"]["adapter_options"] == {
         "component_precision_contract": "pixart_fp16_dit_fp32_t5"
     }
+    assert rows["qwen3_embedding.embed"]["baseline"]["adapter_options"] == {
+        "append_eos": True,
+        "pooling": "last_token",
+    }
     assert "adapter_options" not in rows["flux.generate_image"]["baseline"]
     assert not any(row["baseline"]["runner"] == "unsupported" for row in rows.values())
     assert {
@@ -2847,6 +2852,66 @@ def test_task_reference_uses_manifest_reference_precision(tmp_path: Path) -> Non
     )
 
     assert argv[argv.index("--precision") + 1] == "bf16"
+
+
+def test_task_reference_embedding_pooling_supports_last_valid_token() -> None:
+    torch = pytest.importorskip("torch")
+    runner = runpy.run_path(
+        str(REPOSITORY / "benchmarks/performance/baselines/task_reference.py")
+    )
+    hidden = torch.tensor(
+        [
+            [[1.0, 0.0], [0.0, 2.0], [9.0, 9.0]],
+            [[9.0, 9.0], [3.0, 0.0], [0.0, 4.0]],
+        ]
+    )
+    attention_mask = torch.tensor([[1, 1, 0], [0, 1, 1]])
+
+    pooled = runner["_pool_embedding"](
+        torch,
+        hidden,
+        attention_mask,
+        pooling="last_token",
+    )
+
+    assert torch.allclose(pooled, torch.tensor([[0.0, 1.0], [0.0, 1.0]]))
+
+
+def test_task_reference_embedding_pooling_keeps_mean_as_default() -> None:
+    torch = pytest.importorskip("torch")
+    runner = runpy.run_path(
+        str(REPOSITORY / "benchmarks/performance/baselines/task_reference.py")
+    )
+    hidden = torch.tensor([[[1.0, 0.0], [0.0, 1.0], [9.0, 9.0]]])
+    attention_mask = torch.tensor([[1, 1, 0]])
+
+    pooled = runner["_pool_embedding"](
+        torch,
+        hidden,
+        attention_mask,
+        pooling="mean",
+    )
+
+    expected = torch.tensor([[2**-0.5, 2**-0.5]])
+    assert torch.allclose(pooled, expected)
+
+
+def test_task_reference_embedding_can_require_final_eos() -> None:
+    torch = pytest.importorskip("torch")
+    runner = runpy.run_path(
+        str(REPOSITORY / "benchmarks/performance/baselines/task_reference.py")
+    )
+    inputs = {
+        "input_ids": torch.tensor([[10, 11]]),
+        "attention_mask": torch.tensor([[1, 1]]),
+    }
+
+    appended = runner["_ensure_final_eos"](torch, inputs, eos_token_id=12)
+    preserved = runner["_ensure_final_eos"](torch, appended, eos_token_id=12)
+
+    assert appended["input_ids"].tolist() == [[10, 11, 12]]
+    assert appended["attention_mask"].tolist() == [[1, 1, 1]]
+    assert preserved["input_ids"].tolist() == [[10, 11, 12]]
 
 
 def test_entry_is_the_only_run_selection() -> None:
