@@ -6,6 +6,7 @@
 #include "runtime/models/parakeet_tdt/tdt_config.h"
 
 #include <iostream>
+#include <stdexcept>
 
 namespace {
 
@@ -36,12 +37,45 @@ void test_zero_duration_nonblank_stays_on_frame() {
     check(decision.frame_advance == 0, "zero-duration nonblank must stay on the frame");
 }
 
+void test_invalid_duration_index_is_rejected() {
+    bool threw = false;
+    try {
+        (void)trtmc::make_tdt_greedy_decision(7, 3, {0, 1, 2}, 9);
+    } catch (const std::out_of_range&) {
+        threw = true;
+    }
+    check(threw, "duration indices outside the table must throw");
+}
+
+void test_negative_duration_is_rejected() {
+    bool threw = false;
+    try {
+        (void)trtmc::make_tdt_greedy_decision(7, 1, {0, -1, 2}, 9);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    check(threw, "negative duration values must throw");
+}
+
+void test_streaming_schedule_derives_timing_and_cache_geometry() {
+    const auto schedule = trtmc::make_tdt_streaming_schedule(20, 3, 8000, 80, 4);
+    check(schedule.encoder_frame_ms == 40, "encoder frame timing derives from hop and stride");
+    check(schedule.chunk_samples == 1280, "chunk samples derive from schedule timing");
+    check(schedule.next_pre_encode_cache_mel_frames == 5,
+          "pre-encode cache derives from subsampling");
+    check(schedule.drop_extra_pre_encoded == 2,
+          "pre-encode drop derives from cache overlap");
+}
+
 } // namespace
 
 int main() {
     test_duration_value_controls_frame_advance();
     test_zero_duration_blank_forces_progress_without_emit();
     test_zero_duration_nonblank_stays_on_frame();
+    test_invalid_duration_index_is_rejected();
+    test_negative_duration_is_rejected();
+    test_streaming_schedule_derives_timing_and_cache_geometry();
     if (failures) {
         std::cerr << failures << " TDT decode policy test(s) failed\n";
         return 1;

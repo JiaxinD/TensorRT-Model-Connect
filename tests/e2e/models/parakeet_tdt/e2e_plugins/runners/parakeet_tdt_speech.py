@@ -177,9 +177,9 @@ class SpeechToTextRunner:
         audio_input = (case.inputs.get("audio") or case.inputs.get("audio_path")
                        or case.metadata.get("test_input_audio", ""))
         if audio_input and not os.path.isabs(audio_input):
-            # Resolve relative to project's tests/e2e/ directory
-            e2e_dir = Path(__file__).resolve().parents[2] / "e2e"
-            audio_input = str(e2e_dir / audio_input)
+            # Manifest audio paths are owned by this model family.
+            model_dir = Path(__file__).resolve().parents[2]
+            audio_input = str(model_dir / audio_input)
 
         max_new_tokens = case.inputs.get("max_new_tokens", 100)
 

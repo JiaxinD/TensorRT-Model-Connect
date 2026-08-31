@@ -83,6 +83,7 @@ inline TdtStreamingSchedule make_tdt_streaming_schedule(int32_t left, int32_t ri
     out.att_context_left = left;
     out.att_context_right = right;
     out.subsampling_factor = subsampling;
+    out.encoder_frame_ms = hop * subsampling * 1000 / sample_rate;
     out.valid_encoder_frames = right + 1;
     out.chunk_ms = out.valid_encoder_frames * out.encoder_frame_ms;
     out.chunk_samples = sample_rate * out.chunk_ms / 1000;
@@ -90,6 +91,9 @@ inline TdtStreamingSchedule make_tdt_streaming_schedule(int32_t left, int32_t ri
     out.next_chunk_mel_frames = subsampling * out.valid_encoder_frames;
     out.first_shift_mel_frames = out.first_chunk_mel_frames;
     out.next_shift_mel_frames = out.next_chunk_mel_frames;
+    out.next_pre_encode_cache_mel_frames = subsampling + 1;
+    out.drop_extra_pre_encoded =
+        out.next_pre_encode_cache_mel_frames - (subsampling - 1);
     return out;
 }
 

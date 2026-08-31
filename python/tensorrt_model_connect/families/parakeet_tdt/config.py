@@ -62,7 +62,12 @@ class ParakeetTDTConfig:
 
     @classmethod
     def from_dir(cls, model_dir: str | Path) -> "ParakeetTDTConfig":
-        return cls.from_json((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
+        config_path = Path(model_dir) / "config.json"
+        if not config_path.is_file():
+            raise FileNotFoundError(
+                f"Parakeet TDT model directory is missing config.json: {config_path}"
+            )
+        return cls.from_json(config_path.read_text(encoding="utf-8"))
 
     def validate_supported_checkpoint(self) -> None:
         expected = {

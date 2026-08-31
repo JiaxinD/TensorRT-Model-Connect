@@ -20,13 +20,14 @@ from ..contracts import E2ECase, RunContext, StageOutput, StageSpec
 
 PROJECT_DIR = Path(__file__).resolve().parents[6]
 E2E_DIR = PROJECT_DIR / "tests" / "e2e"
+MODEL_DIR = Path(__file__).resolve().parents[2]
 
 
 def _resolve_audio_path(value: str) -> str:
     path = Path(value)
     if path.is_file():
         return str(path.resolve())
-    for base in (E2E_DIR, PROJECT_DIR):
+    for base in (MODEL_DIR, E2E_DIR, PROJECT_DIR):
         candidate = base / path
         if candidate.is_file():
             return str(candidate.resolve())

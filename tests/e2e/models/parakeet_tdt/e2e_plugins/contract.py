@@ -68,7 +68,6 @@ def strip_chat_markup(text: str) -> str:
             cut = min(cut, idx)
     if cut < len(out):
         out = out[:cut]
-    import re
     out = re.sub(r"(?:\s*#{2,}\s*)+$", "", out).strip()
     return out
 

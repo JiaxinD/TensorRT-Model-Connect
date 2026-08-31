@@ -85,12 +85,50 @@ def resolve_nemo_archive(nemo_path: Path) -> str | None:
     hidden = _cfg_int(enc_cfg.get("d_model"), defaults.get("enc_hidden"), default=1024)
     pred_layers = _cfg_int(prednet.get("pred_rnn_layers"), default=1)
     pred_hidden = _cfg_int(prednet.get("pred_hidden"), defaults.get("pred_hidden"), default=640)
-    vocab_size = _cfg_int(cfg.get("vocab_size"), defaults.get("vocab_size"), default=1024)
+    encoder_layers = _cfg_int(enc_cfg.get("n_layers"), default=24)
+    encoder_heads = _cfg_int(enc_cfg.get("n_heads"), default=8)
+    ffn_expansion = _cfg_int(enc_cfg.get("ff_expansion_factor"), default=4)
+    conv_kernel = _cfg_int(enc_cfg.get("conv_kernel_size"), default=9)
+    subsampling_channels = _cfg_int(
+        enc_cfg.get("subsampling_conv_channels"), default=256
+    )
+    preprocessor = cfg.get("preprocessor", {})
+    num_mel_bins = _cfg_int(preprocessor.get("features"), default=128)
+    decoding = cfg.get("decoding", {})
+    max_symbols = _cfg_int(decoding.get("max_symbols_per_step"), default=10)
+    durations = cfg.get("tdt_durations", decoding.get("durations", [0, 1, 2, 3, 4]))
+    blank_id = _cfg_int(dec_cfg.get("blank_idx"), default=8192)
+    vocab_size = _cfg_int(
+        cfg.get("vocab_size"), defaults.get("vocab_size"), default=blank_id + 1
+    )
+    if vocab_size <= blank_id:
+        vocab_size = blank_id + 1
+    joint = cfg.get("joint", {})
+    jointnet = joint.get("jointnet", {}) if isinstance(joint, dict) else {}
 
     tmp_dir = tempfile.mkdtemp(prefix="trtmc_nemo_parakeet_tdt_")
     tmp_path = Path(tmp_dir)
     synthetic_config = {
         "model_type": "parakeet_tdt",
+        "architectures": ["ParakeetForTDT"],
+        "blank_token_id": blank_id,
+        "pad_token_id": _cfg_int(cfg.get("pad_id"), default=2),
+        "durations": [int(value) for value in durations],
+        "max_symbols_per_step": max_symbols,
+        "decoder_hidden_size": pred_hidden,
+        "num_decoder_layers": pred_layers,
+        "hidden_act": str(jointnet.get("activation", "relu")),
+        "encoder_config": {
+            "hidden_size": hidden,
+            "num_hidden_layers": encoder_layers,
+            "num_attention_heads": encoder_heads,
+            "intermediate_size": hidden * ffn_expansion,
+            "conv_kernel_size": conv_kernel,
+            "max_position_embeddings": _cfg_int(enc_cfg.get("max_len"), default=5000),
+            "num_mel_bins": num_mel_bins,
+            "subsampling_conv_channels": subsampling_channels,
+            "subsampling_factor": _cfg_int(enc_cfg.get("subsampling_factor"), default=8),
+        },
         "hidden_size": hidden,
         "num_hidden_layers": pred_layers,
         "num_attention_heads": 1,

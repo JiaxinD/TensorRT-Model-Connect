@@ -355,7 +355,7 @@ def add_attention_core(
 ) -> trt.ITensor:
     """Scaled dot-product attention via TRT native IAttention layer.
 
-    Replaces the manual Q@K^T 闁?scale 闁?softmax 闁?@V chain.  TRT 10 fuses
+    Replaces the manual Q@K^T -> scale -> softmax -> @V chain. TRT 10 fuses
     this into a single kernel when a compatible implementation is available;
     decomposable=True ensures a correct fallback to primitives otherwise.
 

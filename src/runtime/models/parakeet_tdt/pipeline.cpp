@@ -122,6 +122,10 @@ void validate_tdt_core_config(const TdtConfig& config, const MelFilterbank& mel_
     if (config.encoder_hidden_size <= 0 || config.pred_hidden_size <= 0 ||
         config.pred_num_layers <= 0)
         throw std::runtime_error("TdtPipeline: invalid TDT dimensions in config");
+    if (config.sample_rate <= 0 || config.mel_hop_length <= 0)
+        throw std::runtime_error("TdtPipeline: sample rate and mel hop length must be positive");
+    if (config.max_symbols_per_step <= 0)
+        throw std::runtime_error("TdtPipeline: max_symbols_per_step must be positive");
     if (config.blank_id < 0)
         throw std::runtime_error("TdtPipeline: invalid blank token id");
 }
@@ -437,9 +441,12 @@ TdtPipeline::TdtPipeline(std::unique_ptr<TrtModule> encoder, std::unique_ptr<Trt
       prompt_kernel_(std::move(prompt_kernel)),
       streaming_encoder_sections_(std::move(streaming_encoder_sections)),
       streaming_first_encoder_sections_(std::move(streaming_first_encoder_sections)),
-      backend_(backend), module_options_(module_options), bundle_path_(std::move(bundle_path)),
+      backend_(backend),
+      runtime_cache_path_(module_options.runtime_cache_path ? module_options.runtime_cache_path : ""),
+      module_options_(module_options), bundle_path_(std::move(bundle_path)),
       config_(std::move(config)), mel_fb_(std::make_unique<MelFilterbank>(std::move(mel_fb))),
       stream_(stream), tokenizer_(std::move(tokenizer)), model_id_(std::move(model_id_str)) {
+    module_options_.runtime_cache_path = runtime_cache_path_.c_str();
     validate_tdt_module(encoder_, "encoder");
     validate_tdt_module(predictor_, "predictor");
     validate_tdt_module(joint_, "joint");
@@ -482,6 +489,8 @@ std::vector<float> TdtPipeline::run_prompt_kernel(const float* encoder_frame) {
     auto it = outputs.find("prompt_kernel_output");
     if (it == outputs.end())
         throw std::runtime_error("TdtPipeline: prompt_kernel missing 'prompt_kernel_output'");
+    if (it->second.numel() != config_.encoder_hidden_size)
+        throw std::runtime_error("TdtPipeline: prompt_kernel output size does not match config");
     const auto* src = static_cast<const float*>(it->second.data);
     const auto count = static_cast<std::size_t>(it->second.numel());
     return std::vector<float>(src, src + count);
@@ -503,35 +512,9 @@ void TdtPipeline::setup_prompt_state(const std::string& language) {
 
 std::unique_ptr<ITranscriptionStream>
 TdtPipeline::create_transcription_stream(const TranscriptionStreamConfig& cfg) {
-    (void)make_tdt_streaming_schedule(cfg.att_context_left, cfg.att_context_right,
-                                      cfg.input_sample_rate, config_.mel_hop_length,
-                                      config_.subsampling_factor);
-
-    setup_prompt_state(cfg.language);
-
-    if (cfg.online_normalization)
-        throw std::runtime_error("TDT streaming transcription does not support "
-                                 "online_normalization for this checkpoint");
-    if (!cfg.use_cache || !cfg.use_feature_cache)
-        throw std::runtime_error("TDT streaming transcription parity requires both encoder cache "
-                                 "and feature cache to match NeMo cache-aware streaming");
-    if (streaming_encoders_.find(cfg.att_context_right) == streaming_encoders_.end() &&
-        streaming_encoder_sections_.find(cfg.att_context_right) ==
-            streaming_encoder_sections_.end()) {
-        throw std::runtime_error(
-            "TDT cache-aware streaming requires a bundle with streaming encoder cache "
-            "inputs/outputs for the requested att_context_size");
-    }
-    if (!cfg.pad_and_drop_preencoded &&
-        streaming_first_encoders_.find(cfg.att_context_right) == streaming_first_encoders_.end() &&
-        streaming_first_encoder_sections_.find(cfg.att_context_right) ==
-            streaming_first_encoder_sections_.end()) {
-        throw std::runtime_error(
-            "TDT cache-aware streaming requires a first-step streaming encoder plan for "
-            "NeMo pad_and_drop_preencoded=false parity");
-    }
-    (void)streaming_encoder_for(cfg.att_context_right, !cfg.pad_and_drop_preencoded);
-    return std::make_unique<TdtTranscriptionStream>(*this, cfg);
+    (void)cfg;
+    throw std::runtime_error(
+        "Parakeet TDT v3 only provides an offline encoder; streaming transcription is unsupported");
 }
 
 TextResult TdtPipeline::transcribe(const float* audio_data, int32_t num_samples,
@@ -654,6 +637,9 @@ std::vector<float> TdtPipeline::run_encoder(const std::vector<float>& mel, int32
     auto it = outputs.find("encoder_output");
     if (it == outputs.end())
         throw std::runtime_error("TdtPipeline: encoder missing 'encoder_output'");
+    if (it->second.numel() <= 0 ||
+        it->second.numel() % config_.encoder_hidden_size != 0)
+        throw std::runtime_error("TdtPipeline: encoder output size does not match config");
     const auto frames = infer_encoder_frames(it->second, config_.encoder_hidden_size);
     const auto valid_frames = std::min(
         frames, std::max(1, subsampled_frame_count(actual_frames, config_.causal_downsampling)));
@@ -734,6 +720,11 @@ std::vector<float> TdtPipeline::run_streaming_encoder(
     if (enc_it == outputs.end() || ch_it == outputs.end() || tm_it == outputs.end())
         throw std::runtime_error("TdtPipeline: streaming encoder missing required outputs");
 
+    const auto expected_encoder =
+        static_cast<int64_t>(query_frames) * config_.encoder_hidden_size;
+    if (enc_it->second.numel() != expected_encoder)
+        throw std::runtime_error("TdtPipeline: streaming encoder output size does not match config");
+
     const auto* enc_src = static_cast<const float*>(enc_it->second.data);
     const auto enc_count = static_cast<std::size_t>(query_frames) * config_.encoder_hidden_size;
     std::vector<float> enc(enc_src, enc_src + enc_count);
@@ -762,6 +753,7 @@ void TdtPipeline::decode_encoder_frames(const std::vector<float>& encoder_output
             projected = run_prompt_kernel(enc_ptr);
             enc_frame = projected.data();
         }
+        int32_t symbols_on_frame = 0;
         while (static_cast<int32_t>(emitted.size()) < token_limit) {
             const auto logits = run_joint(enc_frame, pred_output.data());
             const auto token_count = static_cast<std::size_t>(config_.blank_id + 1);
@@ -778,11 +770,16 @@ void TdtPipeline::decode_encoder_frames(const std::vector<float>& encoder_output
                 token, duration_index, config_.duration_values, config_.blank_id);
             if (decision.emit_token) {
                 emitted.push_back(token);
+                ++symbols_on_frame;
                 pred_output = run_predictor(token, state_h, state_c);
             }
             frame += decision.frame_advance;
             if (decision.frame_advance > 0)
                 break;
+            if (symbols_on_frame >= config_.max_symbols_per_step) {
+                ++frame;
+                break;
+            }
         }
     }
 }
@@ -807,12 +804,17 @@ std::vector<float> TdtPipeline::run_predictor(int32_t token_id, std::vector<floa
     if (pred_it == outputs.end())
         throw std::runtime_error("TdtPipeline: predictor missing 'pred_output'");
 
+    if (pred_it->second.numel() != config_.pred_hidden_size)
+        throw std::runtime_error("TdtPipeline: predictor output size does not match config");
     for (int32_t layer = 0; layer < config_.pred_num_layers; ++layer) {
         const std::string suffix = "_" + std::to_string(layer);
         auto h_it = outputs.find("next_h" + suffix);
         auto c_it = outputs.find("next_c" + suffix);
         if (h_it == outputs.end() || c_it == outputs.end())
             throw std::runtime_error("TdtPipeline: predictor missing next state outputs");
+        if (h_it->second.numel() != config_.pred_hidden_size ||
+            c_it->second.numel() != config_.pred_hidden_size)
+            throw std::runtime_error("TdtPipeline: predictor state output size does not match config");
         std::memcpy(state_h.data() + static_cast<std::size_t>(layer) * layer_stride,
                     h_it->second.data, layer_stride * sizeof(float));
         std::memcpy(state_c.data() + static_cast<std::size_t>(layer) * layer_stride,
@@ -834,6 +836,10 @@ std::vector<float> TdtPipeline::run_joint(const float* encoder_frame, const floa
     auto duration_it = outputs.find("duration_logits");
     if (token_it == outputs.end() || duration_it == outputs.end())
         throw std::runtime_error("TdtPipeline: joint missing token_logits or duration_logits");
+    if (token_it->second.numel() != config_.blank_id + 1 ||
+        duration_it->second.numel() !=
+            static_cast<int64_t>(config_.duration_values.size()))
+        throw std::runtime_error("TdtPipeline: joint output sizes do not match config");
     const auto* tokens = static_cast<const float*>(token_it->second.data);
     const auto* durations = static_cast<const float*>(duration_it->second.data);
     std::vector<float> logits(tokens, tokens + token_it->second.numel());

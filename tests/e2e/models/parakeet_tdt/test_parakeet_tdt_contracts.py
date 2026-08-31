@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import ast
+import io
 import importlib
 import importlib.util
 import json
 import re
 import runpy
 import sys
+import tarfile
 from pathlib import Path
 from types import ModuleType
 from types import SimpleNamespace
@@ -81,6 +83,55 @@ def test_config_parses_the_published_architecture_and_rejects_drift() -> None:
     bad["durations"] = [0, 1, 2, 4]
     with pytest.raises(ValueError, match="durations"):
         config_mod.ParakeetTDTConfig.from_json(json.dumps(bad)).validate_supported_checkpoint()
+
+
+def test_config_from_dir_reports_the_missing_family_contract(tmp_path: Path) -> None:
+    config_mod = _load_module("parakeet_tdt_config_missing", "config.py")
+
+    with pytest.raises(FileNotFoundError, match="Parakeet TDT model directory"):
+        config_mod.ParakeetTDTConfig.from_dir(tmp_path)
+
+
+def test_family_private_builder_config_only_projects_parakeet_fields() -> None:
+    model_config = _load_module("parakeet_tdt_model_config", "model_config.py")
+
+    cfg = model_config.ModelConfig.from_json(json.dumps(_hf_config()))
+
+    assert cfg.model_type == "parakeet_tdt"
+    assert cfg.hidden_size == 640
+    assert cfg.num_hidden_layers == 2
+    assert cfg.vocab_size == 8193
+    assert cfg.raw["encoder_config"]["hidden_size"] == 1024
+
+
+def test_nemo_checkpoint_load_uses_safe_weight_only_mode(
+    monkeypatch, tmp_path: Path
+) -> None:
+    checkpoint = _load_module("parakeet_tdt_checkpoint_safe", "checkpoint.py")
+    archive_path = tmp_path / "model.nemo"
+    with tarfile.open(archive_path, "w") as archive:
+        for name, payload in (
+            ("model_config.yaml", b"target: test\n"),
+            ("model_weights.ckpt", b"checkpoint"),
+        ):
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+
+    captured: dict[str, object] = {}
+    fake_torch = ModuleType("torch")
+
+    def _load(_stream, **kwargs):
+        captured.update(kwargs)
+        return {"state_dict": {"weight": np.array([1.0], dtype=np.float32)}}
+
+    fake_torch.load = _load
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    state, _ = checkpoint.load_nemo_archive(tmp_path)
+
+    assert captured == {"map_location": "cpu", "weights_only": True}
+    assert "weight" in state
 
 
 def test_tdt_policy_uses_duration_values_and_forces_zero_duration_progress() -> None:
@@ -164,6 +215,55 @@ def test_nemo_classifier_uses_tdt_architecture_fields_not_checkpoint_name(tmp_pa
     (tmp_path / "model.safetensors").write_bytes(b"header-only-test-placeholder")
     (tmp_path / "legacy.nemo").write_bytes(b"not-read-when-hf-is-present")
     assert archive.resolve_model_dir(tmp_path) == tmp_path
+
+
+def test_nemo_resolution_emits_the_complete_typed_checkpoint_schema(
+    monkeypatch, tmp_path: Path
+) -> None:
+    archive = _load_module("parakeet_tdt_nemo_archive_schema", "nemo_archive.py")
+    config_mod = _load_module("parakeet_tdt_config_schema", "config.py")
+    nemo_cfg = {
+        "target": "nemo.collections.asr.models.rnnt_bpe_models.EncDecRNNTBPEModel",
+        "encoder": {
+            "d_model": 1024,
+            "n_layers": 24,
+            "n_heads": 8,
+            "ff_expansion_factor": 4,
+            "conv_kernel_size": 9,
+            "subsampling_conv_channels": 256,
+            "subsampling_factor": 8,
+            "max_len": 5000,
+        },
+        "preprocessor": {"features": 128},
+        "decoder": {
+            "blank_idx": 8192,
+            "prednet": {"pred_hidden": 640, "pred_rnn_layers": 2},
+        },
+        "joint": {
+            "num_extra_outputs": 5,
+            "jointnet": {"activation": "relu"},
+        },
+        "decoding": {"durations": [0, 1, 2, 3, 4], "max_symbols_per_step": 10},
+        "tdt_durations": [0, 1, 2, 3, 4],
+        "vocab_size": 8193,
+    }
+    import yaml
+
+    nemo_path = tmp_path / "checkpoint.nemo"
+    payload = yaml.safe_dump(nemo_cfg).encode()
+    with tarfile.open(nemo_path, "w") as tar:
+        info = tarfile.TarInfo("model_config.yaml")
+        info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    monkeypatch.setattr(archive.tempfile, "mkdtemp", lambda **_kwargs: str(staged))
+    monkeypatch.setattr(archive, "_symlink_archive", lambda *_args: None)
+
+    resolved = Path(archive.resolve_nemo_archive(nemo_path))
+    cfg = config_mod.ParakeetTDTConfig.from_dir(resolved)
+
+    cfg.validate_supported_checkpoint()
 
 
 def test_manifest_pins_exact_hugging_face_revision_and_strict_asr_oracle() -> None:
@@ -386,11 +486,15 @@ def test_validation_reference_decodes_tdt_generation_output(monkeypatch) -> None
     captured: dict[str, object] = {}
 
     class FakeSequence:
-        def __getitem__(self, _index):
-            return self
-
         def tolist(self):
             return [16, 23, 42]
+
+    sequence = FakeSequence()
+
+    class FakeBatch:
+        def __getitem__(self, index):
+            assert index == 0
+            return sequence
 
     class FakeModel:
         def parameters(self):
@@ -398,7 +502,7 @@ def test_validation_reference_decodes_tdt_generation_output(monkeypatch) -> None
 
         def generate(self, **kwargs):
             captured["generate"] = kwargs
-            return SimpleNamespace(sequences=FakeSequence())
+            return SimpleNamespace(sequences=FakeBatch())
 
     class FakeProcessor:
         feature_extractor = SimpleNamespace(sampling_rate=16_000)
@@ -454,7 +558,7 @@ def test_validation_reference_decodes_tdt_generation_output(monkeypatch) -> None
         "max_new_tokens": 50,
         "return_dict_in_generate": True,
     }
-    assert isinstance(captured["decode"][0], FakeSequence)
+    assert captured["decode"][0] is sequence
     assert captured["decode"][1] == {"skip_special_tokens": True}
 
 
@@ -476,3 +580,28 @@ def test_exact_transcript_contract_rejects_any_normalized_difference() -> None:
     result = contract.plugin.verify(different, reference, case, threshold)
 
     assert result.status == "failed"
+
+
+def test_asr_comparator_rejects_one_sided_empty_transcript() -> None:
+    comparator = importlib.import_module(
+        "tests.e2e.models.parakeet_tdt.e2e_plugins.comparators.parakeet_tdt_asr"
+    )
+    trt = SimpleNamespace(data={"returncode": 0, "transcript": ""}, text="")
+    ref = SimpleNamespace(data={"transcript": "expected speech"}, text="")
+    threshold = SimpleNamespace(metrics={"wer": 0.1, "cer": 0.1})
+    stage = SimpleNamespace(name="full_inference")
+
+    result = comparator.plugin.compare(trt, ref, threshold, stage)
+
+    assert result.status == "failed"
+    assert result.metrics["wer"].value == 1.0
+
+
+def test_reference_resolves_audio_from_the_owning_model_directory() -> None:
+    reference = importlib.import_module(
+        "tests.e2e.models.parakeet_tdt.e2e_plugins.references.parakeet_tdt_hf"
+    )
+
+    resolved = Path(reference._resolve_audio_path("data/Recording.wav"))
+
+    assert resolved == (Path(__file__).parent / "data" / "Recording.wav").resolve()

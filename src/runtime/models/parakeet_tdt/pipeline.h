@@ -90,6 +90,7 @@ class TdtPipeline final : public IPipeline {
     std::map<int32_t, std::unique_ptr<TrtModule>> streaming_encoders_;
     std::map<int32_t, std::unique_ptr<TrtModule>> streaming_first_encoders_;
     IBackend* backend_{nullptr};
+    std::string runtime_cache_path_;
     ModuleCreateOptions module_options_;
     std::string bundle_path_;
     TdtConfig config_;

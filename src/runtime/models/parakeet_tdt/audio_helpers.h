@@ -64,6 +64,7 @@ class IncrementalMelSpectrogram {
     void reset();
 
     int32_t available_frames() const;
+    int32_t stable_target_sample_count(bool final = false) const;
     int32_t frame_count() const;
     int32_t n_mels() const;
     float value(int32_t mel_bin, int32_t frame) const;

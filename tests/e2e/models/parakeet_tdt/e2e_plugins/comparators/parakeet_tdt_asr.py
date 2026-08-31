@@ -93,8 +93,10 @@ class SpeechToTextComparator:
             if not ok:
                 all_pass = False
 
-        # Word Error Rate
-        if trt_transcript and ref_transcript:
+        # Word/character error rates also cover one-sided empty output. An
+        # empty hypothesis against non-empty reference must never pass by
+        # skipping the only semantic correctness metrics.
+        if trt_transcript or ref_transcript:
             wer = _compute_wer(ref_transcript, trt_transcript)
             wer_thresh = thresholds.get("wer", 0.1)
             wer_ok = wer <= wer_thresh

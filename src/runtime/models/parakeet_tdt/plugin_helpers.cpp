@@ -10,16 +10,20 @@
 
 #include <chrono>
 #include <cstring>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
-#include <utility>
 
 #if TRTMC_HAS_TVM_FFI
 #include "plugins/tvm_ffi_module_loader.h"
+
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <nlohmann/json.hpp>
+#include <unistd.h>
 #endif
 
 namespace trtmc {
@@ -166,7 +170,7 @@ bool is_bpe_tokenizer_json(const BundleFile& bundle) {
     auto* tok_data = find_section(bundle, "tokenizer.json");
     if (!tok_data || tok_data->empty())
         return false;
-    // Quick string search 闁?avoid full JSON parse just for type detection
+    // Quick string search avoids a full JSON parse just for type detection.
     std::string_view json(tok_data->data(), tok_data->size());
     return json.find("\"type\":\"BPE\"") != std::string_view::npos ||
            json.find("\"type\": \"BPE\"") != std::string_view::npos;
@@ -385,7 +389,7 @@ std::unique_ptr<ITokenizer> create_clip_tokenizer_from_bundle(const BundleFile& 
     return nullptr;
 }
 
-// 闁冲厜鍋撻柍鍏夊亾闁冲厜鍋?FFI kernel loading 闁冲厜鍋撻柍鍏夊亾闁冲厜鍋?
+// FFI kernel loading.
 #if TRTMC_HAS_TVM_FFI
 
 namespace {
@@ -393,15 +397,31 @@ namespace {
 // Write a bundle section to a temporary .so file, returning the path.
 std::string write_kernel_so_to_temp(const std::string& global_name, const char* data,
                                     std::size_t size) {
-    std::string safe_name = global_name;
-    for (auto& c : safe_name) {
-        if (c == '.')
-            c = '_';
+    (void)global_name;
+    std::string pattern = "/tmp/trtmc_kernel_XXXXXX.so";
+    std::vector<char> writable(pattern.begin(), pattern.end());
+    writable.push_back('\0');
+    const int fd = ::mkstemps(writable.data(), 3);
+    if (fd < 0)
+        throw std::runtime_error("Failed to create a unique FFI kernel temporary file");
+
+    std::size_t written = 0;
+    while (written < size) {
+        const auto count = ::write(fd, data + written, size - written);
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0) {
+            ::close(fd);
+            std::remove(writable.data());
+            throw std::runtime_error("Failed to write the complete FFI kernel temporary file");
+        }
+        written += static_cast<std::size_t>(count);
     }
-    std::string tmp_path = "/tmp/trtmc_kernel_" + safe_name + ".so";
-    std::ofstream ofs(tmp_path, std::ios::binary);
-    ofs.write(data, static_cast<std::streamsize>(size));
-    return tmp_path;
+    if (::close(fd) != 0) {
+        std::remove(writable.data());
+        throw std::runtime_error("Failed to close the FFI kernel temporary file");
+    }
+    return writable.data();
 }
 
 // Load a single kernel entry from the manifest and register it via TVM-FFI.
@@ -420,25 +440,20 @@ void load_single_kernel(const BundleFile& bundle, const std::string& obj) {
     }
 
     std::string tmp_path = write_kernel_so_to_temp(global_name, so_sec->data(), so_sec->size());
-    if (load_tvm_ffi_module_func(tmp_path, func_name, global_name)) {
+    bool loaded = false;
+    try {
+        loaded = load_tvm_ffi_module_func(tmp_path, func_name, global_name);
+    } catch (...) {
+        std::remove(tmp_path.c_str());
+        throw;
+    }
+    std::remove(tmp_path.c_str());
+    if (loaded) {
         std::cerr << "[ffi] Loaded kernel: " << global_name << '\n';
     } else {
         std::cerr << "[ffi] Failed to load kernel: " << global_name << " from " << section_name
                   << '\n';
     }
-}
-
-// Find the "kernels" JSON array bounds within the manifest string.
-// Returns {start_after_bracket, closing_bracket} or {npos, npos}.
-std::pair<std::size_t, std::size_t> find_kernels_array_bounds(const std::string& s) {
-    auto pos = s.find("\"kernels\"");
-    if (pos == std::string::npos)
-        return {std::string::npos, std::string::npos};
-    auto arr_start = s.find('[', pos);
-    if (arr_start == std::string::npos)
-        return {std::string::npos, std::string::npos};
-    auto arr_end = s.find(']', arr_start);
-    return {arr_start + 1, arr_end};
 }
 
 } // namespace
@@ -451,22 +466,12 @@ void load_ffi_kernels_from_bundle(const BundleFile& bundle) {
     if (!manifest_sec)
         return;
 
-    std::string manifest_str(manifest_sec->begin(), manifest_sec->end());
-    auto [cur, arr_end] = find_kernels_array_bounds(manifest_str);
-    if (cur == std::string::npos || arr_end == std::string::npos)
+    const auto manifest = nlohmann::json::parse(manifest_sec->begin(), manifest_sec->end());
+    const auto kernels = manifest.find("kernels");
+    if (kernels == manifest.end() || !kernels->is_array())
         return;
-
-    while (cur < arr_end) {
-        auto obj_start = manifest_str.find('{', cur);
-        if (obj_start == std::string::npos || obj_start >= arr_end)
-            break;
-        auto obj_end = manifest_str.find('}', obj_start);
-        if (obj_end == std::string::npos)
-            break;
-
-        load_single_kernel(bundle, manifest_str.substr(obj_start, obj_end - obj_start + 1));
-        cur = obj_end + 1;
-    }
+    for (const auto& kernel : *kernels)
+        load_single_kernel(bundle, kernel.dump());
 #else
     (void)bundle;
 #endif

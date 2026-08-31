@@ -109,8 +109,6 @@ class ParakeetTDTPlugin final : public IPipelinePlugin {
         std::map<int32_t, std::string> streaming_first_encoder_sections;
         auto right_contexts =
             extract_json_int_array(ctx.config_json, "tdt_streaming_right_contexts");
-        if (right_contexts.empty())
-            right_contexts = {13, 6, 1, 0};
         for (int32_t right_context : right_contexts) {
             const std::string section_name =
                 "streaming_encoder_plan_ctx" + std::to_string(right_context);
@@ -156,8 +154,7 @@ class ParakeetTDTPlugin final : public IPipelinePlugin {
             extract_json_int(json, "tdt_streaming_pre_encode_cache", 9);
         cfg.streaming_drop_pre_encoded =
             extract_json_int(json, "tdt_streaming_drop_pre_encoded", 2);
-        cfg.causal_downsampling =
-            json.find("\"tdt_causal_downsampling\": true") != std::string::npos;
+        cfg.causal_downsampling = extract_json_bool(json, "tdt_causal_downsampling", false);
         cfg.has_prompt_kernel = has_prompt_kernel;
         cfg.num_prompts = extract_json_int(json, "tdt_num_prompts", 0);
         cfg.prompt_dictionary = extract_string_int_map(json, "tdt_prompt_dictionary");

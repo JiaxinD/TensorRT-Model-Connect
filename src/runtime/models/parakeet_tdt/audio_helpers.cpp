@@ -74,7 +74,8 @@ bool is_power_of_two(int32_t value) {
 }
 
 void rfft_power_radix2(const float* x, int32_t n, int32_t n_out, float* power_out,
-                       std::vector<std::complex<double>>& workspace) {
+                       std::vector<std::complex<double>>& workspace,
+                       const std::vector<std::complex<double>>& twiddles) {
     workspace.resize(static_cast<std::size_t>(n));
     for (int32_t i = 0; i < n; ++i) {
         workspace[static_cast<std::size_t>(i)] =
@@ -93,19 +94,15 @@ void rfft_power_radix2(const float* x, int32_t n, int32_t n_out, float* power_ou
         }
     }
 
-    const double pi2 = 2.0 * 3.14159265358979323846;
     for (int32_t length = 2; length <= n; length <<= 1) {
-        const double angle = -pi2 / static_cast<double>(length);
-        const std::complex<double> step(std::cos(angle), std::sin(angle));
         const int32_t half = length / 2;
         for (int32_t offset = 0; offset < n; offset += length) {
-            std::complex<double> twiddle(1.0, 0.0);
             for (int32_t i = 0; i < half; ++i) {
                 const auto even = workspace[static_cast<std::size_t>(offset + i)];
+                const auto twiddle = twiddles[static_cast<std::size_t>(i * n / length)];
                 const auto odd = workspace[static_cast<std::size_t>(offset + i + half)] * twiddle;
                 workspace[static_cast<std::size_t>(offset + i)] = even + odd;
                 workspace[static_cast<std::size_t>(offset + i + half)] = even - odd;
-                twiddle *= step;
             }
         }
     }
@@ -119,11 +116,20 @@ void rfft_power_radix2(const float* x, int32_t n, int32_t n_out, float* power_ou
 
 class RfftPowerPlan {
   public:
-    explicit RfftPowerPlan(int32_t n) : n_(n) {}
+    explicit RfftPowerPlan(int32_t n) : n_(n) {
+        if (is_power_of_two(n_)) {
+            const double pi2 = 2.0 * 3.14159265358979323846;
+            twiddles_.reserve(static_cast<std::size_t>(n_ / 2));
+            for (int32_t k = 0; k < n_ / 2; ++k) {
+                const double angle = -pi2 * static_cast<double>(k) / static_cast<double>(n_);
+                twiddles_.emplace_back(std::cos(angle), std::sin(angle));
+            }
+        }
+    }
 
     void execute(const float* input, int32_t n_out, float* power_out) {
         if (is_power_of_two(n_)) {
-            rfft_power_radix2(input, n_, n_out, power_out, workspace_);
+            rfft_power_radix2(input, n_, n_out, power_out, workspace_, twiddles_);
             return;
         }
         rfft_power_direct(input, n_, n_out, power_out);
@@ -132,6 +138,7 @@ class RfftPowerPlan {
   private:
     int32_t n_{0};
     std::vector<std::complex<double>> workspace_;
+    std::vector<std::complex<double>> twiddles_;
 };
 
 std::vector<float> build_center_padded_audio(const float* samples, int32_t n_samples,
@@ -516,6 +523,10 @@ void IncrementalMelSpectrogram::reset() {
 
 int32_t IncrementalMelSpectrogram::available_frames() const {
     return impl_->available_frames();
+}
+
+int32_t IncrementalMelSpectrogram::stable_target_sample_count(bool final) const {
+    return impl_->stable_target_sample_count(final);
 }
 
 int32_t IncrementalMelSpectrogram::frame_count() const {

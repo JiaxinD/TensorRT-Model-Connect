@@ -52,7 +52,7 @@ def _load_nemo_archive(path: str):
                 f = tar.extractfile(member)
                 if f:
                     state_dict = torch.load(
-                        io.BytesIO(f.read()), map_location="cpu", weights_only=False
+                        io.BytesIO(f.read()), map_location="cpu", weights_only=True
                     )
             elif bn == "model_config.yaml":
                 f = tar.extractfile(member)
@@ -89,14 +89,18 @@ def _extract_tokenizer_from_nemo(nemo_path: str, dest_dir: Path) -> None:
 
             sp = spm.SentencePieceProcessor()
             sp.Load(str(tok_model_path))
-            # Build a minimal tokenizer.json compatible with HF fast tokenizer
-            vocab = {sp.IdToPiece(i): i for i in range(sp.GetPieceSize())}
+            # Unigram vocab is an ordered list: preserve every SentencePiece id
+            # and its learned score, including duplicate piece strings.
+            vocab = [
+                [sp.IdToPiece(i), float(sp.GetScore(i))]
+                for i in range(sp.GetPieceSize())
+            ]
             tok_json = {
                 "version": "1.0",
                 "model": {
                     "type": "Unigram",
                     "unk_id": sp.unk_id(),
-                    "vocab": [[piece, 0.0] for piece in vocab],
+                    "vocab": vocab,
                 },
                 "added_tokens": [],
                 "normalizer": None,
@@ -104,9 +108,11 @@ def _extract_tokenizer_from_nemo(nemo_path: str, dest_dir: Path) -> None:
                 "post_processor": None,
                 "decoder": {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": True},
             }
-            tok_json_path.write_text(json.dumps(tok_json))
-        except Exception:
-            pass
+            tok_json_path.write_text(json.dumps(tok_json), encoding="utf-8")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to convert Parakeet SentencePiece tokenizer {tok_model_path}"
+            ) from exc
 
     tok_cfg = dest_dir / "tokenizer_config.json"
     if not tok_cfg.exists():
@@ -126,6 +132,10 @@ def _relative_pe(seq_len: int, d_model: int, max_len: int = 5000) -> np.ndarray:
     Matches NeMo RelPositionalEncoding: builds table with positive and
     negative position encodings, where negative uses sin(-k*d) = -sin(k*d).
     """
+    if seq_len <= 0:
+        raise ValueError(f"seq_len must be positive, got {seq_len}")
+    if seq_len > max_len:
+        raise ValueError(f"seq_len={seq_len} exceeds relative-position max_len={max_len}")
     pos = np.arange(0, max_len, dtype=np.float32)[:, np.newaxis]
     div = np.exp(np.arange(0, d_model, 2, dtype=np.float32) * -(math.log(10000.0) / d_model))
 
@@ -198,7 +208,7 @@ def _build_subsampling(
     # So Conv2d input is [1, 1, mel_length, mel_bins] (time=H, features=W).
     # Our mel_input is [mel_bins, mel_length] = [F, T]. Transpose to [T, F].
     tr_mel = network.add_shuffle(mel_input)
-    tr_mel.first_transpose = trt.Permutation([1, 0])  # [F,T] 闂?[T,F]
+    tr_mel.first_transpose = trt.Permutation([1, 0])  # [F,T] -> [T,F]
     ri = network.add_shuffle(tr_mel.get_output(0))
     ri.reshape_dims = (1, 1, mel_length, num_mel_bins)  # [1, 1, T, F]
     x = ri.get_output(0)
@@ -224,9 +234,9 @@ def _build_subsampling(
     sub_out_in = int(weights["enc_sub_out_w"].shape[0])
     feat_out = sub_out_in // sub_ch
     # NeMo: x.transpose(1,2).reshape(B,T,-1) on [B,C,T,F]
-    # = permute(0,2,1,3) 闂?[B,T,C,F], reshape 闂?[T, C*F]
+    # = permute(0,2,1,3) -> [B,T,C,F], reshape -> [T, C*F]
     tr = network.add_shuffle(x)
-    tr.first_transpose = trt.Permutation([0, 2, 1, 3])  # [B,C,T,F] 闂?[B,T,C,F]
+    tr.first_transpose = trt.Permutation([0, 2, 1, 3])  # [B,C,T,F] -> [B,T,C,F]
     tr.reshape_dims = (time_out, sub_ch * feat_out)  # [T, C*F]
     out = graph_ops.add_matmul_rhs_constant(
         network, tr.get_output(0), sub_ch * feat_out, hidden, weights["enc_sub_out_w"], dtype=dtype
@@ -597,7 +607,7 @@ def _build_encoder(config, weights, *, precision="fp32", verbose=False):
         net, (1, 1), np.array([1e-5], dtype=work_np_dtype), dtype=work_np_dtype
     )
     mel = net.add_input("mel_features", trt.float32, (mb, ml))
-    # Encoder attention mask: [1, 1, enc_seq] 闂?0.0 for valid, -10000.0 for padded.
+    # Encoder attention mask: [1, 1, enc_seq] -- 0.0 valid, -10000.0 padded.
     # Applied additively to self-attention scores before softmax.
     mask_shape = (
         (1, es, es) if bool(weights.get("_encoder_attention_mask_2d", False)) else (1, 1, es)

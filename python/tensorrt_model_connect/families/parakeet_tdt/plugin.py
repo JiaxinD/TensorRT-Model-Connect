@@ -102,16 +102,23 @@ def _load_hf_as_nemo(model_dir: str):
         raise KeyError(f"HF Parakeet checkpoint is missing normalized tensors: {detail}")
     normalized.update({dst: state[src] for dst, src in aliases.items()})
     nemo_cfg = {
-        "encoder": {"d_model": 1024, "n_layers": 24, "n_heads": 8,
-                    "ff_expansion_factor": 4, "conv_kernel_size": 9,
-                    "subsampling_conv_channels": 256, "att_context_size": [[-1, -1]],
+        "encoder": {"d_model": cfg.encoder_hidden_size,
+                    "n_layers": cfg.encoder_layers,
+                    "n_heads": cfg.encoder_heads,
+                    "ff_expansion_factor": cfg.encoder_ffn_size // cfg.encoder_hidden_size,
+                    "conv_kernel_size": cfg.encoder_conv_kernel_size,
+                    "subsampling_conv_channels": cfg.subsampling_channels,
+                    "att_context_size": [[-1, -1]],
                     "conv_norm_type": "batch_norm", "conv_context_size": "symmetric"},
-        "preprocessor": {"features": 128},
-        "decoder": {"blank_idx": 8192, "prednet": {"pred_hidden": 640,
-                    "pred_rnn_layers": 2, "rnn_hidden_size": 640}},
-        "joint": {"jointnet": {"joint_hidden": 640, "activation": "relu"}},
-        "decoding": {"max_symbols_per_step": 10},
-        "tdt_durations": [0, 1, 2, 3, 4],
+        "preprocessor": {"features": cfg.num_mel_bins},
+        "decoder": {"blank_idx": cfg.blank_id,
+                    "prednet": {"pred_hidden": cfg.decoder_hidden_size,
+                                "pred_rnn_layers": cfg.decoder_layers,
+                                "rnn_hidden_size": cfg.decoder_hidden_size}},
+        "joint": {"jointnet": {"joint_hidden": cfg.decoder_hidden_size,
+                                "activation": cfg.joint_activation}},
+        "decoding": {"max_symbols_per_step": cfg.max_symbols_per_step},
+        "tdt_durations": list(cfg.durations),
     }
     return normalized, nemo_cfg
 
@@ -984,7 +991,10 @@ def _build_predictor(
         next_h.append(hidden)
         next_c.append(c_new)
 
-    pred_output = hidden
+    # Keep pred_output distinct from the last recurrent state even in FP32;
+    # TensorRT output names belong to tensors, so aliasing would rename the
+    # same tensor from pred_output to next_h_{last_layer}.
+    pred_output = network.add_identity(hidden).get_output(0)
     if pred_output.dtype != trt.float32:
         pred_output = network.add_cast(pred_output, trt.float32).get_output(0)
     pred_output.name = "pred_output"

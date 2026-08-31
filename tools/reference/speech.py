@@ -362,7 +362,7 @@ def _run_whisper_asr(
             )
         output_ids = generated.sequences if hasattr(generated, "sequences") else generated
         if _is_parakeet_tdt_asr(arguments):
-            decoded = processor.decode(output_ids, skip_special_tokens=True)
+            decoded = processor.decode(output_ids[0], skip_special_tokens=True)
         else:
             decoded = processor.batch_decode(output_ids, skip_special_tokens=True)
         output_text = decoded[0] if isinstance(decoded, (list, tuple)) else str(decoded)

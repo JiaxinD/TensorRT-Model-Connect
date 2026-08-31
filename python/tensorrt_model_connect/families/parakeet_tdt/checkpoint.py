@@ -120,7 +120,9 @@ def load_nemo_archive(model_dir: str | Path) -> tuple[dict, dict]:
             elif name == "model_weights.ckpt":
                 extracted = tar.extractfile(member)
                 if extracted is not None:
-                    state = torch.load(io.BytesIO(extracted.read()), map_location="cpu", weights_only=False)
+                    state = torch.load(
+                        io.BytesIO(extracted.read()), map_location="cpu", weights_only=True
+                    )
     if not isinstance(config, dict):
         raise FileNotFoundError(f"model_config.yaml not found in {archive}")
     if not isinstance(state, dict):

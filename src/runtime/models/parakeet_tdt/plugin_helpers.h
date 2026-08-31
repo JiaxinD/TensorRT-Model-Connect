@@ -25,7 +25,7 @@
 namespace trtmc {
 
 // A loaded TRT engine, ready for inference.
-// The stream is owned internally by the module 闂?callers get it via module->stream().
+// The stream is owned internally by the module; callers use module->stream().
 struct LoadedModule {
     std::unique_ptr<ITrtModule> module;
 };
@@ -60,7 +60,7 @@ struct DualProfileModules {
 };
 
 // Load an engine from a serialized plan via the backend and create two
-// execution contexts 闂?one per optimization profile 闂?sharing the engine.
+// execution contexts, one per optimization profile, sharing the engine.
 // When the engine has fewer than 2 profiles, `prefill` is left null and
 // `decode` holds the single-profile context (legacy bundles).
 DualProfileModules load_dual_profile_modules(IBackend* backend, const std::vector<char>* plan,

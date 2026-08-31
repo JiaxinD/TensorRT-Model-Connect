@@ -8,6 +8,7 @@
 #include "runtime/models/parakeet_tdt/audio_helpers.h"
 #include "utils/wav_reader.h"
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <string>
@@ -131,8 +132,7 @@ std::vector<float> run_resampled_chunks(const std::vector<float>& source_audio,
             break;
         }
 
-        constexpr int32_t kResampleHalfTaps = 16;
-        const int32_t stable_target = std::max(0, accepted - kResampleHalfTaps) / 3;
+        const int32_t stable_target = state.stable_target_sample_count();
         const int32_t stable_frames =
             stable_target >= options.n_fft / 2
                 ? 1 + (stable_target - options.n_fft / 2) / options.hop_length
