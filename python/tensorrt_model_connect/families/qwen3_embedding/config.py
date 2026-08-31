@@ -212,6 +212,10 @@ class ModelConfig:
     def from_dir(model_dir: str | Path) -> ModelConfig:
         model_path = Path(model_dir)
         config_path = model_path / "config.json"
-        if config_path.exists():
-            return ModelConfig.from_json(config_path.read_text())
-        return ModelConfig.from_json(config_path.read_text())
+        if not config_path.is_file():
+            raise FileNotFoundError(
+                f"Qwen3-Embedding model directory {model_path} has no config.json"
+            )
+        config = ModelConfig.from_json(config_path.read_text(encoding="utf-8"))
+        config.raw["_model_dir"] = str(model_path)
+        return config

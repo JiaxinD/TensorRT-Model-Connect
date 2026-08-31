@@ -2889,7 +2889,6 @@ def test_task_reference_embedding_pooling_keeps_mean_as_default() -> None:
         torch,
         hidden,
         attention_mask,
-        pooling="mean",
     )
 
     expected = torch.tensor([[2**-0.5, 2**-0.5]])

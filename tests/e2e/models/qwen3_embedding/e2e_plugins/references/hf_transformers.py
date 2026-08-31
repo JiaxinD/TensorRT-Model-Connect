@@ -559,7 +559,7 @@ class HfTransformersReference:
     def _run_embedding_ref(
         self, case: E2ECase, stage: StageSpec, ctx: RunContext
     ) -> StageOutput:
-        """Run HF embedding model as reference — mean pool + L2 normalize."""
+        """Run HF embedding model as reference — last-token pool + L2 normalize."""
         artifacts_dir = ctx.artifacts_dir or tempfile.gettempdir()
         model_dir = _case_artifact_dir(artifacts_dir, case.name) if ctx.artifacts_dir else artifacts_dir
         output_path = str(Path(model_dir) / "hf_embedding.json")

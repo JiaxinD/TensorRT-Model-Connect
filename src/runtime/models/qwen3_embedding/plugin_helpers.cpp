@@ -10,7 +10,6 @@
 
 #include <chrono>
 #include <cstring>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -20,6 +19,11 @@
 
 #if TRTMC_HAS_TVM_FFI
 #include "plugins/tvm_ffi_module_loader.h"
+
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
 #endif
 
 namespace trtmc {
@@ -247,145 +251,20 @@ LoadedModule load_trt_module_from_plan(IBackend* backend, const std::vector<char
     return result;
 }
 
-LoadedModule try_load_trt_module_from_plan(IBackend* backend, const std::vector<char>* plan,
-                                           const char* label, const ModuleCreateOptions& options) {
-    if (!plan || plan->empty())
-        return LoadedModule{};
-    try {
-        return load_trt_module_from_plan(backend, plan, label, options);
-    } catch (...) {
-        std::cerr << "[trtmc] WARNING: failed to load optional engine: " << label << std::endl;
-        return LoadedModule{};
-    }
-}
-
-std::unique_ptr<ITrtModule> extract_optional_module(IBackend* backend,
-                                                    const std::vector<char>* plan,
-                                                    const char* label,
-                                                    const ModuleCreateOptions& options) {
-    auto loaded = try_load_trt_module_from_plan(backend, plan, label, options);
-    if (loaded.module && loaded.module->ok())
-        return std::move(loaded.module);
-    return nullptr;
-}
-
-// Dual-profile module loading (delegated to IBackend).
-
-DualProfileModules load_dual_profile_modules(IBackend* backend, const std::vector<char>* plan,
-                                             const char* label,
-                                             const ModuleCreateOptions& options) {
-    if (!plan || plan->empty())
-        throw std::runtime_error(std::string("Bundle missing ") + label);
-    if (!backend)
-        throw std::runtime_error("No backend loaded");
-
-    const auto t0 = SteadyClock::now();
-    auto pair = backend->create_dual_profile_modules(plan->data(), plan->size(), options);
-    const auto t1 = SteadyClock::now();
-    log_trt_load_timing(label, elapsed_ms(t0, t1), plan->size());
-    if (!pair.decode || !pair.decode->ok())
-        throw std::runtime_error(std::string("Failed to create dual-profile modules for ") + label);
-
-    DualProfileModules out;
-    out.prefill = std::move(pair.prefill);
-    out.decode = std::move(pair.decode);
-    if (out.prefill)
-        out.prefill->set_timing_label(std::string(label ? label : "engine") + ":prefill");
-    if (out.decode)
-        out.decode->set_timing_label(std::string(label ? label : "engine") + ":decode");
-    return out;
-}
-
-// Config helpers.
-
-int32_t compute_kv_dim(const BaseConfig& cfg) {
-    int32_t hd = (cfg.head_dim > 0) ? cfg.head_dim
-                                    : ((cfg.num_heads > 0) ? cfg.hidden_size / cfg.num_heads : 128);
-    int32_t kv_heads = (cfg.num_kv_heads > 0) ? cfg.num_kv_heads : cfg.num_heads;
-    return kv_heads * hd;
-}
-
-DType cache_dtype_from_precision(const std::string& precision) {
-    if (precision == "fp16")
-        return DType::kFloat16;
-    if (precision == "bf16")
-        return DType::kBFloat16;
-    return DType::kFloat32;
-}
-
-// Section data conversion.
-
-std::vector<float> section_to_floats(const std::vector<char>* sec) {
-    if (!sec || sec->empty())
-        return {};
-    std::size_t count = sec->size() / sizeof(float);
-    std::vector<float> out(count);
-    std::memcpy(out.data(), sec->data(), count * sizeof(float));
-    return out;
-}
-
-std::vector<int32_t> section_to_int32s(const std::vector<char>* sec) {
-    if (!sec || sec->empty())
-        return {};
-    std::size_t count = sec->size() / sizeof(int32_t);
-    std::vector<int32_t> out(count);
-    std::memcpy(out.data(), sec->data(), count * sizeof(int32_t));
-    return out;
-}
-
-bool has_section_data(const std::vector<char>* d) {
-    return d && !d->empty();
-}
-
-MelFilterbank load_mel_filterbank(const BundleFile& bundle) {
-    MelFilterbank fb;
-    const auto* data = find_section(bundle, "mel_filterbank");
-    if (data == nullptr || data->empty())
-        return fb;
-
-    // Format: [n_freq_bins(int32), n_mel_bins(int32), float32 data...]
-    if (data->size() < 2 * sizeof(int32_t))
-        return fb;
-
-    int32_t header[2] = {0, 0};
-    std::memcpy(header, data->data(), sizeof(header));
-    fb.n_freq_bins = header[0];
-    fb.n_mel_bins = header[1];
-
-    if (fb.n_freq_bins <= 0 || fb.n_mel_bins <= 0)
-        return fb;
-
-    const auto expected_data_size = static_cast<std::size_t>(fb.n_freq_bins) *
-                                    static_cast<std::size_t>(fb.n_mel_bins) * sizeof(float);
-    const auto payload_offset = 2 * sizeof(int32_t);
-    if (data->size() < payload_offset + expected_data_size) {
-        fb.n_freq_bins = 0;
-        fb.n_mel_bins = 0;
-        return fb;
-    }
-
-    fb.data.resize(static_cast<std::size_t>(fb.n_freq_bins) * fb.n_mel_bins);
-    std::memcpy(fb.data.data(), data->data() + payload_offset, expected_data_size);
-    return fb;
-}
-
-std::unique_ptr<ITokenizer> create_clip_tokenizer_from_bundle(const BundleFile& bundle) {
-    auto* tok_data = find_section(bundle, "clip_tokenizer.json");
-    if (!tok_data || tok_data->empty())
-        return nullptr;
-    try {
-        auto tok =
-            CreateBpeTokenizer(tok_data->data(), tok_data->size(), /*add_special_tokens=*/true);
-        if (tok)
-            std::cerr << "[trtmc] Using native BPE CLIP tokenizer" << std::endl;
-        return tok;
-    } catch (const std::exception& e) {
-        std::cerr << "[trtmc] WARNING: CLIP tokenizer failed: " << e.what() << std::endl;
-    }
-    return nullptr;
-}
-
 // ─── FFI kernel loading ───
+
+std::string sanitize_kernel_filename_component(const std::string& global_name) {
+    if (global_name.empty())
+        throw std::invalid_argument("Kernel global name must not be empty");
+    std::string safe_name;
+    safe_name.reserve(global_name.size());
+    for (const char c : global_name) {
+        const bool allowed = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                             (c >= '0' && c <= '9') || c == '_' || c == '-';
+        safe_name.push_back(allowed ? c : '_');
+    }
+    return safe_name;
+}
 
 #if TRTMC_HAS_TVM_FFI
 
@@ -394,15 +273,31 @@ namespace {
 // Write a bundle section to a temporary .so file, returning the path.
 std::string write_kernel_so_to_temp(const std::string& global_name, const char* data,
                                     std::size_t size) {
-    std::string safe_name = global_name;
-    for (auto& c : safe_name) {
-        if (c == '.')
-            c = '_';
+    const std::string safe_name = sanitize_kernel_filename_component(global_name).substr(0, 64);
+    std::string pattern = "/tmp/trtmc_kernel_" + safe_name + "_XXXXXX.so";
+    std::vector<char> writable(pattern.begin(), pattern.end());
+    writable.push_back('\0');
+    const int fd = ::mkstemps(writable.data(), 3);
+    if (fd < 0)
+        throw std::runtime_error("Failed to create a unique kernel temp file");
+
+    std::size_t written = 0;
+    while (written < size) {
+        const auto count = ::write(fd, data + written, size - written);
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0) {
+            ::close(fd);
+            std::remove(writable.data());
+            throw std::runtime_error("Failed to write the complete kernel temp file");
+        }
+        written += static_cast<std::size_t>(count);
     }
-    std::string tmp_path = "/tmp/trtmc_kernel_" + safe_name + ".so";
-    std::ofstream ofs(tmp_path, std::ios::binary);
-    ofs.write(data, static_cast<std::streamsize>(size));
-    return tmp_path;
+    if (::close(fd) != 0) {
+        std::remove(writable.data());
+        throw std::runtime_error("Failed to close kernel temp file");
+    }
+    return writable.data();
 }
 
 // Load a single kernel entry from the manifest and register it via TVM-FFI.
@@ -421,7 +316,15 @@ void load_single_kernel(const BundleFile& bundle, const std::string& obj) {
     }
 
     std::string tmp_path = write_kernel_so_to_temp(global_name, so_sec->data(), so_sec->size());
-    if (load_tvm_ffi_module_func(tmp_path, func_name, global_name)) {
+    bool loaded = false;
+    try {
+        loaded = load_tvm_ffi_module_func(tmp_path, func_name, global_name);
+    } catch (...) {
+        std::remove(tmp_path.c_str());
+        throw;
+    }
+    std::remove(tmp_path.c_str());
+    if (loaded) {
         std::cerr << "[ffi] Loaded kernel: " << global_name << '\n';
     } else {
         std::cerr << "[ffi] Failed to load kernel: " << global_name << " from " << section_name

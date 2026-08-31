@@ -27,13 +27,16 @@ class Qwen3EmbeddingPlugin:
 
     @staticmethod
     def _contract(config: ModelConfig) -> Qwen3EmbeddingContract:
+        cached = getattr(config, "_qwen3_embedding_contract", None)
+        if isinstance(cached, Qwen3EmbeddingContract):
+            return cached
         contract = detect_qwen3_embedding_contract(config)
         if contract is None:
             raise ValueError(
                 "qwen3_embedding requires the pinned Qwen3-Embedding-0.6B "
                 "sentence-transformers last-token pooling contract"
             )
-        config.raw["_qwen3_embedding_contract"] = contract
+        setattr(config, "_qwen3_embedding_contract", contract)
         return contract
 
     def default_build_precision(self, config: ModelConfig) -> str:

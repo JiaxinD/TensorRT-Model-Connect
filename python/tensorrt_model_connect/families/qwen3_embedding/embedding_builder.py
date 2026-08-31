@@ -13,6 +13,7 @@ import numpy as np
 from tensorrt_model_connect import trt_compat
 
 from . import graph_ops
+from .checkpoint_mapper import _target_np_dtype
 
 if TYPE_CHECKING:
     from .checkpoint_mapper import WeightDict
@@ -143,7 +144,7 @@ def build_qwen3_embedding_engine(
     if precision == "fp16":
         work_np_dtype, work_trt_dtype = np.float16, trt.float16
     elif precision == "bf16":
-        work_np_dtype, work_trt_dtype = np.float16, trt.bfloat16
+        work_np_dtype, work_trt_dtype = _target_np_dtype(precision), trt.bfloat16
     else:
         raise ValueError(f"Qwen3-Embedding precision must be fp16 or bf16, got {precision!r}")
 

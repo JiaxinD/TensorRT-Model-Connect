@@ -1222,7 +1222,7 @@ def _pool_embedding(
     hidden: Any,
     attention_mask: Any,
     *,
-    pooling: str,
+    pooling: str = "mean",
 ) -> Any:
     if pooling == "last_token":
         positions = torch.arange(

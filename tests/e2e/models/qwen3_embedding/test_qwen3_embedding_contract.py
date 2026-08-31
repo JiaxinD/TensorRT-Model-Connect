@@ -326,6 +326,7 @@ def test_embedding_route_is_owned_by_standalone_family(
     assert overrides["runtime_strategy"] == "qwen_embedding"
     assert overrides["embedding_pooling"] == "last_token"
     assert overrides["embedding_normalize"] is True
+    json.dumps(embedding_config.raw)
 
 
 def test_qwen_embedding_parser_requires_a_nonempty_json_vector() -> None:

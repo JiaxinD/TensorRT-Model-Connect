@@ -624,17 +624,13 @@ def make_rope_table_half_dim(
     default = 1.0 if cosine else 0.0
     if max_cache_length <= 0 or rope_theta <= 0.0:
         return np.full((max(max_cache_length, 1), max(half, 1)), default, dtype=np.float32)
-    table = np.full((max_cache_length, half), default, dtype=np.float32)
-    for pos in range(max_cache_length):
-        for d in range(half):
-            # For both interleaved and rotate-half the frequency index is d
-            # (the distinction only affects which input pair is rotated; the
-            # freq assignment per half-dim is the same).
-            exponent = (2.0 * d) / rotary_ndims
-            inv_freq = rope_theta ** (-exponent)
-            angle = pos * inv_freq
-            table[pos, d] = np.cos(angle) if cosine else np.sin(angle)
-    return table
+    # For both interleaved and rotate-half the frequency index is d (the
+    # distinction only affects which input pair is rotated).
+    exponents = (2.0 * np.arange(half, dtype=np.float64)) / rotary_ndims
+    inv_freq = rope_theta ** (-exponents)
+    angles = np.arange(max_cache_length, dtype=np.float64)[:, None] * inv_freq[None, :]
+    table = np.cos(angles) if cosine else np.sin(angles)
+    return table.astype(np.float32)
 
 
 def reshape_rows_to_heads_4d(

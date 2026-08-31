@@ -4,6 +4,7 @@
  */
 
 #include "runtime/models/qwen3_embedding/embedding_pipeline.h"
+#include "runtime/models/qwen3_embedding/plugin_helpers.h"
 
 #include <cmath>
 #include <stdexcept>
@@ -57,11 +58,18 @@ void test_last_token_pool_rejects_empty_rows() {
         throw std::runtime_error("empty attention-mask row was accepted");
 }
 
+void test_kernel_filename_component_cannot_escape_temp_directory() {
+    const auto value = trtmc::sanitize_kernel_filename_component("../flashinfer/decode.so");
+    if (value.find('/') != std::string::npos || value.find("..") != std::string::npos)
+        throw std::runtime_error("kernel filename sanitizer preserved traversal syntax");
+}
+
 } // namespace
 
 int main() {
     test_last_token_pool_handles_right_padding();
     test_last_token_pool_handles_left_and_mixed_padding();
     test_last_token_pool_rejects_empty_rows();
+    test_kernel_filename_component_cannot_escape_temp_directory();
     return 0;
 }
