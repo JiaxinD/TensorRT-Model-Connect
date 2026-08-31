@@ -2895,6 +2895,18 @@ def test_task_reference_embedding_pooling_keeps_mean_as_default() -> None:
     assert torch.allclose(pooled, expected)
 
 
+def test_task_reference_embedding_pooling_rejects_empty_mask_rows() -> None:
+    torch = pytest.importorskip("torch")
+    runner = runpy.run_path(
+        str(REPOSITORY / "benchmarks/performance/baselines/task_reference.py")
+    )
+    hidden = torch.zeros((2, 3, 2))
+    attention_mask = torch.tensor([[1, 1, 0], [0, 0, 0]])
+
+    with pytest.raises(ValueError, match="empty mask row"):
+        runner["_pool_embedding"](torch, hidden, attention_mask)
+
+
 def test_task_reference_embedding_can_require_final_eos() -> None:
     torch = pytest.importorskip("torch")
     runner = runpy.run_path(

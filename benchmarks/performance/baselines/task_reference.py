@@ -1224,13 +1224,13 @@ def _pool_embedding(
     *,
     pooling: str = "mean",
 ) -> Any:
+    if bool((attention_mask.sum(dim=1) <= 0).any()):
+        raise ValueError("embedding performance input has an empty mask row")
     if pooling == "last_token":
         positions = torch.arange(
             attention_mask.shape[1], device=attention_mask.device
         ).unsqueeze(0)
         last_indices = positions.masked_fill(attention_mask == 0, -1).max(dim=1).values
-        if bool((last_indices < 0).any()):
-            raise ValueError("embedding performance input has an empty mask row")
         vector = hidden[
             torch.arange(hidden.shape[0], device=hidden.device), last_indices
         ]

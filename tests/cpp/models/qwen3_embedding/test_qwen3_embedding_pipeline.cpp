@@ -7,6 +7,7 @@
 #include "runtime/models/qwen3_embedding/plugin_helpers.h"
 
 #include <cmath>
+#include <iostream>
 #include <stdexcept>
 #include <vector>
 
@@ -67,9 +68,14 @@ void test_kernel_filename_component_cannot_escape_temp_directory() {
 } // namespace
 
 int main() {
-    test_last_token_pool_handles_right_padding();
-    test_last_token_pool_handles_left_and_mixed_padding();
-    test_last_token_pool_rejects_empty_rows();
-    test_kernel_filename_component_cannot_escape_temp_directory();
+    try {
+        test_last_token_pool_handles_right_padding();
+        test_last_token_pool_handles_left_and_mixed_padding();
+        test_last_token_pool_rejects_empty_rows();
+        test_kernel_filename_component_cannot_escape_temp_directory();
+    } catch (const std::exception& error) {
+        std::cerr << "FAIL: " << error.what() << '\n';
+        return 1;
+    }
     return 0;
 }
