@@ -16,7 +16,7 @@
 #include <stdexcept>
 #include <string_view>
 
-#if TRTMC_HAS_TVM_FFI
+#if TRTMC_HAS_TVM_FFI && !defined(_WIN32)
 #include "plugins/tvm_ffi_module_loader.h"
 
 #include <cerrno>
@@ -390,7 +390,7 @@ std::unique_ptr<ITokenizer> create_clip_tokenizer_from_bundle(const BundleFile& 
 }
 
 // FFI kernel loading.
-#if TRTMC_HAS_TVM_FFI
+#if TRTMC_HAS_TVM_FFI && !defined(_WIN32)
 
 namespace {
 
@@ -458,10 +458,14 @@ void load_single_kernel(const BundleFile& bundle, const std::string& obj) {
 
 } // namespace
 
-#endif // TRTMC_HAS_TVM_FFI
+#endif // TRTMC_HAS_TVM_FFI && !defined(_WIN32)
 
 void load_ffi_kernels_from_bundle(const BundleFile& bundle) {
-#if TRTMC_HAS_TVM_FFI
+#if TRTMC_HAS_TVM_FFI && defined(_WIN32)
+    if (find_section(bundle, "kernel_manifest.json")) {
+        throw std::runtime_error("TVM-FFI bundle kernels are not supported on Windows");
+    }
+#elif TRTMC_HAS_TVM_FFI
     const auto* manifest_sec = find_section(bundle, "kernel_manifest.json");
     if (!manifest_sec)
         return;

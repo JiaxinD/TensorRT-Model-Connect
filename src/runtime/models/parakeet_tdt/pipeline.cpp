@@ -122,8 +122,7 @@ void validate_tdt_core_config(const TdtConfig& config, const MelFilterbank& mel_
     if (config.encoder_hidden_size <= 0 || config.pred_hidden_size <= 0 ||
         config.pred_num_layers <= 0)
         throw std::runtime_error("TdtPipeline: invalid TDT dimensions in config");
-    if (config.sample_rate <= 0 || config.mel_hop_length <= 0)
-        throw std::runtime_error("TdtPipeline: sample rate and mel hop length must be positive");
+    validate_tdt_mel_geometry(config, mel_fb.n_freq_bins, mel_fb.n_mel_bins);
     if (config.max_symbols_per_step <= 0)
         throw std::runtime_error("TdtPipeline: max_symbols_per_step must be positive");
     if (config.blank_id < 0)

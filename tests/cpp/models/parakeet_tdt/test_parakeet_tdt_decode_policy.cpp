@@ -66,6 +66,32 @@ void test_streaming_schedule_derives_timing_and_cache_geometry() {
     check(schedule.drop_extra_pre_encoded == 2, "pre-encode drop derives from cache overlap");
 }
 
+void test_mel_geometry_accepts_matching_dimensions() {
+    trtmc::TdtConfig config;
+    trtmc::validate_tdt_mel_geometry(config, 257, 128);
+}
+
+void test_mel_geometry_rejects_invalid_or_mismatched_dimensions() {
+    trtmc::TdtConfig config;
+    config.mel_n_fft = 0;
+    bool invalid_threw = false;
+    try {
+        trtmc::validate_tdt_mel_geometry(config, 257, 128);
+    } catch (const std::invalid_argument&) {
+        invalid_threw = true;
+    }
+    check(invalid_threw, "non-positive mel dimensions must throw");
+
+    config.mel_n_fft = 512;
+    bool mismatch_threw = false;
+    try {
+        trtmc::validate_tdt_mel_geometry(config, 256, 128);
+    } catch (const std::invalid_argument&) {
+        mismatch_threw = true;
+    }
+    check(mismatch_threw, "filterbank dimensions must match the runtime config");
+}
+
 } // namespace
 
 int main() {
@@ -75,6 +101,8 @@ int main() {
     test_invalid_duration_index_is_rejected();
     test_negative_duration_is_rejected();
     test_streaming_schedule_derives_timing_and_cache_geometry();
+    test_mel_geometry_accepts_matching_dimensions();
+    test_mel_geometry_rejects_invalid_or_mismatched_dimensions();
     if (failures) {
         std::cerr << failures << " TDT decode policy test(s) failed\n";
         return 1;

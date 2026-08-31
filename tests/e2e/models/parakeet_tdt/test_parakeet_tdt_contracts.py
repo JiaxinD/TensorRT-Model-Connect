@@ -288,6 +288,15 @@ def test_manifest_pins_exact_hugging_face_revision_and_strict_asr_oracle() -> No
         assert values["cer"] <= 0.2
 
 
+def test_ffi_kernel_tempfiles_are_explicitly_disabled_on_windows() -> None:
+    source = (
+        REPO_ROOT / "src/runtime/models/parakeet_tdt/plugin_helpers.cpp"
+    ).read_text(encoding="utf-8")
+
+    assert "#if TRTMC_HAS_TVM_FFI && !defined(_WIN32)" in source
+    assert "TVM-FFI bundle kernels are not supported on Windows" in source
+
+
 def test_hf_reference_propagates_the_manifest_revision(monkeypatch, tmp_path: Path) -> None:
     reference = importlib.import_module(
         "tests.e2e.models.parakeet_tdt.e2e_plugins.references.parakeet_tdt_hf"

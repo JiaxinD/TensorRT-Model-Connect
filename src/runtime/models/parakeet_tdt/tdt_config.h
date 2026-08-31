@@ -96,6 +96,18 @@ inline TdtStreamingSchedule make_tdt_streaming_schedule(int32_t left, int32_t ri
     return out;
 }
 
+inline void validate_tdt_mel_geometry(const TdtConfig& config, int32_t filterbank_freq_bins,
+                                      int32_t filterbank_mel_bins) {
+    if (config.sample_rate <= 0 || config.mel_hop_length <= 0 || config.mel_n_fft <= 0 ||
+        config.mel_chunk_length <= 0 || config.mel_length <= 0 || config.num_mel_bins <= 0) {
+        throw std::invalid_argument("invalid TDT mel dimensions in config");
+    }
+    if (filterbank_freq_bins != config.mel_n_fft / 2 + 1 ||
+        filterbank_mel_bins != config.num_mel_bins) {
+        throw std::invalid_argument("TDT mel filterbank dimensions do not match config");
+    }
+}
+
 inline TdtGreedyDecision make_tdt_greedy_decision(int32_t token_id, int32_t duration_index,
                                                   const std::vector<int32_t>& duration_values,
                                                   int32_t blank_id) {
