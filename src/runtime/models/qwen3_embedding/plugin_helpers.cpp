@@ -8,6 +8,7 @@
 #include "trtmc/runtime/trt_backend.h"
 #include "utils/json_helpers.h"
 
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <iomanip>
@@ -259,8 +260,8 @@ std::string sanitize_kernel_filename_component(const std::string& global_name) {
     std::string safe_name;
     safe_name.reserve(global_name.size());
     for (const char c : global_name) {
-        const bool allowed = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                             (c >= '0' && c <= '9') || c == '_' || c == '-';
+        const bool allowed =
+            std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_' || c == '-';
         safe_name.push_back(allowed ? c : '_');
     }
     return safe_name;
