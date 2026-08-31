@@ -92,8 +92,7 @@ inline TdtStreamingSchedule make_tdt_streaming_schedule(int32_t left, int32_t ri
     out.first_shift_mel_frames = out.first_chunk_mel_frames;
     out.next_shift_mel_frames = out.next_chunk_mel_frames;
     out.next_pre_encode_cache_mel_frames = subsampling + 1;
-    out.drop_extra_pre_encoded =
-        out.next_pre_encode_cache_mel_frames - (subsampling - 1);
+    out.drop_extra_pre_encoded = out.next_pre_encode_cache_mel_frames - (subsampling - 1);
     return out;
 }
 

@@ -63,8 +63,7 @@ void test_streaming_schedule_derives_timing_and_cache_geometry() {
     check(schedule.chunk_samples == 1280, "chunk samples derive from schedule timing");
     check(schedule.next_pre_encode_cache_mel_frames == 5,
           "pre-encode cache derives from subsampling");
-    check(schedule.drop_extra_pre_encoded == 2,
-          "pre-encode drop derives from cache overlap");
+    check(schedule.drop_extra_pre_encoded == 2, "pre-encode drop derives from cache overlap");
 }
 
 } // namespace
