@@ -271,8 +271,8 @@ def test_release_suite_covers_every_non_l0_ready_model_profile() -> None:
 
     performance_catalog.validate_release_coverage(cases, excluded_profiles)
 
-    assert len(cases) == 111
-    assert len(raw_entries) == 81
+    assert len(cases) == 112
+    assert len(raw_entries) == 82
     assert len(raw_additional) == 30
     assert excluded_profiles == {
         "lfm2-1.2b": LFM2_EXCLUSION_REASON,
@@ -290,15 +290,15 @@ def test_release_suite_covers_every_non_l0_ready_model_profile() -> None:
     assert not any("priority" in entry for entry in raw_entries)
     assert {case["model"] for case in cases} == ready_profiles - set(excluded_profiles)
     assert not any(performance_catalog.is_l0_profile(case["model"]) for case in cases)
-    assert len({(case["family"], case["operation"]) for case in cases}) == 81
-    assert len({case["family"] for case in cases}) == 79
+    assert len({(case["family"], case["operation"]) for case in cases}) == 82
+    assert len({case["family"] for case in cases}) == 80
     assert [case["operation"] for case in cases if case["family"] == "eagle_vlm"] == [
         "embed",
         "rerank",
     ]
     assert Counter(perf_matrix._candidate_timing_scope(case) for case in cases) == {
         "model_call_wall": 26,
-        "public_pipeline_call_wall": 85,
+        "public_pipeline_call_wall": 86,
     }
     assert {case["id"] for case in cases if case["baseline"]["asset_loading_included"]} == {
         "canary.transcribe",
