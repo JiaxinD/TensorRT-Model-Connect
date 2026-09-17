@@ -93,13 +93,13 @@ def add_rms_norm(
 ) -> trt.ITensor:
     """RMSNorm: gamma * (x / sqrt(mean(x^2) + eps)).
 
-    FP32 precision boundary: when dtype != float32, casts to FP32 before
-    norm computation for numerical stability, then casts back.
+    FP32 precision boundary: non-FP32 runtime inputs are cast to FP32 for
+    normalization, then cast back independently of NumPy weight storage.
 
     TRT's native normalization API implements mean-centered LayerNorm, not
     RMSNorm, so this remains a manual shared implementation.
     """
-    need_cast = dtype != np.float32
+    need_cast = inp.dtype != trt.float32
     output_dtype = inp.dtype
     if need_cast:
         inp = network.add_cast(inp, trt.float32).get_output(0)
@@ -132,12 +132,12 @@ def add_rms_norm_per_head(
 ) -> trt.ITensor:
     """Per-head RMSNorm for [Sq, num_heads * head_dim] tensors.
 
-    FP32 precision boundary: when dtype != float32, casts to FP32 before
-    norm computation for numerical stability, then casts back.
+    FP32 precision boundary: non-FP32 runtime inputs are cast to FP32 for
+    normalization, then cast back independently of NumPy weight storage.
     ``sequence_length=None`` means runtime-dynamic Sq.
     ``gamma`` may be [num_heads * head_dim] or [head_dim] broadcast to heads.
     """
-    need_cast = dtype != np.float32
+    need_cast = inp.dtype != trt.float32
     output_dtype = inp.dtype
     seq_dim = -1 if sequence_length is None else sequence_length
     reshape_in = network.add_shuffle(inp)
@@ -279,10 +279,10 @@ def add_layer_norm(
 ) -> trt.ITensor:
     """LayerNorm: gamma * ((x - mean) / sqrt(var + eps)) + beta.
 
-    FP32 precision boundary: when dtype != float32, casts to FP32 before
-    norm computation for numerical stability, then casts back.
+    FP32 precision boundary: non-FP32 runtime inputs are cast to FP32 for
+    normalization, then cast back independently of NumPy weight storage.
     """
-    need_cast = dtype != np.float32
+    need_cast = inp.dtype != trt.float32
     output_dtype = inp.dtype
     if need_cast:
         inp = network.add_cast(inp, trt.float32).get_output(0)
