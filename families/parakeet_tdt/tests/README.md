@@ -10,13 +10,28 @@ They exercise the real BuildRequest, family dispatch, configuration validation,
 and BundleWriter. They do not establish engine validity, numerical equivalence,
 transcript quality, GPU execution, or performance.
 
-`test_native.py` compiles three CPU executables with a C++17 compiler (`CXX`,
+`test_native.py` compiles five CPU executables with a C++17 compiler (`CXX`,
 default `c++`): Task audio-input validation/downmix/resampling, the existing
 mel/FFT/incremental-resampling tests, and the existing TDT duration/geometry
-tests. The last two retain their original assertions from PR #1060. No CUDA or
-TensorRT libraries are used. The audio-input helper is not yet wired to the
-pending native family factory/pipeline; these tests do not establish an
-end-to-end transcription path or advertise streaming support.
+tests, semantic transcription pipeline orchestration with fake engines, and BPE
+Metaspace decoding. The original mel and duration assertions from PR #1060 are
+retained. Pipeline tests need CUDA headers (`CUDA_HOME` or `CUDA_PATH`) but use
+no GPU or CUDA/TensorRT libraries. Tokenizer tests need `nlohmann/json.hpp`
+(`NLOHMANN_JSON_INCLUDE_DIR`, default `/usr/include`). Missing headers produce
+explicit skips, not passing evidence.
+
+The native pipeline now connects the audio helper to encoder, predictor, joint,
+and tokenizer calls. Tests check request state reset, invalid options, malformed
+or missing engine outputs, and recovery after failed requests. The family factory
+and CMake target are present, but these CPU tests do not prove engine validity,
+factory bundle compatibility, model transcript parity, or streaming support.
+
+An additional September 19, 2026 check compared the pinned official tokenizer
+above against Hugging Face `tokenizers==0.22.2`: all 8,193 singleton vocabulary
+IDs, 1,000 deterministic random token sequences, and two special/empty cases
+matched (9,195 cases). It caught and fixed incorrect conversion of the literal
+`Ġ` character to a space. The synthetic regression remains in the repository;
+this broader check requires downloading the official tokenizer JSON, not weights.
 
 From the repository root:
 
