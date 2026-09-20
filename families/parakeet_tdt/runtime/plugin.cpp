@@ -33,7 +33,7 @@ extern "C" trtmc::ITask* trtmc_create_family(const trtmc::FamilyContext& context
     using namespace trtmc;
     using namespace trtmc::parakeet_tdt;
     if (context.kv_cache_size_bytes != 0)
-        throw std::invalid_argument("Parakeet TDT does not support kv-cache-size");
+        throw std::invalid_argument("parakeet_tdt does not support --kv-cache-size");
     if (context.reader.info().family != "parakeet_tdt" ||
         context.reader.info().task != "speech_transcription" ||
         context.reader.info().backend != "trt" || std::string(context.backend.name()) != "trt")

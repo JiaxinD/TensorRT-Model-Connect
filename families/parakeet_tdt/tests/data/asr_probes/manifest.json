@@ -1,5 +1,5 @@
 {
-  "source_audio": "tests/e2e/models/parakeet_tdt/data/Recording.wav",
+  "source_audio": "families/parakeet_tdt/tests/data/Recording.wav",
   "source_properties": {
     "sample_rate_hz": 48000,
     "channels": 2,

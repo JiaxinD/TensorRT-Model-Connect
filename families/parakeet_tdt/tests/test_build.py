@@ -52,7 +52,7 @@ def test_discovery_does_not_claim_other_parakeet_topologies(config):
     ("context_parallel_size", 2), ("max_batch_size", 2),
     ("max_sequence_length", 128), ("image_height", 224), ("image_width", 224),
     ("video_num_frames", 8), ("quantization", "int8"),
-    ("fp32_layers", (0,)), ("dynamic_kv_cache", True),
+    ("fp32_layers", (0,)),
     ("graph_transform", lambda *args: None),
 ])
 def test_unsupported_options_fail_before_checkpoint_or_engine_loading(tmp_path, option, value):
@@ -68,6 +68,13 @@ def test_missing_native_checkpoint_does_not_fall_back_to_nemo(tmp_path):
     req.model_dir.mkdir()
     (req.model_dir / "legacy.nemo").write_bytes(b"not a supported input")
     with pytest.raises(FileNotFoundError, match="config.json"):
+        build(req, BundleWriter(req.output_path))
+
+
+def test_dynamic_kv_cache_is_explicitly_unsupported(tmp_path):
+    build = importlib.import_module("families.parakeet_tdt.model").build
+    req = request(tmp_path, dynamic_kv_cache=True)
+    with pytest.raises(NotImplementedError, match="does not support dynamic_kv_cache"):
         build(req, BundleWriter(req.output_path))
 
 

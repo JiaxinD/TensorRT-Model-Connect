@@ -166,7 +166,8 @@ def test_official_checkpoint_e2e(case_name, tmp_path):
     bundle = tmp_path / manifest["bundle"]
     with evidence_stage("build"):
         build(BuildRequest(model_dir=model_dir, output_path=bundle, family=FAMILY,
-                           task=manifest["task"], precision=manifest["precision"]))
+                           task=manifest["task"], precision=manifest["precision"],
+                           tensor_parallel_size=int(manifest["tensor_parallel_size"])))
     audio, rate, channels = _audio(case)
     pcm = tmp_path / "input.f32"
     audio.astype("<f4").tofile(pcm)
