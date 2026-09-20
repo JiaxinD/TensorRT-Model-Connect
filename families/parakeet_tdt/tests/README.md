@@ -31,7 +31,7 @@ invalid identity/config/tokenizer/frontend data, missing sections, failed engine
 loads, and destruction of modules after partial construction failures. Engine
 loading is faked; CUDA headers and nlohmann JSON are required as above. This
 does not prove TensorRT deserialization, engine validity, model transcript parity,
-or streaming support. The E2E/manifest migration remains incomplete.
+or streaming support.
 
 An additional September 19, 2026 check compared the pinned official tokenizer
 above against Hugging Face `tokenizers==0.22.2`: all 8,193 singleton vocabulary
