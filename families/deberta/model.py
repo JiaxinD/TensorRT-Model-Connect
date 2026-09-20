@@ -82,7 +82,6 @@ class _DebertaModel:
         embedding = _load_tensor(readers, "deberta.embeddings.word_embeddings.weight")
         if embedding.shape != (vocab, hidden):
             raise ValueError(f"Embedding shape {embedding.shape} != ({vocab}, {hidden})")
-            raise ValueError(f"Embedding shape {embedding.shape} != ({vocab}, {hidden})")
         weights["embedding"] = embedding.astype(np.float32)
 
         if position_biased_input and _has_tensor(
