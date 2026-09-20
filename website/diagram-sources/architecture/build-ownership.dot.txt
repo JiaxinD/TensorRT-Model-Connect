@@ -56,7 +56,7 @@ digraph BuildOwnership {
     penwidth="2";
     fontsize="18";
     fontcolor="#1e3a8a";
-    descriptor [label=<<B>Family descriptor</B><BR/><FONT POINT-SIZE="16">MODEL.toml + match rules</FONT>>];
+    descriptor [label=<<B>Family support</B><BR/><FONT POINT-SIZE="16">support.py + match rules</FONT>>];
     plugin [label=<<B>FamilyPlugin</B><BR/><FONT POINT-SIZE="16">config · weights · checkpoint mapping</FONT>>];
     native [label=<<B>Native builders</B><BR/><FONT POINT-SIZE="16">graph + TensorRT engine plans</FONT>>];
     optimized [label=<<B>Exact optimized profile</B><BR/><FONT POINT-SIZE="16">implementation + isolated adapter</FONT>>];

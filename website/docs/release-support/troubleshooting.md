@@ -5,11 +5,11 @@ description: Route failures to model resolution, build, bundle, load, execution,
 
 | Boundary | Diagnostic | Owner to inspect |
 | --- | --- | --- |
-| Model resolution | Exact ID/revision, config, auth, local assets | Python family descriptor/plugin |
+| Model resolution | Exact ID/revision, config, auth, local assets | Family `support.py` and builder |
 | TensorRT build | First parser/builder error, shapes, precision, workspace | Family builder and backend |
 | Bundle | `trtmc inspect`, section list, checksum | Bundle writer/format |
-| Runtime dispatch | Native strategy or optimized descriptor | Model DSO or provider adapter |
-| Dependency load | Loader error, DSO search path, ABI cohort | Host environment/backend/provider |
+| Runtime loading | Required family task and runtime-root contents | Family DSO and shared loader |
+| Dependency load | Loader error, exact runtime root, ABI cohort | Host environment, core, backend, and family DSOs |
 | Task execution | Exact input, request config, first runtime error | Model pipeline/task implementation |
 | Validation | Oracle, comparator, thresholds, skipped prerequisites | E2E manifest and harness |
 | Performance | Timing boundary, warmup, variance, quality gate | Benchmark configuration |

@@ -15,11 +15,13 @@ const config = {
   projectName: repositoryName,
   onBrokenLinks: 'throw',
   markdown: {
+    mermaid: true,
     hooks: {
       onBrokenMarkdownLinks: 'warn'
     }
   },
   plugins: [require.resolve('./plugins/model-support-inventory')],
+  themes: ['@docusaurus/theme-mermaid'],
   presets: [
     [
       'classic',
@@ -56,9 +58,9 @@ const config = {
         { to: '/models-recipes/overview', label: 'Models', position: 'left' },
         { to: '/user-guides/overview', label: 'User Guides', position: 'left' },
         { to: '/learning-path', label: 'Tutorials', position: 'left' },
-        { to: '/blog', label: 'Blog', position: 'left' },
         { to: '/developer-guide/overview', label: 'Developer', position: 'left' },
         { to: '/api/overview', label: 'Reference', position: 'left' },
+        { to: '/blog', label: 'Blog', position: 'left' },
         { href: `https://github.com/${repository}`, label: 'GitHub', position: 'right' }
       ]
     },
@@ -78,6 +80,7 @@ const config = {
           items: [
             { label: 'Tutorial Curriculum', to: '/learning-path' },
             { label: 'Blog', to: '/blog' },
+            { label: 'Architecture', to: '/architecture/ai-native-horizontal-scaling' },
             { label: 'Reference', to: '/api/overview' },
             { label: 'Developer Guide', to: '/developer-guide/overview' }
           ]

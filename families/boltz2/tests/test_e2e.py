@@ -1,0 +1,963 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Direct build and native Task qualification for Boltz-2."""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import struct
+import subprocess
+import tarfile
+from pathlib import Path
+
+import numpy as np
+import pytest
+from families.boltz2.cli import BuildRequest, build_bundle
+from tools.e2e_evidence import evidence_enabled, evidence_stage, record_evidence
+
+
+FAMILY = "boltz2"
+TASK = "structure_prediction"
+TEST_ROOT = Path(__file__).resolve().parent
+MANIFEST_ROOT = TEST_ROOT / "manifests"
+THRESHOLD_ROOT = TEST_ROOT / "thresholds"
+
+
+def _record_request_evidence(request: Path, prepared: Path | None = None) -> None:
+    if not evidence_enabled():
+        return
+    try:
+        from families.boltz2.contracts import LigandInput, parse_request_yaml
+
+        def entity_text(entity) -> str:
+            if isinstance(entity, LigandInput):
+                value = entity.smiles or ",".join(entity.ccd)
+                return "Ligand " + ", ".join(entity.chain_ids) + "\n" + value
+            return (
+                entity.kind.value.title()
+                + " "
+                + ", ".join(entity.chain_ids)
+                + "\n"
+                + entity.sequence
+            )
+
+        record_evidence("inputs", {"request_file": request, "prepared_request": prepared})
+        if request.stat().st_size > 65536:
+            record_evidence("input_preview", {"omitted": "request exceeds the text preview bound"})
+            return
+        parsed = parse_request_yaml(request.read_text(encoding="utf-8"))
+        record_evidence(
+            "inputs",
+            {
+                "text": "\n\n".join(entity_text(entity) for entity in parsed.sequences),
+                "sequences": [
+                    {
+                        "chain_ids": list(entity.chain_ids),
+                        "sequence": getattr(entity, "sequence", None),
+                        "smiles": getattr(entity, "smiles", None),
+                        "ccd": list(getattr(entity, "ccd", ())),
+                        "msa": (
+                            request.parent / entity.msa_path
+                            if getattr(entity, "msa_path", None) is not None
+                            else None
+                        ),
+                    }
+                    for entity in parsed.sequences
+                ],
+            },
+        )
+    except Exception as error:
+        record_evidence("input_preview", {"error": f"{type(error).__name__}: {error}"})
+
+
+def _record_native_evidence(structure: Path, metadata: Path) -> None:
+    if not evidence_enabled():
+        return
+    try:
+        record_evidence("native_artifacts", {"structure": structure, "metadata": metadata})
+        if metadata.stat().st_size <= 8 * 1024 * 1024:
+            record_evidence("native", json.loads(metadata.read_text(encoding="utf-8")))
+        else:
+            record_evidence(
+                "native",
+                {"metadata": metadata, "omitted": "metadata exceeds the JSON preview bound"},
+            )
+    except Exception as error:
+        record_evidence("native_preview", {"error": f"{type(error).__name__}: {error}"})
+
+
+def _record_reference_comparison(structure: Path, reference: Path, accuracy: Path) -> None:
+    if not evidence_enabled():
+        return
+    try:
+        record_evidence("comparison_artifacts", {"accuracy": accuracy})
+        if accuracy.stat().st_size > 8 * 1024 * 1024:
+            record_evidence(
+                "comparison_preview", {"omitted": "accuracy exceeds the JSON preview bound"}
+            )
+            return
+        metrics = json.loads(accuracy.read_text(encoding="utf-8"))
+        record_evidence("metrics", metrics)
+        qualification = metrics["qualification"]
+        thresholds, outcomes = qualification["thresholds"], qualification["checks"]
+        checks = [
+            {
+                "name": name,
+                "label": label,
+                "scope": "contract",
+                "actual": metrics[name],
+                "operator": "==",
+                "expected": expected,
+                "passed": outcomes[name],
+            }
+            for name, label, expected in (
+                ("all_outputs_finite", "Finite outputs", True),
+                ("atom_count", "Atom count", thresholds["atom_count"]),
+                ("token_count", "Token count", thresholds["token_count"]),
+            )
+        ]
+        checks.extend(
+            {
+                "name": name,
+                "label": label,
+                "scope": "independent_reference",
+                "actual": metrics[name],
+                "operator": operator,
+                "expected": thresholds[threshold],
+                "passed": outcomes[name],
+            }
+            for name, label, operator, threshold in (
+                ("lddt", "lDDT", ">=", "lddt_min"),
+                ("kabsch_rmsd_angstrom", "Aligned RMSD (Å)", "<=", "kabsch_rmsd_angstrom_max"),
+                ("plddt_mean_abs", "Mean pLDDT difference", "<=", "plddt_mean_abs_max"),
+                (
+                    "confidence_score_abs",
+                    "Confidence score difference",
+                    "<=",
+                    "confidence_score_abs_max",
+                ),
+                ("complex_plddt_abs", "Complex pLDDT difference", "<=", "complex_plddt_abs_max"),
+                (
+                    "complex_iplddt_abs",
+                    "Complex interface pLDDT difference",
+                    "<=",
+                    "complex_iplddt_abs_max",
+                ),
+                ("ptm_abs", "pTM difference", "<=", "ptm_abs_max"),
+                ("iptm_abs", "ipTM difference", "<=", "iptm_abs_max"),
+                ("protein_iptm_abs", "Protein ipTM difference", "<=", "protein_iptm_abs_max"),
+                (
+                    "chains_ptm_max_abs",
+                    "Largest per-chain pTM difference",
+                    "<=",
+                    "chains_ptm_max_abs_max",
+                ),
+                (
+                    "pair_chains_iptm_max_abs",
+                    "Largest chain-pair ipTM difference",
+                    "<=",
+                    "pair_chains_iptm_max_abs_max",
+                ),
+            )
+        )
+        record_evidence(
+            "reference_comparison",
+            {
+                "label": structure.stem,
+                "scope": "independent_reference",
+                "enforced": True,
+                "native": structure,
+                "reference": reference,
+                "checks": checks,
+            },
+        )
+    except Exception as error:
+        record_evidence("comparison_preview", {"error": f"{type(error).__name__}: {error}"})
+
+
+def _cases() -> dict[str, tuple[dict, dict]]:
+    result = {}
+    for path in MANIFEST_ROOT.glob("*.json"):
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        assert manifest["family"] == FAMILY and manifest["task"] == TASK
+        for case in manifest["testcases"]:
+            result[case["name"]] = (manifest, case)
+    return result
+
+
+CASES = _cases()
+
+
+def test_biomolecular_request_contract() -> None:
+    from families.boltz2.contracts import LigandInput, PolymerKind, parse_request_yaml
+
+    request = parse_request_yaml(
+        """version: 1
+sequences:
+  - protein:
+      id: [A, B]
+      sequence: ACDE
+      msa: shared.a3m
+  - protein:
+      id: C
+      sequence: FGHIK
+      msa: chain-c.csv
+      cyclic: true
+      modifications:
+        - ccd: MSE
+          position: 2
+  - dna:
+      id: D
+      sequence: ACGTN
+  - rna:
+      id: E
+      sequence: ACGUN
+  - ligand:
+      id: L
+      smiles: CCO
+  - ligand:
+      id: M
+      ccd: EOH
+templates:
+  - cif: template.cif
+    chain_id: [A, B]
+    template_id: [X, Y]
+properties:
+  - affinity:
+      binder: L
+constraints:
+  - pocket:
+      binder: L
+      contacts: [[A, 1], [C, 2]]
+  - contact:
+      token1: [L, C1]
+      token2: [A, 2]
+"""
+    )
+    assert request.token_count == 25
+    assert request.sequences[0].chain_ids == ("A", "B")
+    assert request.sequences[1].chain_ids == ("C",)
+    assert request.sequences[1].cyclic is True
+    assert request.sequences[2].kind is PolymerKind.DNA
+    assert request.sequences[3].kind is PolymerKind.RNA
+    assert isinstance(request.sequences[4], LigandInput)
+    assert isinstance(request.sequences[5], LigandInput)
+    assert request.sequences[5].ccd == ("EOH",)
+    assert request.affinity is not None and request.affinity.binder == "L"
+    assert len(request.constraints) == 2
+    assert request.templates[0].template_chain_ids == ("X", "Y")
+
+
+def pytest_generate_tests(metafunc) -> None:
+    if "case_name" not in metafunc.fixturenames:
+        return
+    selected = set()
+    for option in ("--e2e-model", "--e2e-testcase"):
+        for value in metafunc.config.getoption(option) or []:
+            selected.update(item.strip() for item in value.split(",") if item.strip())
+    models_file = metafunc.config.getoption("--e2e-models-file")
+    if models_file:
+        selected.update(
+            line.strip()
+            for line in Path(models_file).read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+    enabled = bool(selected)
+    names = [
+        name
+        for name, (manifest, _) in CASES.items()
+        if not selected or selected & {FAMILY, name, manifest["name"]}
+    ]
+    metafunc.parametrize(
+        "case_name",
+        names
+        if enabled
+        else [
+            pytest.param(name, marks=pytest.mark.skip(reason="select Boltz-2 E2E explicitly"))
+            for name in names
+        ],
+        ids=names,
+    )
+
+
+def _required_environment(name: str) -> Path:
+    value = os.environ.get(name)
+    assert value, f"selected Boltz-2 E2E requires {name}"
+    path = Path(value)
+    assert path.exists(), f"{name} does not exist: {path}"
+    return path
+
+
+def _model_dir(manifest: dict, tmp_path: Path) -> Path:
+    explicit = os.environ.get("TRTMC_BOLTZ2_MODEL_DIR")
+    if explicit:
+        return _required_environment("TRTMC_BOLTZ2_MODEL_DIR")
+
+    from boltz.main import process_inputs
+    from huggingface_hub import snapshot_download
+
+    try:
+        snapshot = Path(
+            snapshot_download(
+                repo_id=manifest["hf_id"],
+                revision=manifest["hf_revision"],
+                local_files_only=True,
+                allow_patterns=["boltz2_conf.ckpt", "boltz2_aff.ckpt", "mols.tar"],
+            )
+        )
+    except Exception as error:
+        raise AssertionError(
+            "selected Boltz-2 E2E requires the exact cached public checkpoint"
+        ) from error
+
+    model_dir = tmp_path / "boltz2-model"
+    model_dir.mkdir()
+    for name in ("boltz2_conf.ckpt", "boltz2_aff.ckpt", "mols.tar"):
+        source = snapshot / name
+        assert source.is_file(), f"cached Boltz-2 snapshot is missing {name}"
+        (model_dir / name).symlink_to(source.resolve(strict=True))
+    shutil.copy2(TEST_ROOT / "data/protein_monomer.yaml", model_dir)
+    shutil.copy2(TEST_ROOT / "data/protein_monomer.a3m", model_dir)
+    with tarfile.open(model_dir / "mols.tar", "r") as archive:
+        archive.extractall(model_dir, filter="data")
+    mols = model_dir / "mols"
+    assert mols.is_dir(), "cached Boltz-2 molecule archive has no mols directory"
+
+    previous = Path.cwd()
+    try:
+        os.chdir(model_dir)
+        process_inputs(
+            data=[model_dir / "protein_monomer.yaml"],
+            out_dir=model_dir,
+            ccd_path=mols / "unused.pkl",
+            mol_dir=mols,
+            msa_server_url="https://api.colabfold.com",
+            msa_pairing_strategy="greedy",
+            max_msa_seqs=1024,
+            use_msa_server=False,
+            boltz2=True,
+            preprocessing_threads=1,
+        )
+    finally:
+        os.chdir(previous)
+    return model_dir
+
+
+def _last_json(text: str) -> dict:
+    for line in reversed(text.splitlines()):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    raise AssertionError("native prediction emitted no JSON summary")
+
+
+def _assert_live_reference_parity(
+    model_dir: Path,
+    processed_dir: Path,
+    structure: Path,
+    metadata: Path,
+    output_dir: Path,
+    *,
+    atom_count: int,
+    token_count: int,
+) -> None:
+    with evidence_stage("reference"):
+        import torch
+
+        from families.boltz2.reference import (
+            compare_native,
+            load_reference_model,
+            predict_reference,
+            save_reference_output,
+        )
+        from families.boltz2.request_preparation import load_profile_features
+
+        batch = load_profile_features(processed_dir, model_dir / "mols")
+        model = load_reference_model(model_dir / "boltz2_conf.ckpt")
+        prediction = predict_reference(model, batch)
+        reference = output_dir / "eager-reference.npz"
+        save_reference_output(reference, prediction)
+        record_evidence("reference", {"artifact": reference, "kind": "seeded eager model output"})
+        del prediction, model, batch
+        torch.cuda.empty_cache()
+    with evidence_stage("compare"):
+        try:
+            compare_native(
+                reference,
+                structure,
+                metadata,
+                output_dir / "accuracy.json",
+                expected_atom_count=atom_count,
+                expected_token_count=token_count,
+            )
+        finally:
+            _record_reference_comparison(structure, reference, output_dir / "accuracy.json")
+
+
+def _affinity_head_inputs(arguments: dict) -> dict[str, np.ndarray]:
+    feats = arguments["feats"]
+    return {
+        "s_inputs_affinity": arguments["s_inputs"].detach().float().cpu().numpy(),
+        "z": arguments["z"].detach().float().cpu().numpy(),
+        "x_pred": arguments["x_pred"].detach().float().reshape(1, -1, 3).cpu().numpy(),
+        "token_to_rep_atom": feats["token_to_rep_atom"].detach().int().cpu().numpy(),
+        "mol_type": feats["mol_type"].detach().int().cpu().numpy(),
+        "affinity_token_mask": (feats["affinity_token_mask"].detach().int().cpu().numpy()),
+        "token_mask": feats["token_pad_mask"].detach().float().cpu().numpy(),
+    }
+
+
+def _bundle_section(bundle: Path, name: str) -> bytes:
+    with bundle.open("rb") as stream:
+        assert stream.read(8) == b"BUNDLE\x01\x00"
+        header_size = struct.unpack("<Q", stream.read(8))[0]
+        header = json.loads(stream.read(header_size))
+        section = header["sections"][name]
+        stream.seek(16 + header_size + section["offset"])
+        payload = stream.read(section["length"])
+    assert len(payload) == section["length"]
+    return payload
+
+
+def _run_affinity_plan(plan: bytes, inputs: dict[str, np.ndarray]) -> dict[str, float]:
+    import tensorrt as trt
+    import torch
+
+    runtime = trt.Runtime(trt.Logger(trt.Logger.WARNING))
+    engine = runtime.deserialize_cuda_engine(plan)
+    assert engine is not None
+    context = engine.create_execution_context()
+    assert context is not None
+    torch_dtypes = {trt.float32: torch.float32, trt.int32: torch.int32}
+    tensors = {}
+    for index in range(engine.num_io_tensors):
+        name = engine.get_tensor_name(index)
+        dtype = torch_dtypes[engine.get_tensor_dtype(name)]
+        if engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+            tensor = torch.as_tensor(inputs[name], device="cuda", dtype=dtype).contiguous()
+        else:
+            tensor = torch.empty(tuple(context.get_tensor_shape(name)), device="cuda", dtype=dtype)
+        tensors[name] = tensor
+        assert context.set_tensor_address(name, tensor.data_ptr())
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    assert context.execute_async_v3(stream.cuda_stream)
+    stream.synchronize()
+    return {
+        name: float(tensor.detach().float().cpu().reshape(-1)[0])
+        for name, tensor in tensors.items()
+        if engine.get_tensor_mode(name) == trt.TensorIOMode.OUTPUT
+    }
+
+
+def _assert_affinity_head_parity(
+    bundle: Path,
+    inputs: dict[int, dict[str, np.ndarray]],
+    reference: dict[int, dict[str, float]],
+) -> None:
+    checks = []
+    try:
+        for member in (1, 2):
+            actual = _run_affinity_plan(
+                _bundle_section(bundle, f"boltz2_affinity_{member}_plan"), inputs[member]
+            )
+            for name in ("affinity_pred_value", "affinity_probability_binary"):
+                error = abs(actual[name] - reference[member][name])
+                checks.append(
+                    {
+                        "name": f"{name}{member}_same_input",
+                        "actual": error,
+                        "operator": "<=",
+                        "expected": 1.0e-4,
+                        "passed": error <= 1.0e-4,
+                    }
+                )
+    finally:
+        record_evidence("affinity_head_reference_comparison", {"enforced": True, "checks": checks})
+    for check in checks:
+        assert check["passed"], (
+            f"{check['name']} absolute error {check['actual']} exceeds {check['expected']}"
+        )
+
+
+def _assert_live_affinity_parity(
+    model_dir: Path, processed_dir: Path, bundle: Path, metadata: Path
+) -> None:
+    import torch
+
+    from families.boltz2.reference import (
+        load_affinity_reference_model,
+        predict_affinity_reference,
+    )
+    from families.boltz2.request_preparation import load_profile_features
+
+    batch = None
+    model = None
+    prediction = None
+    head_inputs = {}
+    handles = []
+    checks = []
+    try:
+        batch = load_profile_features(processed_dir, model_dir / "mols")
+        model = load_affinity_reference_model(model_dir / "boltz2_aff.ckpt")
+        for member in (1, 2):
+            module = getattr(model, f"affinity_module{member}")
+            handles.append(
+                module.register_forward_pre_hook(
+                    lambda _module, _args, kwargs, member=member: head_inputs.__setitem__(
+                        member, _affinity_head_inputs(kwargs)
+                    ),
+                    with_kwargs=True,
+                )
+            )
+        prediction = predict_affinity_reference(model, batch)
+        native = json.loads(metadata.read_text(encoding="utf-8"))
+        # The affinity value is highly sensitive to which near-tied diffusion
+        # candidate wins iPTM ranking. Record the independent-path difference,
+        # while gating the stable aggregate probability and exact-input heads.
+        reference_value = float(
+            prediction["affinity_pred_value"].detach().float().cpu().reshape(-1)[0]
+        )
+        record_evidence(
+            "affinity_value_observation",
+            {
+                "scope": "independent_reference",
+                "enforced": False,
+                "native": float(native["affinity_pred_value"]),
+                "reference": reference_value,
+                "absolute_error": abs(float(native["affinity_pred_value"]) - reference_value),
+            },
+        )
+        limits = {"affinity_probability_binary": 0.03}
+        try:
+            for name, limit in limits.items():
+                reference = float(prediction[name].detach().float().cpu().reshape(-1)[0])
+                error = abs(float(native[name]) - reference)
+                checks.append(
+                    {
+                        "name": name,
+                        "actual": error,
+                        "operator": "<=",
+                        "expected": limit,
+                        "passed": error <= limit,
+                    }
+                )
+        finally:
+            record_evidence("affinity_reference_comparison", {"enforced": True, "checks": checks})
+        for check in checks:
+            assert check["passed"], (
+                f"{check['name']} absolute error {check['actual']} exceeds {check['expected']}"
+            )
+        assert np.isclose(
+            native["affinity_pred_value"],
+            (native["affinity_pred_value1"] + native["affinity_pred_value2"]) / 2.0,
+            rtol=0.0,
+            atol=1.0e-6,
+        )
+        assert np.isclose(
+            native["affinity_probability_binary"],
+            (native["affinity_probability_binary1"] + native["affinity_probability_binary2"]) / 2.0,
+            rtol=0.0,
+            atol=1.0e-6,
+        )
+        head_reference = {
+            member: {
+                "affinity_pred_value": float(
+                    prediction[f"affinity_pred_value{member}"].detach().float().cpu().reshape(-1)[0]
+                ),
+                "affinity_probability_binary": float(
+                    prediction[f"affinity_probability_binary{member}"]
+                    .detach()
+                    .float()
+                    .cpu()
+                    .reshape(-1)[0]
+                ),
+            }
+            for member in (1, 2)
+        }
+    finally:
+        for handle in handles:
+            handle.remove()
+        del prediction, model, batch
+        torch.cuda.empty_cache()
+    _assert_affinity_head_parity(bundle, head_inputs, head_reference)
+
+
+def test_model_e2e(case_name: str, tmp_path: Path) -> None:
+    manifest, case = CASES[case_name]
+    record_evidence("inputs", {"manifest": manifest, "case": case})
+    _record_request_evidence(TEST_ROOT / case["request"])
+    model_dir = _model_dir(manifest, tmp_path)
+    record_evidence(
+        "checkpoint",
+        {
+            "model_dir": str(model_dir),
+            "hf_id": manifest["hf_id"],
+            "hf_revision": manifest["hf_revision"],
+        },
+    )
+    binary = _required_environment("TRTMC_BINARY")
+    runtime_root = _required_environment("TRTMC_RUNTIME_ROOT")
+    assert manifest["hf_id"] and manifest["hf_revision"]
+
+    bundle = tmp_path / manifest["bundle"]
+    with evidence_stage("build"):
+        assert manifest["tensor_parallel_size"] == 1
+        build_bundle(
+            BuildRequest(
+                model_dir=model_dir,
+                task=manifest["task"],
+                precision=manifest["precision"],
+                max_sequence_length=manifest["max_sequence_length"],
+            ),
+            bundle,
+        )
+    structure = tmp_path / "prediction.cif"
+    metadata = tmp_path / "prediction.json"
+    request = TEST_ROOT / case["request"]
+    environment = os.environ.copy()
+    environment["LD_LIBRARY_PATH"] = ":".join(
+        value for value in (str(runtime_root), environment.get("LD_LIBRARY_PATH")) if value
+    )
+    with evidence_stage("native"):
+        completed = subprocess.run(
+            [
+                str(binary),
+                "predict-structure",
+                str(bundle),
+                "--runtime-root",
+                str(runtime_root),
+                "--input",
+                str(request),
+                "--output",
+                str(structure),
+                "--output-json",
+                str(metadata),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=1800,
+        )
+        record_evidence(
+            "native_process",
+            {"argv": completed.args, "stdout": completed.stdout, "stderr": completed.stderr},
+        )
+        record_evidence("native_summary", _last_json(completed.stdout))
+        details = json.loads(metadata.read_text(encoding="utf-8"))
+        record_evidence("native", {**details, "structure": structure, "metadata": metadata})
+    thresholds = json.loads((THRESHOLD_ROOT / f"{case_name}.json").read_text(encoding="utf-8"))[
+        "threshold_overrides"
+    ]
+    record_evidence("thresholds", thresholds)
+    atom_count = sum(line.startswith("ATOM ") for line in structure.read_text().splitlines())
+    token_count = len(details["plddt"])
+    with evidence_stage("compare"):
+        assert atom_count == thresholds["atom_count"]
+        assert token_count == thresholds["token_count"]
+        assert structure.read_text(encoding="utf-8").startswith("data_boltz2\n#\nloop_\n")
+    _assert_live_reference_parity(
+        model_dir,
+        model_dir / "processed",
+        structure,
+        metadata,
+        tmp_path,
+        atom_count=thresholds["atom_count"],
+        token_count=thresholds["token_count"],
+    )
+
+    from families.boltz2.random_samples import serialize_profile_random_samples
+    from families.boltz2.request_preparation import _isolated_rng_state, prepare_structure_request
+
+    bundle_stat = bundle.stat()
+    bundle_identity = (
+        bundle_stat.st_dev,
+        bundle_stat.st_ino,
+        bundle_stat.st_size,
+        bundle_stat.st_mtime_ns,
+        bundle_stat.st_ctime_ns,
+    )
+    request_root = tmp_path / "biomolecular-request"
+    request_root.mkdir()
+    (request_root / "a.csv").write_text(
+        "key,sequence\n-1,ACDE\n9606,ACNE\n10090,AGDE\n", encoding="utf-8"
+    )
+    (request_root / "b.csv").write_text(
+        "key,sequence\n-1,FGHIK\n9606,FGHVK\n10090,FGYIK\n", encoding="utf-8"
+    )
+    (request_root / "template.pdb").write_text(
+        "HEADER    SYNTHETIC BOLTZ2 E2E TEMPLATE\n"
+        "SEQRES   1 X    4  ALA CYS ASP GLU\n"
+        "ATOM      1  N   ALA X   1       0.000   0.000   0.000  1.00 20.00           N\n"
+        "ATOM      2  CA  ALA X   1       1.450   0.000   0.000  1.00 20.00           C\n"
+        "ATOM      3  C   ALA X   1       2.000   1.420   0.000  1.00 20.00           C\n"
+        "ATOM      4  O   ALA X   1       1.350   2.420   0.000  1.00 20.00           O\n"
+        "ATOM      5  CB  ALA X   1       1.950  -0.750  -1.220  1.00 20.00           C\n"
+        "ATOM      6  N   CYS X   2       3.250   1.500   0.000  1.00 20.00           N\n"
+        "ATOM      7  CA  CYS X   2       3.900   2.820   0.000  1.00 20.00           C\n"
+        "ATOM      8  C   CYS X   2       5.420   2.700   0.000  1.00 20.00           C\n"
+        "ATOM      9  O   CYS X   2       6.050   3.730   0.000  1.00 20.00           O\n"
+        "ATOM     10  CB  CYS X   2       3.350   3.650  -1.160  1.00 20.00           C\n"
+        "ATOM     11  N   ASP X   3       6.000   1.520   0.000  1.00 20.00           N\n"
+        "ATOM     12  CA  ASP X   3       7.450   1.350   0.000  1.00 20.00           C\n"
+        "ATOM     13  C   ASP X   3       8.000   2.770   0.000  1.00 20.00           C\n"
+        "ATOM     14  O   ASP X   3       7.340   3.770   0.000  1.00 20.00           O\n"
+        "ATOM     15  CB  ASP X   3       7.900   0.550  -1.220  1.00 20.00           C\n"
+        "ATOM     16  N   GLU X   4       9.250   2.850   0.000  1.00 20.00           N\n"
+        "ATOM     17  CA  GLU X   4       9.900   4.170   0.000  1.00 20.00           C\n"
+        "ATOM     18  C   GLU X   4      11.420   4.050   0.000  1.00 20.00           C\n"
+        "ATOM     19  O   GLU X   4      12.050   5.080   0.000  1.00 20.00           O\n"
+        "ATOM     20  CB  GLU X   4       9.350   5.000  -1.160  1.00 20.00           C\n"
+        "TER\nEND\n",
+        encoding="utf-8",
+    )
+    biomolecular_request = request_root / "request.json"
+    biomolecular_request.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "sequences": [
+                    {"protein": {"id": "A", "sequence": "ACDE", "msa": "a.csv", "cyclic": True}},
+                    {"protein": {"id": "B", "sequence": "FGHIK", "msa": "b.csv"}},
+                    {
+                        "protein": {
+                            "id": "C",
+                            "sequence": "S",
+                            "msa": "empty",
+                            "modifications": [{"ccd": "SEP", "position": 1}],
+                        }
+                    },
+                    {"dna": {"id": "D", "sequence": "ACGTN"}},
+                    {"rna": {"id": "R", "sequence": "ACGUN"}},
+                    {"ligand": {"id": "L", "ccd": "EOH"}},
+                ],
+                "templates": [{"pdb": "template.pdb", "chain_id": "A", "template_id": "X1"}],
+                "properties": [{"affinity": {"binder": "L"}}],
+                "constraints": [
+                    {"bond": {"atom1": ["A", 1, "CA"], "atom2": ["B", 1, "CA"]}},
+                    {"pocket": {"binder": "L", "contacts": [["A", 1], ["B", 1]]}},
+                    {"contact": {"token1": ["A", 2], "token2": ["B", 2]}},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    prepared = tmp_path / "biomolecular.b2rq"
+    request_cache = tmp_path / "request-cache"
+    preparation = prepare_structure_request(
+        model_dir,
+        biomolecular_request,
+        prepared,
+        cache_dir=request_cache,
+    )
+    record_evidence("request_preparation", preparation)
+    _record_request_evidence(biomolecular_request, prepared)
+
+    from families.boltz2.feature_bundle import deserialize_features, serialize_features
+    from families.boltz2.request_preparation import serialize_prepared_request
+
+    prepared_payload = prepared.read_bytes()
+    prepared_header = struct.Struct("<4sI4Q")
+    magic, version, *section_sizes = prepared_header.unpack_from(prepared_payload)
+    assert magic == b"B2RQ" and version == 4
+    section_offset = prepared_header.size
+    prepared_sections = []
+    for section_size in section_sizes:
+        prepared_sections.append(prepared_payload[section_offset : section_offset + section_size])
+        section_offset += section_size
+    assert section_offset == len(prepared_payload)
+    malformed_features = deserialize_features(prepared_sections[1])
+    affinity_mask = malformed_features["affinity_token_mask"].copy()
+    affinity_tokens = np.flatnonzero(affinity_mask)
+    assert affinity_tokens.size > 1
+    affinity_mask.flat[affinity_tokens[-1]] = 0
+    malformed_features["affinity_token_mask"] = affinity_mask
+    malformed_prepared = tmp_path / "biomolecular-partial-affinity-mask.b2rq"
+    malformed_prepared.write_bytes(
+        serialize_prepared_request(
+            prepared_sections[0],
+            serialize_features(malformed_features),
+            prepared_sections[2],
+            prepared_sections[3],
+        )
+    )
+    rejected = subprocess.run(
+        [
+            str(binary),
+            "predict-structure",
+            str(bundle),
+            "--runtime-root",
+            str(runtime_root),
+            "--input",
+            str(malformed_prepared),
+            "--output",
+            str(tmp_path / "malformed.cif"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=60,
+    )
+    assert rejected.returncode != 0
+    assert "affinity mask must cover the complete ligand chain" in rejected.stderr
+
+    biomolecular_structure = tmp_path / "biomolecular.cif"
+    biomolecular_metadata = tmp_path / "biomolecular.json"
+    with evidence_stage("native"):
+        completed = subprocess.run(
+            [
+                str(binary),
+                "predict-structure",
+                str(bundle),
+                "--runtime-root",
+                str(runtime_root),
+                "--input",
+                str(prepared),
+                "--output",
+                str(biomolecular_structure),
+                "--output-json",
+                str(biomolecular_metadata),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=1800,
+        )
+        record_evidence(
+            "native_process",
+            {"argv": completed.args, "stdout": completed.stdout, "stderr": completed.stderr},
+        )
+        record_evidence("native_summary", _last_json(completed.stdout))
+    _record_native_evidence(biomolecular_structure, biomolecular_metadata)
+    affinity_metadata = json.loads(biomolecular_metadata.read_text(encoding="utf-8"))
+    assert np.isfinite(affinity_metadata["affinity_pred_value"])
+    assert 0.0 <= affinity_metadata["affinity_probability_binary"] <= 1.0
+    processed_request = (
+        request_cache
+        / str(preparation["cache_key"])[:2]
+        / str(preparation["cache_key"])
+        / "work/processed"
+    )
+    with np.load(processed_request / "structures/request.npz", allow_pickle=False) as archive:
+        active_atoms = int(archive["atoms"].shape[0])
+    bundle_stat = bundle.stat()
+    with evidence_stage("compare"):
+        assert (
+            bundle_stat.st_dev,
+            bundle_stat.st_ino,
+            bundle_stat.st_size,
+            bundle_stat.st_mtime_ns,
+            bundle_stat.st_ctime_ns,
+        ) == bundle_identity
+        biomolecular_details = json.loads(biomolecular_metadata.read_text(encoding="utf-8"))
+        assert biomolecular_details["profile"] == "tokens_117_atoms_928"
+        assert biomolecular_details["active_token_count"] == 23
+        assert biomolecular_details["active_atom_count"] == active_atoms
+        assert biomolecular_details["chain_pair_confidence"] == []
+    _assert_live_reference_parity(
+        model_dir,
+        processed_request,
+        biomolecular_structure,
+        biomolecular_metadata,
+        tmp_path / "biomolecular-reference",
+        atom_count=active_atoms,
+        token_count=23,
+    )
+    with evidence_stage("affinity"):
+        _assert_live_affinity_parity(model_dir, processed_request, bundle, biomolecular_metadata)
+    cached = prepare_structure_request(
+        model_dir,
+        biomolecular_request,
+        tmp_path / "biomolecular-cached.b2rq",
+        cache_dir=request_cache,
+    )
+    record_evidence("request_preparation", cached)
+    with evidence_stage("compare"):
+        assert cached["cache_hit"] is True
+
+    variable_request = tmp_path / "biomolecular-variable.b2rq"
+    import torch
+
+    numpy_rng_state = np.random.get_state()
+    cpu_rng_state = torch.random.get_rng_state()
+    cuda_rng_states = torch.cuda.get_rng_state_all()
+    prepare_structure_request(
+        model_dir,
+        biomolecular_request,
+        variable_request,
+        cache_dir=request_cache,
+        sampling_steps=10,
+        diffusion_samples=2,
+        seed=7,
+        affinity_sampling_steps=10,
+        affinity_diffusion_samples=1,
+    )
+    restored_numpy_state = np.random.get_state()
+    assert numpy_rng_state[0] == restored_numpy_state[0]
+    assert np.array_equal(numpy_rng_state[1], restored_numpy_state[1])
+    assert numpy_rng_state[2:] == restored_numpy_state[2:]
+    assert torch.equal(cpu_rng_state, torch.random.get_rng_state())
+    assert all(
+        torch.equal(expected, actual)
+        for expected, actual in zip(cuda_rng_states, torch.cuda.get_rng_state_all(), strict=True)
+    )
+    payload = variable_request.read_bytes()
+    _, request_size, feature_size, random_size, _ = struct.unpack_from("<I4Q", payload, 4)
+    random_offset = 4 + struct.calcsize("<I4Q") + request_size + feature_size
+    embedded_random = payload[random_offset : random_offset + random_size]
+    with _isolated_rng_state():
+        repeated_random = serialize_profile_random_samples(
+            seed=7,
+            atom_count=928,
+            structure_sampling_steps=10,
+            structure_sample_count=2,
+            affinity_sampling_steps=10,
+            affinity_sample_count=1,
+        )
+    assert embedded_random == repeated_random
+    variable_structure = tmp_path / "biomolecular-variable.cif"
+    variable_metadata = tmp_path / "biomolecular-variable.json"
+    completed = subprocess.run(
+        [
+            str(binary),
+            "predict-structure",
+            str(bundle),
+            "--runtime-root",
+            str(runtime_root),
+            "--input",
+            str(variable_request),
+            "--output",
+            str(variable_structure),
+            "--output-json",
+            str(variable_metadata),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=1800,
+    )
+    sample_outputs = _last_json(completed.stdout)["samples"]
+    assert len(sample_outputs) == 2
+    sample_metadata = [
+        json.loads(Path(sample["metadata_path"]).read_text(encoding="utf-8"))
+        for sample in sample_outputs
+    ]
+    assert [
+        (item["seed"], item["sampling_steps"], item["diffusion_samples"])
+        for item in sample_metadata
+    ] == [(7, 10, 2), (7, 10, 2)]
+    assert sorted(item["sample_rank"] for item in sample_metadata) == [0, 1]
+    assert (
+        Path(sample_outputs[0]["structure_path"]).read_bytes()
+        != Path(sample_outputs[1]["structure_path"]).read_bytes()
+    )

@@ -4,12 +4,10 @@
  */
 
 const path = require('path');
-const {
-  collectModelSupportInventory,
-} = require('./plugins/model-support-inventory');
+const {collectModelSupportInventory} = require('./plugins/model-support-inventory');
 
-const modelInventory = collectModelSupportInventory(path.resolve(__dirname, '..'));
-const modelRecipeTaskItems = modelInventory.taskRecipes.map((task) => ({
+const inventory = collectModelSupportInventory(path.resolve(__dirname, '..'));
+const recipes = inventory.taskRecipes.map((task) => ({
   type: 'category',
   label: task.label,
   collapsed: true,
@@ -18,18 +16,16 @@ const modelRecipeTaskItems = modelInventory.taskRecipes.map((task) => ({
       type: 'link',
       label: 'Task overview',
       href: `/models-recipes/model-recipes/tasks/${task.slug}`,
-      autoAddBaseUrl: true,
     },
     ...task.families.map((family) => ({
       type: 'link',
       label: family.family,
       href: `/models-recipes/model-recipes/families/${family.slug}`,
-      autoAddBaseUrl: true,
     })),
   ],
 }));
 
-const sidebars = {
+module.exports = {
   docs: [
     'intro',
     {
@@ -42,8 +38,8 @@ const sidebars = {
         'getting-started/installation',
         'getting-started/source-build',
         'getting-started/quick-start',
-        'getting-started/troubleshooting'
-      ]
+        'getting-started/troubleshooting',
+      ],
     },
     {
       type: 'category',
@@ -54,9 +50,9 @@ const sidebars = {
           type: 'category',
           label: 'Model Recipes',
           link: {type: 'doc', id: 'models-recipes/model-recipes'},
-          items: modelRecipeTaskItems,
+          items: recipes,
         },
-      ]
+      ],
     },
     {
       type: 'category',
@@ -66,6 +62,7 @@ const sidebars = {
         'user-guides/build-a-bundle',
         'user-guides/inspect-a-bundle',
         'user-guides/run-inference',
+        'user-guides/serve-text-generation',
         {
           type: 'category',
           label: 'Task Guides',
@@ -73,14 +70,14 @@ const sidebars = {
             'user-guides/text-generation',
             'user-guides/multimodal-speech',
             'user-guides/image-video-generation',
-            'user-guides/time-series'
-          ]
+            'user-guides/time-series',
+          ],
         },
         'user-guides/configure-runtime',
         'features/quantization',
         'features/multi-device',
-        'user-guides/validate-benchmark'
-      ]
+        'user-guides/validate-benchmark',
+      ],
     },
     {
       type: 'category',
@@ -93,8 +90,8 @@ const sidebars = {
           items: [
             'getting-started/inference-fundamentals',
             'tutorials/beginner/inspect-bundles',
-            'tutorials/beginner/text-generation'
-          ]
+            'tutorials/beginner/text-generation',
+          ],
         },
         {
           type: 'category',
@@ -102,8 +99,8 @@ const sidebars = {
           items: [
             'tutorials/intermediate/multimodal-and-speech',
             'tutorials/intermediate/canary-decoding',
-            'tutorials/intermediate/diffusion-and-time-series'
-          ]
+            'tutorials/intermediate/diffusion-and-time-series',
+          ],
         },
         {
           type: 'category',
@@ -112,10 +109,10 @@ const sidebars = {
             'tutorials/advanced/quantization-and-runtime-knobs',
             'tutorials/advanced/multi-device-inference',
             'tutorials/advanced/bring-your-own-kernel',
-            'tutorials/advanced/validation-and-benchmarking'
-          ]
-        }
-      ]
+            'tutorials/advanced/validation-and-benchmarking',
+          ],
+        },
+      ],
     },
     {
       type: 'category',
@@ -131,8 +128,8 @@ const sidebars = {
         'reference/testing',
         'reference/benchmarking',
         'reference/profiling',
-        'getting-started/glossary'
-      ]
+        'getting-started/glossary',
+      ],
     },
     {
       type: 'category',
@@ -143,6 +140,7 @@ const sidebars = {
           type: 'category',
           label: 'Architecture',
           items: [
+            'architecture/ai-native-horizontal-scaling',
             'architecture/overview',
             'architecture/units-and-ownership',
             'architecture/build-pipeline',
@@ -150,8 +148,8 @@ const sidebars = {
             'architecture/build-system',
             'architecture/validation-design',
             'features/model-families',
-            'features/runtime-strategies'
-          ]
+            'features/runtime-strategies',
+          ],
         },
         {
           type: 'category',
@@ -160,16 +158,17 @@ const sidebars = {
             'extend/overview',
             'extend/contributing',
             'extend/add-model-family',
+            'extend/family-cli',
             'extend/add-runtime-strategy',
             'extend/add-optimized-runtime',
             'extend/add-config-schema',
-            'extend/model-validation'
-          ]
+            'extend/model-validation',
+          ],
         },
         'features/tvm-ffi',
         'features/triattention',
-        'reference/source-layout'
-      ]
+        'reference/source-layout',
+      ],
     },
     {
       type: 'category',
@@ -183,17 +182,15 @@ const sidebars = {
         'release-support/troubleshooting',
         'release-support/release-notes',
         'release-support/migration-guide',
-        'release-support/deprecation-policy'
-      ]
+        'release-support/deprecation-policy',
+      ],
     },
     {
       type: 'category',
       label: 'AI & Agent Guide',
       link: {type: 'doc', id: 'agent-guide'},
       collapsed: true,
-      items: []
-    }
-  ]
+      items: [],
+    },
+  ],
 };
-
-module.exports = sidebars;

@@ -1,37 +1,43 @@
 ---
 title: Reference
-description: Exact CLI, Python, C++, bundle, configuration, testing, and performance contracts.
+description: Exact build, runtime, bundle, testing, and performance contracts.
 ---
 
-Reference pages are for exact lookup, not progressive learning or task
-instruction. Begin with [your first NLP inference](../getting-started/quick-start.md)
-if you have not built a bundle, or use [User Guides](../user-guides/overview.md)
-when you need a goal-oriented procedure.
+Reference pages are for exact lookup. Begin with the
+[Quick Start](../getting-started/quick-start.md) if you have not built a bundle,
+or use the [User Guides](../user-guides/overview.md) for goal-oriented
+procedures.
 
-TensorRT-Model-Connect exposes four public entry layers:
+TensorRT-Model-Connect separates build tools from runtime entry points:
 
 | API | Entry point | Best for |
 | --- | --- | --- |
-| Python builder | `tensorrt_model_connect.build()` and `trtmc build` | Building `.bundle` bundles from Hugging Face IDs or local model directories. |
-| Python runtime wrapper | `tensorrt_model_connect.Pipeline` | Text and vision-language generation through the native `trtmc` executable from Python. |
-| C++ runtime | `#include <trtmc/pipeline.h>` and `trtmc::load()` | Native applications that want task-specific inference results. |
-| C-linkage subset | `trtmc_create_pipeline_ex()` and `trtmc_generate_batch()` | C++ shims and experimental FFI integration; the current header/handle is not yet a complete pure-C ownership API. |
+| Python build API | `python -m tensorrt_model_connect build` and `tensorrt_model_connect.build()` | Resolving a supported checkpoint and building a `.bundle`. |
+| Native CLI | `trtmc inspect` and task commands such as `trtmc run` | Inspecting a bundle or invoking one abstract Task interface. |
+| C Task SDK | `trtmc_get_api()` from `trtmc/trtmc.h` | Typed native calls through the public C boundary for migrated families. |
+| Header-only C++ SDK | `#include <trtmc/trtmc.hpp>` and `trtmc::Model::load()` | User-compiled convenience wrappers and RAII over that same C boundary. |
 
-The command-line interface is a thin adapter over these APIs:
+The new Task SDK is experimental pending its first stable release. Runtime and
+family implementations upgrade together; the older internal C++ loader API is
+not a stable user ABI. See [C and C++ Task SDK](cpp-api.md).
 
-- `trtmc build` is implemented by `src/cli/main.cpp` delegating to `python/tensorrt_model_connect/build_cli.py`.
-- Runtime subcommands such as `trtmc run` are implemented under `src/cli/`.
-- `tensorrt_model_connect.Pipeline` is a subprocess wrapper over `trtmc run`
-  and `trtmc inspect`, not an in-process binding to `IPipeline`.
-
-The core contract is always the same:
+The build and runtime entry points are intentionally separate. The Python
+builder resolves exactly one `families/<family>/support.py`, imports only that
+family's `model.py`, and writes a bundle. The native loader reads the bundle's
+`family`, `task`, and `backend`, then loads exactly one family DSO and one
+backend DSO from the directory containing the loaded `libtrtmc_runtime`, or
+from an explicit runtime-root override.
 
 ```text
-Hugging Face model or local model directory
-  -> trtmc build
+Hugging Face model ID or local snapshot
+  -> python -m tensorrt_model_connect build
   -> model.bundle
-  -> trtmc::load() or trtmc run
+  -> trtmc::Model::load() or trtmc TASK
   -> task-specific output
 ```
 
-{/* Collaborative review anchor: batch 2. */}
+The installed `trtmc` Python entrypoint uses the Python builder only for `build`;
+other commands replace that process with the packaged native executable. There
+is no resident Python inference wrapper. The SDK defaults to its installed
+library directory, with an explicit runtime-root override when needed; it does
+not retry arbitrary backends or family implementations after a failed call.

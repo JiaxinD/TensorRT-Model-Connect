@@ -1,107 +1,53 @@
 ---
-title: System Overview
-description: The build, bundle, and runtime boundaries of TensorRT-Model-Connect.
+title: Architecture Overview
 ---
 
-import Diagram from '@site/src/components/Diagram';
+TensorRT-Model-Connect turns a supported checkpoint into a native bundle and
+loads that bundle through an abstract task interface. The model family is the
+unit of source ownership, validation, and rollback.
 
-TensorRT-Model-Connect turns a Hugging Face checkpoint or local model directory
-into a deployable `.bundle` bundle, then loads that bundle behind task-oriented
-C++ APIs.
+```mermaid
+flowchart LR
+  Model["HF ID or local snapshot"] --> Resolver["support.py resolver"]
+  Resolver --> FamilyBuild["one family/model.py"]
+  FamilyBuild --> TRT["TensorRT build API"]
+  TRT --> Bundle["family-owned bundle sections"]
+  Bundle --> Loader["exact family/backend loader"]
+  Loader --> Task["abstract Task API"]
+```
 
-The most important boundary is the bundle:
+## Shared mechanics
 
-- Python owns source-model diversity and artifact construction.
-- `.bundle` carries the contract from build time to run time.
-- C++ owns bundle loading, task dispatch, and request execution.
+The shared build and runtime core owns only model-agnostic contracts:
 
-Read the [Glossary](../getting-started/glossary.md) first if terms such as
-checkpoint, engine, bundle, DSO, prefill, or KV cache are new to you.
+- checkpoint metadata loading and exact family resolution;
+- `BuildRequest`, `BundleWriter`, and the optional graph-transform callback;
+- bounded bundle container I/O;
+- public Task, Engine, loader, tensor, and BYOK interfaces;
+- exact DSO loading and the TensorRT backend implementation.
 
-## System block diagram
+Shared code does not own model topology, weights, section semantics,
+preprocessing, postprocessing, sampling, runtime orchestration, or validation
+oracles.
 
-<Diagram
-  src="/img/diagrams/trtmc-system-map.svg"
-  alt="System map from a Hugging Face checkpoint through build routing and a native or optimized bundle to the C++ runtime and typed task result"
-  caption="The bundle is the deployment boundary: native artifacts resolve installed model and backend DSOs, while optimized artifacts carry their exact implementation DSO."
-/>
+## Family vertical slices
 
-The diagram shows two artifact shapes, not two user-selected public APIs.
-`trtmc build` and the Python `build()` function resolve the model family first.
-A family-owned native default may claim the request immediately. Otherwise, an
-exact model/revision/target/options profile may select an optimized adapter; no
-qualified profile continues to the native builder.
+Every supported family lives under `families/<family>/` and owns its
+dependency declaration, support metadata, Python builder, native DSO, test
+manifests, thresholds, fixtures, and oracles. A normal new-family contribution
+adds only this directory; it does not modify a registry or central source list.
 
-## The two bundle paths
+At build time the resolver imports all dependency-free `support.py` modules but
+only the selected `model.py`. At runtime the loader reads the bundle header and
+loads only `libtrtmc_model_<family>.so` plus the named backend. There is no
+second strategy dispatch.
 
-| Concern | Native bundle | Optimized-runtime bundle |
-| --- | --- | --- |
-| Build owner | Python `FamilyPlugin` and family-local TensorRT builders | Family-local implementation/profile and isolated adapter |
-| Primary identity | `runtime_strategy` | `optimized_runtime.json` implementation and profile |
-| Runtime implementation | Installed `libtrtmc_model_<owner>.so` | Exact embedded `libtrtmc_impl_*.so` |
-| TensorRT execution boundary | Installed backend DSO implementing `IBackend` | Delegated implementation behind its private factory |
-| Fallback behavior | Used when no optimized profile claims the request | Descriptor presence claims this path; load failures do not fall back to native |
-| Evidence | Native E2E manifest and model-owned tests | Exact profile qualification plus adapter, bundle, and host evidence |
+## Applications stay above the public boundary
 
-Both shapes still depend on compatible host facilities such as the NVIDIA
-driver, CUDA, TensorRT, the dynamic loader, and system libraries. A bundle is a
-deployment artifact, not a complete operating-system or GPU-runtime image.
+The native CLI in `apps/cli/`, benchmark application in `apps/benchmark/`,
+examples, and TVM-FFI BYOK use public build, load, Task, and Engine contracts.
+Core and families never depend on those applications.
 
-## Design rules
-
-### Model knowledge stays model-owned
-
-Checkpoint mapping, graph semantics, runtime state, tokenization,
-pre/postprocessing, and task behavior stay with the owning model family.
-Shared code owns stable contracts and genuinely model-independent mechanics.
-
-### Dispatch uses artifact identity
-
-The runtime does not choose a pipeline by searching a Hugging Face model name.
-A native bundle dispatches through its `runtime_strategy`; an optimized bundle
-dispatches through its integrity-bound implementation/profile descriptor.
-
-### Public APIs are task-oriented
-
-Applications load a bundle and call methods such as `generate()`,
-`transcribe()`, `generate_image()`, `embed()`, or `solve()`. Unsupported methods
-fail explicitly for that concrete pipeline.
-
-### TensorRT ABI details stay behind a boundary
-
-Native pipelines use `IBackend` and `ITrtModule`; TensorRT headers and
-ABI-sensitive calls live behind backend DSOs. Optimized implementations own
-their delegated execution internally.
-
-### Buildability is not qualification
-
-Source, unit tests, model E2E evidence, exact-profile qualification, and
-performance evidence prove different things. Do not infer model support or
-parity from the existence of a family package alone.
-
-## Where each concern is explained
-
-| Question | Canonical page |
-| --- | --- |
-| Which source unit owns a behavior? | [Units and Ownership](units-and-ownership.md) |
-| How does a checkpoint become a bundle? | [Build Pipeline](build-pipeline.md) |
-| What is physically stored in `.bundle`? | [Bundle Format](bundle-format.md) |
-| How does a bundle become an `IPipeline` and serve requests? | [Runtime Lifecycle](runtime-lifecycle.md) |
-| How are native targets, DSOs, and wheels assembled? | [Build System](build-system.md) |
-| Which evidence layer proves which contract? | [Validation Design](validation-design.md) |
-
-## Source-of-truth entry points
-
-| Boundary | Primary implementation |
-| --- | --- |
-| Build CLI | `python/tensorrt_model_connect/build_cli.py` |
-| Public Python build API | `python/tensorrt_model_connect/engine_builder.py` |
-| Family discovery | `python/tensorrt_model_connect/families/__init__.py` |
-| Optimized selection and packaging | `python/tensorrt_model_connect/runtime_provider/` |
-| Bundle writer and reader | `python/tensorrt_model_connect/bundle_writer.py`, `src/bundle/` |
-| Public task API | `include/trtmc/pipeline.h` |
-| Pipeline creation | `src/runtime/registry/pipeline_factory.cpp` |
-| Native plugin loading | `src/runtime/registry/pipeline_plugin_loader.cpp` |
-| Optimized implementation loading | `src/runtime/providers/optimized_runtime_host.cpp` |
-
-{/* Collaborative review anchor: batch 2. */}
+See [AI-Native Horizontal Scaling Architecture](ai-native-horizontal-scaling.md)
+for the complete rules and [Source Layout](../reference/source-layout.md) for
+the physical tree.

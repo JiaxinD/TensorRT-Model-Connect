@@ -92,6 +92,17 @@
       "architecture_source": "config.architectures"
     },
     {
+      "hf_id": "IFM/K2-Horizon-7B",
+      "revision": "586b03f0fd1fbbf2f13eeafc33749e95ae34dd10",
+      "revision_source": "declared",
+      "metadata_file": "config.json",
+      "model_type": "k2_horizon",
+      "architectures": [
+        "K2HorizonForCausalLM"
+      ],
+      "architecture_source": "config.architectures"
+    },
+    {
       "hf_id": "Lightricks/LTX-Video",
       "revision": "8984fa25007f376c1a299016d0957a37a2f797bb",
       "revision_source": "resolved",
@@ -301,6 +312,17 @@
       "architecture_source": "config.architectures"
     },
     {
+      "hf_id": "Qwen/Qwen3.8-27B",
+      "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+      "revision_source": "resolved",
+      "metadata_file": "config.json",
+      "model_type": "qwen3_5",
+      "architectures": [
+        "Qwen3_5ForConditionalGeneration"
+      ],
+      "architecture_source": "config.architectures"
+    },
+    {
       "hf_id": "RWKV/rwkv-4-169m-pile",
       "revision": "46bdc280eb97b6141d5d51a935e0c4870ecaefcc",
       "revision_source": "resolved",
@@ -310,6 +332,15 @@
         "RwkvForCausalLM"
       ],
       "architecture_source": "config.architectures"
+    },
+    {
+      "hf_id": "Ruicheng/moge-2-vitl",
+      "revision": "39c4d5e957afe587e04eec59dc2bcc3be5ecd968",
+      "revision_source": "declared",
+      "metadata_file": null,
+      "model_type": null,
+      "architectures": [],
+      "architecture_source": null
     },
     {
       "hf_id": "Salesforce/codegen-350M-mono",
@@ -840,6 +871,17 @@
       "architecture_source": "config.architectures"
     },
     {
+      "hf_id": "intfloat/multilingual-e5-small",
+      "revision": "614241f622f53c4eeff9890bdc4f31cfecc418b3",
+      "revision_source": "resolved",
+      "metadata_file": "config.json",
+      "model_type": "bert",
+      "architectures": [
+        "BertModel"
+      ],
+      "architecture_source": "config.architectures"
+    },
+    {
       "hf_id": "katuni4ka/tiny-random-deepseek-v3",
       "revision": "ba144b0d3331a5892aa588d82722d382be2b6e6b",
       "revision_source": "declared",
@@ -849,6 +891,15 @@
         "DeepseekV3ForCausalLM"
       ],
       "architecture_source": "config.architectures"
+    },
+    {
+      "hf_id": "lerobot/act_aloha_sim_transfer_cube_human",
+      "revision": "ba73b2766f1371cdc133ca4efb97eb090d744625",
+      "revision_source": "resolved",
+      "metadata_file": "config.json",
+      "model_type": null,
+      "architectures": [],
+      "architecture_source": null
     },
     {
       "hf_id": "microsoft/Phi-3-mini-4k-instruct",
@@ -902,6 +953,17 @@
         "MistralForCausalLM"
       ],
       "architecture_source": "config.architectures"
+    },
+    {
+      "hf_id": "nvidia/Cosmos3-Nano",
+      "revision": "411f42a8fdfb8c5b2583cb8786e0938f49796eaa",
+      "revision_source": "declared",
+      "metadata_file": "model_index.json",
+      "model_type": null,
+      "architectures": [
+        "Cosmos3OmniDiffusersPipeline"
+      ],
+      "architecture_source": "model_index._class_name"
     },
     {
       "hf_id": "nvidia/Llama-3.1-Minitron-4B-Depth-Base",
@@ -1140,6 +1202,17 @@
       "architecture_source": "config.architectures"
     },
     {
+      "hf_id": "openai/whisper-small",
+      "revision": "973afd24965f72e36ca33b3055d56a652f456b4d",
+      "revision_source": "declared",
+      "metadata_file": "config.json",
+      "model_type": "whisper",
+      "architectures": [
+        "WhisperForConditionalGeneration"
+      ],
+      "architecture_source": "config.architectures"
+    },
+    {
       "hf_id": "openai/whisper-tiny",
       "revision": "169d4a4341b33bc18d8881c4b69c2e104e1cc0af",
       "revision_source": "resolved",
@@ -1248,6 +1321,94 @@
         "FalconForCausalLM"
       ],
       "architecture_source": "config.architectures"
+    },
+    {
+      "hf_id": "timm/mobilenetv3_large_100.ra_in1k",
+      "revision": "96f46a1c52932f27492dff66c72378eb99b443a7",
+      "revision_source": "resolved",
+      "metadata_file": "config.json",
+      "model_type": null,
+      "architectures": [
+        "mobilenetv3_large_100"
+      ],
+      "architecture_source": "config.architecture"
+    },
+    {
+      "hf_id": "timm/efficientnet_b0.ra_in1k",
+      "revision": "1b5383e5f79cc0f7fc067e372f8f26a5fa73f26a",
+      "revision_source": "resolved",
+      "metadata_file": "config.json",
+      "model_type": null,
+      "architectures": [
+        "efficientnet_b0"
+      ],
+      "architecture_source": "config.architecture"
+    },
+    {
+      "hf_id": "timm/densenet121.ra_in1k",
+      "revision": "92007b6200e0b4a4fe68cb4e3947022a928aaaae",
+      "revision_source": "resolved",
+      "metadata_file": "config.json",
+      "model_type": null,
+      "architectures": [
+        "densenet121"
+      ],
+      "architecture_source": "config.architecture"
+    },
+    {
+      "hf_id": "timm/mnasnet_100.rmsp_in1k",
+      "revision": "a30af72360c7a4871b0156cc11d7b767208273d7",
+      "revision_source": "resolved",
+      "metadata_file": "config.json",
+      "model_type": null,
+      "architectures": [
+        "mnasnet_100"
+      ],
+      "architecture_source": "config.architecture"
+    },
+    {
+      "hf_id": "timm/inception_v3.tv_in1k",
+      "revision": "393d84cc85c467d8fbc0dc81a65c04e87a32572c",
+      "revision_source": "resolved",
+      "metadata_file": "config.json",
+      "model_type": null,
+      "architectures": [
+        "inception_v3"
+      ],
+      "architecture_source": "config.architecture"
+    },
+    {
+      "hf_id": "timm/repvgg_a2.rvgg_in1k",
+      "revision": "87d4d383cb45031cb9fa2fc8ddca73fd6649240f",
+      "revision_source": "resolved",
+      "metadata_file": "config.json",
+      "model_type": null,
+      "architectures": [
+        "repvgg_a2"
+      ],
+      "architecture_source": "config.architecture"
+    },
+    {
+      "hf_id": "timm/resnet50.a1_in1k",
+      "revision": "767268603ca0cb0bfe326fa87277f19c419566ef",
+      "revision_source": "resolved",
+      "metadata_file": "config.json",
+      "model_type": null,
+      "architectures": [
+        "resnet50"
+      ],
+      "architecture_source": "config.architecture"
+    },
+    {
+      "hf_id": "timm/vgg16.tv_in1k",
+      "revision": "b8d8aa2dd860af9233c8c67385a8097fd6c35d3f",
+      "revision_source": "resolved",
+      "metadata_file": "config.json",
+      "model_type": null,
+      "architectures": [
+        "vgg16"
+      ],
+      "architecture_source": "config.architecture"
     },
     {
       "hf_id": "timm/vit_base_patch16_224.augreg_in21k_ft_in1k",

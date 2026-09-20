@@ -42,7 +42,7 @@ digraph KnobScopes {
   native [
     fillcolor="#fffbeb",
     color="#b45309",
-    label=<<B>Native .bundle</B><BR/><FONT POINT-SIZE="16">runtime_strategy + plans</FONT>>
+    label=<<B>Native .bundle</B><BR/><FONT POINT-SIZE="16">family + task + backend + plans</FONT>>
   ];
   optimized [
     fillcolor="#fffbeb",

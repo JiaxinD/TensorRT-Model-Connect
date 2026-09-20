@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Start empty. The image needs shared runtime and builder sources plus Cosmos3;
+# other model families, website sources, repository metadata, generated
+# artifacts, caches, and credentials must not enter the Docker build context.
+*
+
+!CMakeLists.txt
+!LICENSE
+!NOTICE
+!ASSET_LICENSES.md
+
+!cmake/
+!cmake/**
+
+!core/
+!core/**
+
+!families/
+families/**
+!families/__init__.py
+!families/cosmos3/
+!families/cosmos3/**
+
+!third_party/
+third_party/**
+!third_party/stb/
+!third_party/stb/**
+
+!apps/
+apps/**
+!apps/cli/
+!apps/cli/**
+
+# Guard against basename negations above matching similarly named directories
+# below unrelated source trees.
+examples/**
+website/**
+
+# Defense in depth if a future allowlist entry becomes broader.
+**/__pycache__/
+**/*.py[cod]
+**/*.bundle
+**/*.engine
+**/*.plan
+**/build/
+**/build-*/
+**/hf-cache/
+/models/
+/outputs/
+/secrets/

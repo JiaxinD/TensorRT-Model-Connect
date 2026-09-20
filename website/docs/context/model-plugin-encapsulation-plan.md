@@ -1,15 +1,11 @@
 # Simple Model Plugin Encapsulation Plan
 
-:::info Implementation-history snapshot
+:::caution Archived before the family-isolation cutover
 
-This plan records the migration toward model-owned Builder, Runtime, and E2E
-trees. The migration has since landed: current discovery is driven by the
-three per-family `MODEL.toml` descriptors. Paths under “Target Shape” are
-design notation, not copy-and-paste scaffolding instructions. Use the
-[current Add a Model Family guide](../extend/add-model-family.md) and the live
-descriptor files for current onboarding. Command-looking `text` blocks below
-are preserved acceptance sketches from the migration and are not a replayable
-runbook.
+This plan records an earlier descriptor-based migration. PR #1093 replaced it
+with complete physical family ownership under `families/<family>/` and removed
+the three-descriptor discovery design. Paths and command sketches below are
+historical. Use the [current Add a Model Family guide](../extend/add-model-family.md).
 
 :::
 

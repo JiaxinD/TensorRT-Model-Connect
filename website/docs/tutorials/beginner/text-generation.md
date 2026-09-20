@@ -2,97 +2,47 @@
 title: Beginner Tutorial - Text Generation
 ---
 
-import Diagram from '@site/src/components/Diagram';
+# Text generation
 
-Complete the [Quick Start](/getting-started/quick-start) before this tutorial.
-This page reuses `./qwen3-0.6b.bundle`; it does not build a second newcomer
-bundle.
+Complete the [Quick Start](/getting-started/quick-start) first. This tutorial
+reuses `./gpt2.bundle`.
 
-<div className="trtmc-handout-meta">
-  <div>
-    <strong>Level</strong>
-    <span>Beginner</span>
-  </div>
-  <div>
-    <strong>Model</strong>
-    <span>`Qwen/Qwen3-0.6B`</span>
-  </div>
-  <div>
-    <strong>Artifact</strong>
-    <span>`./qwen3-0.6b.bundle`</span>
-  </div>
-  <div>
-    <strong>Runtime</strong>
-    <span>Decoder text generation with KV cache.</span>
-  </div>
-</div>
-
-<Diagram
-  src="/img/diagrams/trtmc-inference-loop.svg"
-  alt="Text generation prefill and decode loop with KV-cache reuse"
-  caption="Prefill processes the prompt once; decode reuses the KV cache for each new token."
-/>
-
-## 1. Read the existing bundle
+## Inspect and run
 
 ```bash
-trtmc inspect ./qwen3-0.6b.bundle
-trtmc inspect ./qwen3-0.6b.bundle --list-engines
+trtmc inspect ./gpt2.bundle
+
+trtmc run ./gpt2.bundle \
+  --runtime-root /opt/trtmc/lib \
+  --prompt "Explain why KV caches help decoding." \
+  --max-new-tokens 80 \
+  --temperature 0.7 \
+  --top-k 40 \
+  --top-p 0.9 \
+  --seed 1234
 ```
 
-Connect the output to the runtime:
+The runtime tokenizes the prompt, runs prefill once, then repeatedly runs
+decode while reusing key/value tensors. Generation stops at EOS or the
+requested maximum.
 
-| Field or section | Meaning |
-| --- | --- |
-| `family=qwen` | The Python Qwen family built the artifact. |
-| `runtime_strategy=qwen_decoder_kv_cache` | The native runtime loads the Qwen decoder implementation. |
-| `prefill_engine_plan` | Processes the prompt. |
-| `engine_plan` | Produces one token per decode step. |
-| `max_cache_length` | Bounds prompt plus generated tokens for this bundle. |
-| Tokenizer sections | Convert between text and token IDs. |
-
-## 2. Understand generation
-
-For one request, the runtime:
-
-1. applies the chat template and tokenizes the prompt;
-2. runs the prefill engine;
-3. stores key/value tensors in the KV cache;
-4. runs the decode engine one token at a time;
-5. samples each next token from logits; and
-6. stops at EOS or `max_new_tokens`.
-
-The KV cache avoids recomputing attention for every earlier token on each
-decode step.
-
-## 3. Change one sampling control
-
-Start from the exact run command in Quick Start. Change only one control per
-experiment:
+## Change one control at a time
 
 | Option | Effect |
 | --- | --- |
-| `--temperature` | Controls how strongly score differences affect sampling. |
-| `--top-k` | Keeps only the highest-scoring candidate tokens. |
-| `--top-p` | Keeps the smallest candidate set reaching the probability threshold. |
-| `--seed` | Repeats sampling for an unchanged bundle and runtime environment. |
-| `--greedy` | Always selects the highest-scoring token instead of sampling. |
+| `--temperature` | Rescales logits before sampling. |
+| `--top-k` | Limits sampling to the highest-scoring candidates. |
+| `--top-p` | Limits sampling to a cumulative probability mass. |
+| `--min-p` | Removes candidates far below the best probability. |
+| `--seed` | Controls the sampling RNG for the same software and target. |
+| `--repetition-penalty` | Adjusts scores for tokens already generated. |
 
-Keep `--chat-template` and `--no-thinking` while comparing decoding behavior so
-the prompt format does not change at the same time.
+The current CLI does not provide `--greedy`; configure deterministic selection
+with the supported sampling controls for the installed version. Chat-template
+and reasoning behavior use the explicit boolean options shown in the
+[CLI Reference](/api/cli-reference), such as `--use-chat-template true|false`
+and `--enable-thinking true|false`.
 
-## 4. Explain the result
-
-You are done when you can answer:
-
-1. Why are prefill and decode separate engines?
-2. What does the KV cache reuse?
-3. Which bundle field selects the native Qwen runtime?
-4. Why can sampled output change when the software or hardware cohort changes?
-5. Which single option would you change for the next experiment?
-
-For exact CLI options, use the [CLI Reference](/api/cli-reference). For parity
-and performance work, continue to
-[Validation and Benchmarking](/tutorials/advanced/validation-and-benchmarking).
-
-{/* Collaborative review anchor: batch 2. */}
+You are done when you can explain why prefill and decode are distinct phases,
+what the KV cache reuses, and why identical sampling flags still require the
+same bundle, runtime, and target environment for a reproducible comparison.

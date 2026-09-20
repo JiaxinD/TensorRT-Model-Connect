@@ -17,6 +17,11 @@
   `main`.
 - Wait for GitHub CI before merging.
 - Merge with squash or rebase, matching the repository ruleset.
+- Sign off every commit introduced by a pull request with DCO using
+  `git commit --signoff`; ensure the `Signed-off-by` email matches the commit
+  author.
+- Preserve or re-add valid sign-offs when amending, rebasing, or cherry-picking
+  commits, and never sign off on another author's behalf.
 - Avoid commit messages containing `Claude`; the GitHub ruleset rejects them.
 
 ## GitHub Pages
@@ -56,6 +61,9 @@
 
 - Do keep validation criteria meaningful and aligned with the behavior under
   test.
+- Write repository documentation, code comments, user-facing messages, and PR
+  text in English. Preserve non-English model inputs, tokenizer data, and test
+  fixtures when they are required to validate multilingual functionality.
 - Never change the test passing criteria for the purpose of passing CI. If you believe the test is faulty, escalate to a human
 
 ## Repo Skills

@@ -1,55 +1,43 @@
 ---
 title: Build a Bundle
-description: Build one native TensorRT bundle from an exact checkpoint and retain the configuration receipt.
+description: Build one family-owned TensorRT bundle from an exact checkpoint.
 ---
 
-Start from an exact Hugging Face ID in [Supported Models](../models-recipes/overview.md)
-or a compatible local checkpoint directory:
+Start from an exact supported model ID or compatible local snapshot:
 
 ```bash
-trtmc build Qwen/Qwen3-0.6B \
-  --model-revision MODEL_COMMIT \
-  -o qwen3-0.6b.bundle
-```
-
-Omit `--model-revision` for exploration only. A reproducible result pins an
-immutable revision and records the complete command.
-
-## Choose one configuration source
-
-| Need | Surface | Example |
-| --- | --- | --- |
-| Common CLI option | Dedicated flag | `--precision fp16` |
-| Registered feature schema | Config file | `--config profile.json` |
-| One schema override | Repeatable key/value | `--set namespace.field=value` |
-| Model-owned parallel build | Topology flag | `--tensor-parallel-size 4` |
-
-```bash
-trtmc build MODEL_ID \
-  --model-revision MODEL_COMMIT \
+python -m tensorrt_model_connect build Qwen/Qwen3-0.6B \
+  --revision MODEL_COMMIT \
   --precision fp16 \
-  --config build-profile.json \
-  --set qwen_vl_vision.dynamic_resolution=true \
-  -o model.bundle
+  --max-sequence-length 256 \
+  --output qwen3-0.6b.bundle
 ```
 
-Do not copy that combination to an arbitrary family. The selected family owns
-which schemas, precision modes, quantization formats, graph shapes, and
-topologies it supports.
+`--output` is required. Pin an immutable revision for reproducible evidence.
+The resolver requires exactly one `families/*/support.py` match and imports
+only that family's `model.py`.
+
+## Choose explicit typed inputs
+
+| Need | Option |
+| --- | --- |
+| Non-default family task | `--task TASK` |
+| Precision/backend | `--precision`, `--backend` |
+| Text/image/video build bounds | `--max-sequence-length`, `--image-height`, `--image-width`, `--video-num-frames` |
+| Batch/topology | `--max-batch-size`, `--tensor-parallel-size`, `--context-parallel-size` |
+| Family-owned quantization | `--quantization NAME`, repeatable `--fp32-layer INDEX` |
+| Compatible dynamic KV build | `--dynamic-kv-cache` |
+
+The selected family implements or explicitly rejects each non-default value.
+Do not copy an option combination to a different checkpoint and infer support.
+There is no generic config file/options registry or build fallback.
 
 ## Retain the build receipt
 
-Record at least:
+Record the exact source revision, model ID/revision, family requirements,
+complete command, output checksum, family/task/backend from inspection,
+precision/topology, target GPU, and TensorRT/CUDA cohort. A successful build
+proves artifact construction only; it does not prove Task correctness or
+parity.
 
-- exact model ID and immutable revision;
-- output bundle name and checksum;
-- complete build command and config file;
-- build environment, TensorRT/CUDA cohort, and SM architecture;
-- family, runtime strategy, precision, quantization, and topology; and
-- whether the resulting bundle is native or platform-specialized.
-
-Run [Inspect a Bundle](inspect-a-bundle.md) before inference. The
-[CLI Reference](../api/cli-reference.md#trtmc-build) is the source for the
-complete option inventory.
-
-{/* Collaborative review anchor: batch 2. */}
+Next, [inspect the bundle](inspect-a-bundle.md), then run its declared Task.

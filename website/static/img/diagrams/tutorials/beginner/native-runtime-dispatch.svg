@@ -17,9 +17,9 @@
 <!-- strategy -->
 <g id="node2" class="node">
 <title>strategy</title>
-<path fill="#fffbeb" stroke="#b45309" stroke-width="1.6" d="M416.77,-614.04C416.77,-614.04 164.03,-614.04 164.03,-614.04 158.03,-614.04 152.03,-608.04 152.03,-602.04 152.03,-602.04 152.03,-574.32 152.03,-574.32 152.03,-568.32 158.03,-562.32 164.03,-562.32 164.03,-562.32 416.77,-562.32 416.77,-562.32 422.77,-562.32 428.77,-568.32 428.77,-574.32 428.77,-574.32 428.77,-602.04 428.77,-602.04 428.77,-608.04 422.77,-614.04 416.77,-614.04"/>
-<text xml:space="preserve" text-anchor="start" x="221.43" y="-590.38" font-family="Arial" font-weight="bold" font-size="17.00" fill="#101828">runtime_strategy</text>
-<text xml:space="preserve" text-anchor="start" x="164.99" y="-574.28" font-family="Arial" font-size="16.00" fill="#101828">example: qwen_decoder_kv_cache</text>
+<path fill="#fffbeb" stroke="#b45309" stroke-width="1.6" d="M402.09,-614.04C402.09,-614.04 178.71,-614.04 178.71,-614.04 172.71,-614.04 166.71,-608.04 166.71,-602.04 166.71,-602.04 166.71,-574.32 166.71,-574.32 166.71,-568.32 172.71,-562.32 178.71,-562.32 178.71,-562.32 402.09,-562.32 402.09,-562.32 408.09,-562.32 414.09,-568.32 414.09,-574.32 414.09,-574.32 414.09,-602.04 414.09,-602.04 414.09,-608.04 408.09,-614.04 402.09,-614.04"/>
+<text xml:space="preserve" text-anchor="start" x="209.64" y="-590.38" font-family="Arial" font-weight="bold" font-size="17.00" fill="#101828">Bundle task identity</text>
+<text xml:space="preserve" text-anchor="start" x="179.67" y="-574.28" font-family="Arial" font-size="16.00" fill="#101828">example: qwen + generate + trt</text>
 </g>
 <!-- load&#45;&gt;strategy -->
 <g id="edge1" class="edge">
