@@ -85,6 +85,13 @@ extern "C" trtmc::ITask* trtmc_create_family(const trtmc::FamilyContext& context
         if (!std::isfinite(value))
             throw std::invalid_argument("nonfinite Parakeet mel coefficient");
     const auto tokenizer_data = require_section(context.reader, "tokenizer.json");
+    const auto tokenizer_json = nlohmann::json::parse(tokenizer_data.begin(), tokenizer_data.end());
+    if (tokenizer_json.at("model").at("type") != "BPE" ||
+        tokenizer_json.at("decoder").at("type") != "Metaspace" ||
+        tokenizer_json.at("decoder").at("replacement") != "\xe2\x96\x81" ||
+        tokenizer_json.at("decoder").at("prepend_scheme") != "always")
+        throw std::invalid_argument(
+            "Parakeet TDT requires its native BPE tokenizer with Metaspace decoding");
     auto tokenizer = CreateBpeTokenizer(tokenizer_data.data(), tokenizer_data.size(), false);
     if (!tokenizer)
         throw std::invalid_argument("Parakeet TDT requires its native BPE tokenizer");

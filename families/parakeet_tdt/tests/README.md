@@ -22,9 +22,16 @@ explicit skips, not passing evidence.
 
 The native pipeline now connects the audio helper to encoder, predictor, joint,
 and tokenizer calls. Tests check request state reset, invalid options, malformed
-or missing engine outputs, and recovery after failed requests. The family factory
-and CMake target are present, but these CPU tests do not prove engine validity,
-factory bundle compatibility, model transcript parity, or streaming support.
+or missing engine outputs, and recovery after failed requests.
+
+`test_factory.py` writes real bundles with the shared Python `BundleWriter`,
+then compiles and executes the real C++ `BundleReader` and family factory.
+Its 22 cases cover semantic task binding, engine section order/content,
+invalid identity/config/tokenizer/frontend data, missing sections, failed engine
+loads, and destruction of modules after partial construction failures. Engine
+loading is faked; CUDA headers and nlohmann JSON are required as above. This
+does not prove TensorRT deserialization, engine validity, model transcript parity,
+or streaming support. The E2E/manifest migration remains incomplete.
 
 An additional September 19, 2026 check compared the pinned official tokenizer
 above against Hugging Face `tokenizers==0.22.2`: all 8,193 singleton vocabulary
