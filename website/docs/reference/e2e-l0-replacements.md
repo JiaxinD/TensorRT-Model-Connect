@@ -10,8 +10,8 @@ same E2E contract:
 - the source model mainly adds scale coverage, such as long build time, memory
   pressure, large weights, image or video size, frame count, denoising steps, or
   decode length
-- the replacement keeps the same family, runtime strategy, plugin/model path,
-  precision or quantization mode, runner, comparator, and artifact contract
+- the replacement keeps the same family-owned build/runtime path, precision or
+  quantization mode, runner, comparator, and artifact contract
 - if no smaller checkpoint preserves the path, the L0 representative may keep
   the same checkpoint and reduce only workload knobs
 - source manifests stay `nightly_only`; L0-only representatives use
@@ -52,7 +52,7 @@ manifest or model-specific E2E data.
 
 This table is a checked snapshot of non-self replacements declared by
 `testcases[*].l0_replacement`. The manifests remain authoritative; run
-`PYTHONPATH=python:. python3 tools/test_impact.py --validate` after changing a
+`PYTHONPATH=core/builder:. python3 tools/test_impact.py --validate` after changing a
 replacement.
 
 {/* Collaborative review anchor: batch 2. */}

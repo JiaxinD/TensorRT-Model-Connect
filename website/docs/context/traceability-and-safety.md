@@ -11,6 +11,14 @@ case, legal advice, or functional-safety approval.
 
 :::
 
+:::caution Historical snapshot
+
+This page predates PR #1093. Its recorded counts, paths, and coverage gaps are
+preserved for traceability but have not been recomputed for the current
+`families/<family>/` layout.
+
+:::
+
 ## Snapshot
 
 The measurements below were recomputed from GitHub `main` commit

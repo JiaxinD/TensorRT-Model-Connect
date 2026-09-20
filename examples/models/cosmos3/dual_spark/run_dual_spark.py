@@ -6,8 +6,8 @@
 
 This host-side orchestrator uses a locally built example image to build one
 CP=2 TensorRT bundle on the primary Spark, copies the exact image and bundle to
-a peer Spark, and launches one global rank on each host. Each scene has an
-independent file rendezvous and runs only after the previous scene finishes.
+a peer Spark, and uses Open MPI to launch one Docker-owning worker per host.
+MPI broadcasts the rank-0 NCCL unique ID before rank 1 starts its container.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ import base64
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import getpass
-import hashlib
 import json
 import math
 import os
@@ -45,6 +44,8 @@ GUIDANCE_SCALE = 6.0
 FLOW_SHIFT = 10.0
 CP_SIZE = 2
 NCCL_ID_BYTES = 128
+NCCL_ID_ENV_TOKEN = "__TRTMC_NCCL_UNIQUE_ID_HEX__"
+NCCL_ID_LOG_PATTERN = r"\[cosmos3\.nccl\] unique_id=([0-9a-f]{256})(?:\s|$)"
 PHYSICS_NEGATIVE_PROMPT = (
     "blur, low detail, jitter, flicker, morphing, floating objects, interpenetrating "
     "objects, fused objects, teleportation, discontinuous motion, cuts, scene changes, "
@@ -57,6 +58,12 @@ DEFAULT_REMOTE_ROOT = "/var/tmp/cosmos3-physics-dual-spark"  # noqa: S108
 DEFAULT_IB_HCA = "rocep1s0f0:1"
 DEFAULT_NET_IFACE = "enp1s0f0np0"
 DEFAULT_GID_INDEX = 3
+RUNTIME_ROOT = "/opt/trtmc/lib"
+CHECKPOINT_DOWNLOAD_SCRIPT = (
+    "from huggingface_hub import snapshot_download; "
+    f"snapshot_download(repo_id={MODEL_ID!r}, revision={MODEL_REVISION!r}, "
+    "local_dir='/checkpoint')"
+)
 
 RUN_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,47}$")
 PEER_COMPONENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -113,6 +120,132 @@ for current_root, directories, filenames in os.walk(root, followlinks=False):
             raise SystemExit("remote root must not contain symbolic links")
         if child.st_uid != os.geteuid():
             raise SystemExit("remote root contents must be owned by the SSH user")
+"""
+
+MPI_FACTS_SCRIPT = """\
+import json
+from mpi4py import MPI
+
+vendor, version = MPI.get_vendor()
+print(json.dumps({"vendor": vendor, "version": list(version)}))
+"""
+
+# mpirun transports these two base64 arguments without requiring the source
+# checkout on the peer. The worker itself is the MPI application: it stays
+# alive while its node-local detached container runs and returns that
+# container's exit code to mpirun.
+MPI_WORKER_BOOTSTRAP = (
+    "import base64,sys;"
+    "exec(compile(base64.urlsafe_b64decode(sys.argv[1]),'<cosmos3-mpi-worker>','exec'))"
+)
+MPI_WORKER_SOURCE = r"""\
+import base64
+import json
+import re
+import subprocess
+import sys
+import time
+
+from mpi4py import MPI
+
+
+def abort(message):
+    print(f"cosmos3 MPI worker: {message}", file=sys.stderr, flush=True)
+    MPI.COMM_WORLD.Abort(1)
+    raise SystemExit(1)
+
+
+def run(argv):
+    return subprocess.run(
+        argv,
+        check=False,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def launch(argv, container):
+    completed = run(argv)
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        abort(f"cannot launch {container}: {detail[-2000:]}")
+
+
+def rank_zero_unique_id(config, container):
+    pattern = re.compile(config["nccl_id_log_pattern"])
+    deadline = time.monotonic() + config["bootstrap_timeout"]
+    while time.monotonic() < deadline:
+        logs = run(["docker", "logs", container])
+        combined = (logs.stdout or "") + (logs.stderr or "")
+        match = pattern.search(combined)
+        if match is not None:
+            return bytearray.fromhex(match.group(1))
+        state = run(["docker", "inspect", "--format", "{{.State.Running}}", container])
+        if state.returncode != 0 or state.stdout.strip() != "true":
+            abort(f"rank 0 exited before publishing its NCCL unique ID: {combined[-2000:]}")
+        time.sleep(0.25)
+    abort("timed out waiting for rank 0 to publish its NCCL unique ID")
+
+
+def container_exit_code(container):
+    waited = run(["docker", "wait", container])
+    if waited.returncode != 0:
+        detail = (waited.stderr or waited.stdout).strip()
+        abort(f"docker wait failed for {container}: {detail[-2000:]}")
+    lines = [line.strip() for line in waited.stdout.splitlines() if line.strip()]
+    if len(lines) != 1 or not lines[0].isdigit():
+        abort(f"docker wait returned an invalid exit code for {container}")
+    return int(lines[0])
+
+
+def main():
+    config = json.loads(base64.urlsafe_b64decode(sys.argv[2]).decode("utf-8"))
+    comm = MPI.COMM_WORLD
+    if comm.Get_size() != 2:
+        abort(f"expected two MPI ranks, got {comm.Get_size()}")
+    local = comm.Split_type(MPI.COMM_TYPE_SHARED, 0)
+    try:
+        if local.Get_size() != 1:
+            abort("expected exactly one MPI rank on each Spark")
+    finally:
+        local.Free()
+
+    rank = comm.Get_rank()
+    rank_config = config["ranks"][rank]
+    container = rank_config["container"]
+    docker_argv = list(rank_config["docker_argv"])
+    unique_id = bytearray(config["nccl_id_bytes"])
+
+    if rank == 0:
+        launch(docker_argv, container)
+        unique_id = rank_zero_unique_id(config, container)
+        if len(unique_id) != config["nccl_id_bytes"]:
+            abort("rank 0 published an invalid NCCL unique ID")
+
+    comm.Bcast([unique_id, MPI.BYTE], root=0)
+
+    if rank == 1:
+        encoded = unique_id.hex()
+        token = config["nccl_id_env_token"]
+        replacements = sum(value.count(token) for value in docker_argv)
+        if replacements != 1:
+            abort("rank 1 Docker command does not contain one NCCL ID placeholder")
+        docker_argv = [value.replace(token, encoded) for value in docker_argv]
+        launch(docker_argv, container)
+
+    exit_code = container_exit_code(container)
+    exit_codes = comm.allgather(exit_code)
+    raise SystemExit(max(exit_codes))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException as error:
+        abort(str(error))
 """
 
 
@@ -198,9 +331,7 @@ def _showcase_prompt(
             "key_changes": description,
             "camera": camera_motion,
         }
-        for index, (time_range, description) in enumerate(
-            zip(times, steps, strict=True)
-        )
+        for index, (time_range, description) in enumerate(zip(times, steps, strict=True))
     ]
     return {
         "subjects": subjects,
@@ -261,9 +392,7 @@ SCENES = (
                     size="Large within frame",
                     orientation="Moving away then carving through alternating bends",
                     pose="Tires firmly contacting the asphalt with body roll under load",
-                    action=(
-                        "Accelerating, braking, and steering through multiple winding turns"
-                    ),
+                    action=("Accelerating, braking, and steering through multiple winding turns"),
                     state_changes=(
                         "Suspension compresses and unloads naturally while the car advances "
                         "continuously"
@@ -274,9 +403,7 @@ SCENES = (
                 "A closed professional road-racing circuit with curbs, barriers, distant "
                 "grandstands, and clear safety runoff."
             ),
-            light_conditions=(
-                "Bright late-afternoon daylight with crisp atmospheric visibility"
-            ),
+            light_conditions=("Bright late-afternoon daylight with crisp atmospheric visibility"),
             light_direction="Warm sun from camera-left with balanced sky fill",
             shadows="Stable moving car shadow and strong tire contact shadows",
             illumination="Specular highlights travel smoothly over the bodywork",
@@ -293,9 +420,7 @@ SCENES = (
             camera_angle="Low rear three-quarter angle near track height",
             focus="Sharp focus on the racing car with natural background motion blur",
             lens="35mm equivalent",
-            context=(
-                "A high-speed racing event in which a car navigates multiple winding turns."
-            ),
+            context=("A high-speed racing event in which a car navigates multiple winding turns."),
             steps=(
                 "The car accelerates into the first sweeping turn and loads the outside "
                 "suspension.",
@@ -328,9 +453,7 @@ SCENES = (
                     ),
                     location="Across the center foreground and middle distance",
                     size="Medium to large within frame",
-                    orientation=(
-                        "Initially facing rock samples, then turning toward the base"
-                    ),
+                    orientation=("Initially facing rock samples, then turning toward the base"),
                     pose="Balanced bipedal stances with feet planted in regolith",
                     action="Collecting geological samples and walking toward a Mars base",
                     state_changes=(
@@ -353,9 +476,7 @@ SCENES = (
                 "All three robots and the destination habitat remain legible throughout "
                 "the continuous shot."
             ),
-            colors=(
-                "Rust-red terrain, pale sky, white-and-graphite robots, blue status lights"
-            ),
+            colors=("Rust-red terrain, pale sky, white-and-graphite robots, blue status lights"),
             mood="Purposeful scientific exploration and teamwork",
             camera_motion=(
                 "Slow stabilized lateral tracking move that follows the team toward the base"
@@ -412,18 +533,14 @@ SCENES = (
                 "magenta neon reflections, closed storefronts, and light rainfall."
             ),
             light_conditions="Night rain illuminated by practical neon and street lamps",
-            light_direction=(
-                "Colored side light from storefronts with soft overhead streetlight"
-            ),
+            light_direction=("Colored side light from storefronts with soft overhead streetlight"),
             shadows="Soft wet-ground contact shadow beneath the robot",
             illumination="Physically plausible reflections and specular rain highlights",
             composition=(
                 "Low street-level view keeps the robot, its wheels, and the complete puddle "
                 "interaction visible."
             ),
-            colors=(
-                "Neutral white robot, dark wet street, subtle cyan and magenta reflections"
-            ),
+            colors=("Neutral white robot, dark wet street, subtle cyan and magenta reflections"),
             mood="Quiet, futuristic, believable last-mile delivery",
             camera_motion="Gentle street-level tracking pan with one continuous take",
             framing="Low medium-wide shot showing full robot and puddle",
@@ -476,9 +593,7 @@ SCENES = (
                     appearance=(
                         "Single intact red apple with stem; round white plate with raised rim."
                     ),
-                    relationship=(
-                        "Apple is the transported object; plate is its destination"
-                    ),
+                    relationship=("Apple is the transported object; plate is its destination"),
                     location="Apple at left foreground and plate at right foreground",
                     size="Medium within frame",
                     orientation="Both upright on the tabletop",
@@ -512,8 +627,7 @@ SCENES = (
                 "The open gripper approaches and closes gently around the single apple.",
                 "The arm lifts the apple, translates smoothly above the table, and centers "
                 "it over the plate.",
-                "The apple is lowered into contact with the plate; the gripper opens and "
-                "retracts.",
+                "The apple is lowered into contact with the plate; the gripper opens and retracts.",
             ),
             temporal_caption=(
                 "One unchanged apple is grasped, lifted clear of the table, carried in a "
@@ -556,9 +670,7 @@ SCENES = (
             light_direction="Sun from rear-left with open-sky fill",
             shadows="Stable running shadow and distinct foot contact shadows",
             illumination="Clean highlights define joint motion and track texture",
-            composition=(
-                "Full robot stays visible with lane lines emphasizing forward speed."
-            ),
+            composition=("Full robot stays visible with lane lines emphasizing forward speed."),
             colors="Red track, green infield, white-and-black robot, blue sky",
             mood="Powerful, focused, technically impressive athletic motion",
             camera_motion=(
@@ -602,8 +714,7 @@ SCENES = (
                     size="Large foreground elements",
                     orientation="Both hands directed toward the cake",
                     pose=(
-                        "One hand gently stabilizes the cake board while the other aligns "
-                        "the knife"
+                        "One hand gently stabilizes the cake board while the other aligns the knife"
                     ),
                     action="Making one smooth precise cut through the cake",
                     state_changes=(
@@ -637,12 +748,8 @@ SCENES = (
             light_direction="Window light from left and diffused ceiling light",
             shadows="Gentle stable hand, knife, cake, and plate contact shadows",
             illumination="Natural frosting texture and restrained metal highlights",
-            composition=(
-                "Ego-view centers the knife path and keeps both robotic hands visible."
-            ),
-            colors=(
-                "Warm neutral kitchen, white frosting, muted berries, white robotic hands"
-            ),
+            composition=("Ego-view centers the knife path and keeps both robotic hands visible."),
+            colors=("Warm neutral kitchen, white frosting, muted berries, white robotic hands"),
             mood="Calm, precise, careful domestic assistance",
             camera_motion=(
                 "Stable first-person head camera with only subtle natural robot-body "
@@ -762,9 +869,7 @@ def _parser() -> argparse.ArgumentParser:
         "--ssh-key",
         type=Path,
         default=(
-            Path(os.environ["COSMOS3_SSH_KEY"])
-            if os.environ.get("COSMOS3_SSH_KEY")
-            else None
+            Path(os.environ["COSMOS3_SSH_KEY"]) if os.environ.get("COSMOS3_SSH_KEY") else None
         ),
     )
     parser.add_argument(
@@ -858,9 +963,7 @@ def _validate_settings(settings: Settings) -> None:
         _hca_name, port_text = settings.ib_hca.rsplit(":", 1)
         port = int(port_text)
     except (TypeError, ValueError) as exc:
-        raise DualSparkError(
-            "--ib-hca must use HCA:PORT form, for example rocep1s0f0:1"
-        ) from exc
+        raise DualSparkError("--ib-hca must use HCA:PORT form, for example rocep1s0f0:1") from exc
     if port < 1:
         raise DualSparkError("--ib-hca port must be positive")
     if settings.gid_index < 0:
@@ -918,14 +1021,25 @@ def _scp_argv(settings: Settings) -> list[str]:
     return argv
 
 
+def _mpi_rsh_agent(settings: Settings) -> str:
+    argv = _ssh_argv(settings)[:-1]
+    argv.extend(["-l", settings.peer_user])
+    return shlex.join(argv)
+
+
 def _layout(settings: Settings) -> dict[str, Any]:
     models = settings.work_root / "models"
     run_root = settings.work_root / "runs" / settings.run_id
     return {
         "hf_cache": settings.work_root / "hf-cache",
         "models": models,
-        "bundle": models / "cosmos3-nano-cp2-1280x720.trtfb",
-        "remote_bundle": f"{settings.remote_root}/models/cosmos3-nano-cp2-1280x720.trtfb",
+        "checkpoint": models / f"cosmos3-nano-{MODEL_REVISION}",
+        "bundle": models / "cosmos3-nano-cp2-1280x720.bundle",
+        "bundle_spec": models / "cosmos3-nano-cp2-1280x720.build.json",
+        "remote_bundle": f"{settings.remote_root}/models/cosmos3-nano-cp2-1280x720.bundle",
+        "remote_bundle_spec": (
+            f"{settings.remote_root}/models/cosmos3-nano-cp2-1280x720.build.json"
+        ),
         "preparation": settings.work_root / "preparation.json",
         "run_root": run_root,
         "remote_run_root": f"{settings.remote_root}/runs/{settings.run_id}",
@@ -937,14 +1051,13 @@ def _scene_layout(settings: Settings, scene: Scene) -> dict[str, Any]:
     layout = _layout(settings)
     scene_root = Path(layout["run_root"]) / scene.slug
     remote_scene_root = f"{layout['remote_run_root']}/{scene.slug}"
-    rendezvous_name = f"{scene.slug}-seed{scene.seed}.nccl"
     return {
         "scene_root": scene_root,
         "rank0": scene_root / "rank0",
         "rank1_capture": scene_root / "rank1",
         "remote_rank1": f"{remote_scene_root}/rank1",
-        "rendezvous": scene_root / "rendezvous" / rendezvous_name,
-        "remote_rendezvous": f"{remote_scene_root}/rendezvous/{rendezvous_name}",
+        "mpi_stdout": scene_root / "mpi.stdout.log",
+        "mpi_stderr": scene_root / "mpi.stderr.log",
         "mp4": Path(layout["run_root"]) / f"{scene.slug}-720p.mp4",
         "rank0_container": f"cosmos3-{settings.run_id}-{scene.slug}-rank0",
         "rank1_container": f"cosmos3-{settings.run_id}-{scene.slug}-rank1",
@@ -980,7 +1093,9 @@ def _generation_argv(scene: Scene) -> list[str]:
     return [
         "/opt/trtmc/bin/trtmc",
         "generate-video",
-        "/models/cosmos3.trtfb",
+        "/models/cosmos3.bundle",
+        "--runtime-root",
+        RUNTIME_ROOT,
         "--prompt",
         _prompt_text(scene),
         "--negative-prompt",
@@ -1001,12 +1116,11 @@ def _generation_argv(scene: Scene) -> list[str]:
 
 
 def _rank_environment(settings: Settings, scene: Scene, rank: int) -> dict[str, str]:
-    return {
+    environment = {
         "CUDA_VISIBLE_DEVICES": "0",
-        "WORLD_SIZE": str(CP_SIZE),
-        "RANK": str(rank),
-        "LOCAL_RANK": "0",
-        "TRTMC_NCCL_RENDEZVOUS": f"/rendezvous/{scene.slug}-seed{scene.seed}.nccl",
+        "OMPI_COMM_WORLD_SIZE": str(CP_SIZE),
+        "OMPI_COMM_WORLD_RANK": str(rank),
+        "OMPI_COMM_WORLD_LOCAL_RANK": "0",
         "NCCL_NET": "IB",
         "NCCL_IB_DISABLE": "0",
         "NCCL_IB_HCA": f"={settings.ib_hca}",
@@ -1019,6 +1133,11 @@ def _rank_environment(settings: Settings, scene: Scene, rank: int) -> dict[str, 
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",
     }
+    if rank == 0:
+        environment["TRTMC_NCCL_UNIQUE_ID_STDOUT"] = "1"
+    elif rank == 1:
+        environment["TRTMC_NCCL_UNIQUE_ID_HEX"] = NCCL_ID_ENV_TOKEN
+    return environment
 
 
 def _rank_docker_argv(
@@ -1033,12 +1152,10 @@ def _rank_docker_argv(
     if rank == 0:
         bundle = str(layout["bundle"])
         output_dir = str(scene_paths["rank0"])
-        rendezvous_dir = str(Path(scene_paths["rendezvous"]).parent)
         container = str(scene_paths["rank0_container"])
     elif rank == 1:
         bundle = str(layout["remote_bundle"])
         output_dir = str(scene_paths["remote_rank1"])
-        rendezvous_dir = str(Path(scene_paths["remote_rendezvous"]).parent)
         container = str(scene_paths["rank1_container"])
     else:
         raise ValueError("rank must be 0 or 1")
@@ -1080,11 +1197,9 @@ def _rank_docker_argv(
     argv.extend(
         [
             "--mount",
-            f"type=bind,src={bundle},dst=/models/cosmos3.trtfb,readonly",
+            f"type=bind,src={bundle},dst=/models/cosmos3.bundle,readonly",
             "--mount",
             f"type=bind,src={output_dir},dst=/outputs",
-            "--mount",
-            f"type=bind,src={rendezvous_dir},dst=/rendezvous",
             "--entrypoint",
             "/opt/trtmc/bin/trtmc",
             settings.image,
@@ -1094,6 +1209,113 @@ def _rank_docker_argv(
     return argv
 
 
+def _mpi_worker_config(
+    settings: Settings,
+    scene: Scene,
+    *,
+    primary_uverbs: str,
+    peer_uverbs: str,
+) -> dict[str, Any]:
+    paths = _scene_layout(settings, scene)
+    return {
+        "bootstrap_timeout": min(180, settings.runtime_timeout),
+        "nccl_id_bytes": NCCL_ID_BYTES,
+        "nccl_id_env_token": NCCL_ID_ENV_TOKEN,
+        "nccl_id_log_pattern": NCCL_ID_LOG_PATTERN,
+        "ranks": [
+            {
+                "container": str(paths["rank0_container"]),
+                "docker_argv": _rank_docker_argv(
+                    settings,
+                    scene,
+                    0,
+                    uverbs_device=primary_uverbs,
+                ),
+            },
+            {
+                "container": str(paths["rank1_container"]),
+                "docker_argv": _rank_docker_argv(
+                    settings,
+                    scene,
+                    1,
+                    uverbs_device=peer_uverbs,
+                ),
+            },
+        ],
+    }
+
+
+def _mpirun_argv(
+    settings: Settings,
+    scene: Scene,
+    *,
+    primary_uverbs: str,
+    peer_uverbs: str,
+    redact_payload: bool = False,
+) -> list[str]:
+    config = _mpi_worker_config(
+        settings,
+        scene,
+        primary_uverbs=primary_uverbs,
+        peer_uverbs=peer_uverbs,
+    )
+    source = base64.urlsafe_b64encode(MPI_WORKER_SOURCE.encode("utf-8")).decode("ascii")
+    payload = base64.urlsafe_b64encode(
+        json.dumps(config, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+    if redact_payload:
+        source = "<embedded-mpi-worker-source>"
+        payload = "<embedded-scene-config>"
+    return [
+        "mpirun",
+        "--host",
+        f"localhost:1,{settings.peer_host}:1",
+        "-np",
+        str(CP_SIZE),
+        "--map-by",
+        "ppr:1:node",
+        "--rank-by",
+        "slot",
+        "--mca",
+        "oob_tcp_if_include",
+        settings.net_iface,
+        "--mca",
+        "btl_tcp_if_include",
+        settings.net_iface,
+        "--mca",
+        "btl",
+        "self,tcp",
+        "--bind-to",
+        "none",
+        "--mca",
+        "plm_rsh_agent",
+        _mpi_rsh_agent(settings),
+        "python3",
+        "-c",
+        MPI_WORKER_BOOTSTRAP,
+        source,
+        payload,
+    ]
+
+
+def _checkpoint_download_argv(settings: Settings) -> list[str]:
+    layout = _layout(settings)
+    return [
+        "docker",
+        "run",
+        "--rm",
+        "--mount",
+        f"type=bind,src={layout['hf_cache']},dst=/root/.cache/huggingface",
+        "--mount",
+        f"type=bind,src={layout['checkpoint']},dst=/checkpoint",
+        "--entrypoint",
+        "/opt/venv/bin/python",
+        settings.image,
+        "-c",
+        CHECKPOINT_DOWNLOAD_SCRIPT,
+    ]
+
+
 def _bundle_build_argv(settings: Settings) -> list[str]:
     layout = _layout(settings)
     pending_name = f"{Path(layout['bundle']).name}.pending"
@@ -1101,6 +1323,10 @@ def _bundle_build_argv(settings: Settings) -> list[str]:
         "docker",
         "run",
         "--rm",
+        "--user",
+        f"{os.getuid()}:{os.getgid()}",
+        "-e",
+        "HOME=/tmp",
         "--gpus",
         "all",
         "--ipc",
@@ -1112,28 +1338,28 @@ def _bundle_build_argv(settings: Settings) -> list[str]:
         "--cap-add",
         "IPC_LOCK",
         "--mount",
-        f"type=bind,src={layout['hf_cache']},dst=/root/.cache/huggingface",
+        f"type=bind,src={layout['checkpoint']},dst=/checkpoint,readonly",
         "--mount",
         f"type=bind,src={layout['models']},dst=/models",
         "--entrypoint",
-        "/opt/trtmc/bin/trtmc",
+        "/opt/venv/bin/python",
         settings.image,
+        "-m",
+        "tensorrt_model_connect",
         "build",
-        MODEL_ID,
-        "--model-revision",
-        MODEL_REVISION,
+        "/checkpoint",
         "--precision",
         PRECISION,
+        "--max-sequence-length",
+        "4096",
         "--context-parallel-size",
         str(CP_SIZE),
-        "--video-height",
+        "--image-height",
         str(HEIGHT),
-        "--video-width",
+        "--image-width",
         str(WIDTH),
         "--video-num-frames",
         str(FRAME_COUNT),
-        "--num-inference-steps",
-        str(STEPS),
         "-o",
         f"/models/{pending_name}",
     ]
@@ -1156,8 +1382,20 @@ def execution_plan(settings: Settings) -> dict[str, Any]:
                 "prompt": _prompt_record(scene),
                 "rendezvous": {
                     "bytes": NCCL_ID_BYTES,
-                    "primary": str(paths["rendezvous"]),
-                    "peer": str(paths["remote_rendezvous"]),
+                    "transport": "MPI_Bcast",
+                    "root": 0,
+                    "file_transfer": False,
+                },
+                "mpi": {
+                    "processes": CP_SIZE,
+                    "mapping": "one MPI worker per Spark",
+                    "argv": _mpirun_argv(
+                        settings,
+                        scene,
+                        primary_uverbs=planned_uverbs["primary"],
+                        peer_uverbs=planned_uverbs["peer"],
+                        redact_payload=True,
+                    ),
                 },
                 "ranks": [
                     {
@@ -1198,8 +1436,6 @@ def execution_plan(settings: Settings) -> dict[str, Any]:
             "authoritative_identity": "NVIDIA GPU UUID",
             "require_distinct_gpu_uuids": True,
             "require_matching_gpu_name_compute_capability_driver": True,
-            "machine_id_sources": ["/etc/machine-id", "/var/lib/dbus/machine-id"],
-            "machine_ids_are_advisory_only": True,
         },
         "ssh": {
             "argv": _ssh_argv(settings),
@@ -1215,9 +1451,7 @@ def execution_plan(settings: Settings) -> dict[str, Any]:
             "network_interface": settings.net_iface,
             "address_family": "AF_INET",
             "uverbs_resolution": {
-                "sysfs_directory": (
-                    f"/sys/class/infiniband/{hca_name}/device/infiniband_verbs"
-                ),
+                "sysfs_directory": (f"/sys/class/infiniband/{hca_name}/device/infiniband_verbs"),
                 "primary_device": planned_uverbs["primary"],
                 "peer_device": planned_uverbs["peer"],
                 "resolved_at_runtime": True,
@@ -1227,11 +1461,11 @@ def execution_plan(settings: Settings) -> dict[str, Any]:
             "image": settings.image,
             "image_source": "prebuilt locally from this example's Dockerfile",
             "image_sync": "docker image save on primary -> strict SSH -> docker image load",
+            "checkpoint_download_argv": _checkpoint_download_argv(settings),
             "bundle_build_argv": _bundle_build_argv(settings),
             "bundle": str(layout["bundle"]),
             "peer_bundle": str(layout["remote_bundle"]),
-            "require_matching_image_id": True,
-            "require_matching_bundle_sha256": True,
+            "bundle_reuse_key": _bundle_spec(),
         },
         "run": {
             "order": [scene.slug for scene in _selected_scenes(settings)],
@@ -1249,6 +1483,23 @@ def _log(message: str) -> None:
     print(f"[cosmos3-dual-spark] {message}", file=sys.stderr, flush=True)
 
 
+def _display_argv(argv: Sequence[str]) -> str:
+    values = [str(value) for value in argv]
+    displayed: list[str] = []
+    for index, value in enumerate(values):
+        if index > 0 and values[index - 1] == "-c":
+            displayed.append("<inline-code>")
+        elif len(value) > 160:
+            displayed.append(f"<argument:{len(value)}-characters>")
+        else:
+            displayed.append(value)
+    return shlex.join(displayed)
+
+
+def _command_logging_enabled() -> bool:
+    return os.environ.get("COSMOS3_LOG_COMMANDS") == "1"
+
+
 def _run(
     argv: Sequence[str],
     *,
@@ -1256,8 +1507,12 @@ def _run(
     timeout: int | float | None = None,
     input_text: str | None = None,
     capture: bool = True,
+    log_command: bool | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    _log(f"$ {shlex.join(str(value) for value in argv)}")
+    if log_command is None:
+        log_command = _command_logging_enabled()
+    if log_command:
+        _log(f"$ {_display_argv(argv)}")
     try:
         completed = subprocess.run(
             [str(value) for value in argv],
@@ -1279,9 +1534,7 @@ def _run(
         if len(detail) > 2000:
             detail = detail[-2000:]
         suffix = f": {detail}" if detail else ""
-        raise DualSparkError(
-            f"command failed with exit code {completed.returncode}{suffix}"
-        )
+        raise DualSparkError(f"command failed with exit code {completed.returncode}{suffix}")
     return completed
 
 
@@ -1291,7 +1544,12 @@ def _remote_run(
     *,
     check: bool = True,
     timeout: int | float | None = None,
+    log_command: bool | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    if log_command is None:
+        log_command = _command_logging_enabled()
+    if log_command:
+        _log(f"peer {settings.peer_host}: $ {_display_argv(argv)}")
     payload = base64.urlsafe_b64encode(
         json.dumps([str(value) for value in argv]).encode("utf-8")
     ).decode("ascii")
@@ -1301,6 +1559,7 @@ def _remote_run(
         check=check,
         timeout=timeout,
         input_text=REMOTE_EXEC_HELPER,
+        log_command=False,
     )
 
 
@@ -1321,30 +1580,23 @@ def _write_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _remote_sha256(settings: Settings, path: str) -> str:
-    output = _remote_run(settings, ["sha256sum", "--", path]).stdout.strip()
-    digest = output.split(maxsplit=1)[0] if output else ""
-    if not re.fullmatch(r"[0-9a-f]{64}", digest):
-        raise DualSparkError(f"peer returned an invalid SHA-256 for {path}")
-    return digest
-
-
-def _image_id(settings: Settings, *, remote: bool) -> str:
+def _image_id(settings: Settings, *, remote: bool) -> str | None:
     argv = ["docker", "image", "inspect", "--format", "{{.Id}}", settings.image]
-    completed = (
-        _remote_run(settings, argv, check=False)
-        if remote
-        else _run(argv, check=False)
-    )
-    return completed.stdout.strip() if completed.returncode == 0 else ""
+    completed = _remote_run(settings, argv, check=False) if remote else _run(argv, check=False)
+    if completed.returncode == 1:
+        return None
+    if completed.returncode != 0:
+        location = "peer" if remote else "primary"
+        raise DualSparkError(f"cannot inspect the requested image on the {location}")
+    image_id = completed.stdout.strip()
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+        location = "peer" if remote else "primary"
+        raise DualSparkError(f"cannot parse the requested image ID on the {location}")
+    return image_id
+
+
+def _image_available(settings: Settings, *, remote: bool) -> bool:
+    return _image_id(settings, remote=remote) is not None
 
 
 def _gpu_facts(settings: Settings, *, remote: bool) -> dict[str, str]:
@@ -1357,9 +1609,7 @@ def _gpu_facts(settings: Settings, *, remote: bool) -> dict[str, str]:
     rows = [row.strip() for row in completed.stdout.splitlines() if row.strip()]
     location = "peer" if remote else "primary"
     if len(rows) != 1:
-        raise DualSparkError(
-            f"{location} DGX Spark must expose exactly one GPU; found {len(rows)}"
-        )
+        raise DualSparkError(f"{location} DGX Spark must expose exactly one GPU; found {len(rows)}")
     parts = [part.strip() for part in rows[0].split(",")]
     if len(parts) != 4:
         raise DualSparkError(f"could not parse {location} nvidia-smi GPU identity")
@@ -1385,77 +1635,29 @@ def _read_host_file(settings: Settings, path: str, *, remote: bool) -> str:
     return completed.stdout.strip()
 
 
-def _machine_id(settings: Settings, *, remote: bool) -> str | None:
-    """Return an advisory OS image identifier when one is available.
-
-    DGX Sparks may legitimately share a machine ID after an OS image is cloned,
-    so this value must never be used to decide whether the hosts are distinct.
-    """
-
-    for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
-        argv = ["cat", "--", path]
-        completed = (
-            _remote_run(settings, argv, check=False)
-            if remote
-            else _run(argv, check=False)
-        )
-        candidate = completed.stdout.strip().lower()
-        if completed.returncode == 0 and re.fullmatch(r"[0-9a-f]{32}", candidate):
-            return candidate
-    return None
-
-
 def _recorded_gpu_facts(facts: Mapping[str, str]) -> dict[str, str]:
-    """Return provenance-safe GPU facts without publishing the raw UUID."""
-
     return {
         "name": facts["name"],
         "compute_capability": facts["compute_capability"],
         "driver": facts["driver"],
-        "uuid_sha256": hashlib.sha256(facts["uuid"].encode("ascii")).hexdigest(),
     }
 
 
 def _validate_host_identity(
     local_gpu: Mapping[str, str],
     peer_gpu: Mapping[str, str],
-    local_machine_id: str | None,
-    peer_machine_id: str | None,
 ) -> dict[str, Any]:
-    """Validate two matching Spark stacks using GPU UUIDs as host identity."""
-
     for fact_name in ("name", "compute_capability", "driver"):
         if local_gpu[fact_name] != peer_gpu[fact_name]:
             raise DualSparkError(
-                "the two Sparks must use matching GPU/driver stacks "
-                f"({fact_name} differs)"
+                f"the two Sparks must use matching GPU/driver stacks ({fact_name} differs)"
             )
     if local_gpu["uuid"] == peer_gpu["uuid"]:
         raise DualSparkError(
-            "--peer-host resolves to the primary Spark; two distinct NVIDIA GPU UUIDs "
-            "are required"
+            "--peer-host resolves to the primary Spark; two distinct NVIDIA GPU UUIDs are required"
         )
 
-    def optional_hash(value: str | None) -> str | None:
-        return hashlib.sha256(value.encode("ascii")).hexdigest() if value else None
-
-    return {
-        "authoritative_source": "nvidia_gpu_uuid",
-        "primary_gpu_uuid_sha256": hashlib.sha256(
-            local_gpu["uuid"].encode("ascii")
-        ).hexdigest(),
-        "peer_gpu_uuid_sha256": hashlib.sha256(
-            peer_gpu["uuid"].encode("ascii")
-        ).hexdigest(),
-        "machine_ids_authoritative": False,
-        "primary_machine_id_sha256": optional_hash(local_machine_id),
-        "peer_machine_id_sha256": optional_hash(peer_machine_id),
-        "machine_ids_match": (
-            local_machine_id == peer_machine_id
-            if local_machine_id is not None and peer_machine_id is not None
-            else None
-        ),
-    }
+    return {"distinct_gpu_uuids": True, "matching_gpu_driver_stack": True}
 
 
 def _resolve_uverbs_device(
@@ -1475,23 +1677,48 @@ def _resolve_uverbs_device(
     )
     if len(names) != 1:
         raise DualSparkError(
-            f"{location} HCA {hca_name!r} must resolve to exactly one uverbs device; "
-            f"found {names}"
+            f"{location} HCA {hca_name!r} must resolve to exactly one uverbs device; found {names}"
         )
     device = f"/dev/infiniband/{names[0]}"
     check_argv = ["test", "-c", device]
     checked = (
-        _remote_run(settings, check_argv, check=False)
-        if remote
-        else _run(check_argv, check=False)
+        _remote_run(settings, check_argv, check=False) if remote else _run(check_argv, check=False)
     )
     if checked.returncode != 0:
         raise DualSparkError(f"{location} resolved uverbs device is unavailable: {device}")
     return device
 
 
+def _mpi_facts(settings: Settings, *, remote: bool) -> dict[str, Any]:
+    location = "peer" if remote else "primary"
+    version_argv = ["mpirun", "--version"]
+    version = _remote_run(settings, version_argv) if remote else _run(version_argv)
+    version_lines = [line.strip() for line in version.stdout.splitlines() if line.strip()]
+    if not version_lines or "Open MPI" not in version_lines[0]:
+        raise DualSparkError(f"{location} must provide Open MPI")
+
+    facts_argv = ["python3", "-c", MPI_FACTS_SCRIPT]
+    completed = _remote_run(settings, facts_argv) if remote else _run(facts_argv)
+    try:
+        facts = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise DualSparkError(f"cannot parse {location} mpi4py runtime identity") from exc
+    if (
+        facts.get("vendor") != "Open MPI"
+        or not isinstance(facts.get("version"), list)
+        or not all(isinstance(value, int) for value in facts["version"])
+    ):
+        raise DualSparkError(f"{location} mpi4py must use Open MPI")
+    return {
+        "launcher": version_lines[0],
+        "vendor": facts["vendor"],
+        "version": facts["version"],
+    }
+
+
 def _preflight(settings: Settings) -> dict[str, Any]:
-    for executable in ("docker", "ssh", "scp", "nvidia-smi"):
+    _log(f"checking the primary and peer {settings.peer_host}")
+    for executable in ("docker", "ssh", "scp", "nvidia-smi", "mpirun", "python3"):
         if shutil.which(executable) is None:
             raise DualSparkError(f"required executable is unavailable: {executable}")
     for label, path in (
@@ -1505,13 +1732,16 @@ def _preflight(settings: Settings) -> dict[str, Any]:
     _remote_run(settings, ["docker", "info"], timeout=60)
     _remote_run(settings, ["python3", "--version"], timeout=30)
 
+    local_mpi = _mpi_facts(settings, remote=False)
+    peer_mpi = _mpi_facts(settings, remote=True)
+    if local_mpi != peer_mpi:
+        raise DualSparkError(
+            "the two Sparks must use matching Open MPI and mpi4py runtime versions"
+        )
+
     local_gpu = _gpu_facts(settings, remote=False)
     peer_gpu = _gpu_facts(settings, remote=True)
-    local_machine_id = _machine_id(settings, remote=False)
-    peer_machine_id = _machine_id(settings, remote=True)
-    host_identity = _validate_host_identity(
-        local_gpu, peer_gpu, local_machine_id, peer_machine_id
-    )
+    host_identity = _validate_host_identity(local_gpu, peer_gpu)
 
     hca_name, port_text = settings.ib_hca.rsplit(":", 1)
     port = int(port_text)
@@ -1536,9 +1766,7 @@ def _preflight(settings: Settings) -> dict[str, Any]:
     roce: dict[str, dict[str, str]] = {}
     for label, remote in (("primary", False), ("peer", True)):
         uverbs_device = _resolve_uverbs_device(settings, hca_name, remote=remote)
-        interface_state = _read_host_file(
-            settings, interface_state_path, remote=remote
-        ).lower()
+        interface_state = _read_host_file(settings, interface_state_path, remote=remote).lower()
         hca_state = _read_host_file(settings, hca_state_path, remote=remote).upper()
         gid = _read_host_file(settings, gid_path, remote=remote)
         if interface_state != "up":
@@ -1554,17 +1782,28 @@ def _preflight(settings: Settings) -> dict[str, Any]:
             "uverbs_device": uverbs_device,
         }
 
+    _log(
+        "preflight passed: matching GB10 GPUs and Open MPI, "
+        f"with active RoCE on {settings.net_iface}"
+    )
     return {
         "primary_gpu": _recorded_gpu_facts(local_gpu),
         "peer_gpu": _recorded_gpu_facts(peer_gpu),
         "host_identity": host_identity,
+        "mpi_hosts": {
+            "primary": local_mpi,
+            "peer": peer_mpi,
+        },
         "roce_hosts": roce,
     }
 
 
-def _sync_image(settings: Settings, expected_id: str) -> None:
-    if _image_id(settings, remote=True) == expected_id:
-        _log("peer already has the exact image ID")
+def _sync_image(settings: Settings) -> None:
+    local_image_id = _image_id(settings, remote=False)
+    if local_image_id is None:
+        raise DualSparkError(f"primary image is unavailable: {settings.image}")
+    if _image_id(settings, remote=True) == local_image_id:
+        _log("peer already has the exact requested image")
         return
     _log("copying the exact image to the peer Spark")
     with tempfile.TemporaryFile() as save_stderr_file:
@@ -1605,13 +1844,12 @@ def _sync_image(settings: Settings, expected_id: str) -> None:
     if save_returncode != 0 or load.returncode != 0:
         detail = (save_stderr + load_stdout + load_stderr).decode("utf-8", "replace")
         raise DualSparkError(f"image transfer failed: {detail[-2000:]}")
-    if _image_id(settings, remote=True) != expected_id:
+    if _image_id(settings, remote=True) != local_image_id:
         raise DualSparkError("peer image ID does not match the primary after transfer")
 
 
-def _bundle_spec(image_id: str) -> dict[str, Any]:
+def _bundle_spec() -> dict[str, Any]:
     return {
-        "image_id": image_id,
         "model": MODEL_ID,
         "revision": MODEL_REVISION,
         "precision": PRECISION,
@@ -1619,14 +1857,51 @@ def _bundle_spec(image_id: str) -> dict[str, Any]:
     }
 
 
-def _prepare_bundle(settings: Settings, image_id: str) -> Path:
+def _prepare_checkpoint(settings: Settings) -> None:
+    layout = _layout(settings)
+    checkpoint = Path(layout["checkpoint"])
+    checkpoint.mkdir(parents=True, exist_ok=True)
+    _log("downloading or reusing the pinned Cosmos3-Nano checkpoint")
+    _run(_checkpoint_download_argv(settings), timeout=settings.build_timeout, capture=False)
+    if not (checkpoint / "model_index.json").is_file():
+        raise DualSparkError("checkpoint download completed without model_index.json")
+
+
+def _ensure_local_bundle_readable(settings: Settings, bundle: Path) -> None:
+    if os.access(bundle, os.R_OK):
+        return
+    if bundle.is_symlink() or not bundle.is_file():
+        raise DualSparkError(f"TensorRT bundle is not a readable regular file: {bundle}")
+
+    _log("repairing ownership of a bundle created by an older root-running container")
+    _run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--mount",
+            f"type=bind,src={bundle.parent},dst=/models",
+            "--entrypoint",
+            "/bin/chown",
+            settings.image,
+            f"{os.getuid()}:{os.getgid()}",
+            f"/models/{bundle.name}",
+        ],
+        timeout=60,
+    )
+    if not os.access(bundle, os.R_OK):
+        raise DualSparkError(f"TensorRT bundle remains unreadable after ownership repair: {bundle}")
+
+
+def _prepare_bundle(settings: Settings) -> Path:
     layout = _layout(settings)
     bundle = Path(layout["bundle"])
-    marker = bundle.with_suffix(f"{bundle.suffix}.build-spec.json")
-    expected = _bundle_spec(image_id)
+    marker = Path(layout["bundle_spec"])
+    expected = _bundle_spec()
     if bundle.is_file() and bundle.stat().st_size > 0 and marker.is_file():
         try:
             if json.loads(marker.read_text(encoding="utf-8")) == expected:
+                _ensure_local_bundle_readable(settings, bundle)
                 _log("reusing the exact native 720p CP=2 TensorRT bundle")
                 return bundle
         except (OSError, json.JSONDecodeError):
@@ -1640,24 +1915,46 @@ def _prepare_bundle(settings: Settings, image_id: str) -> Path:
     if not pending.is_file() or pending.stat().st_size == 0:
         raise DualSparkError("bundle build completed without a nonempty CP=2 bundle")
     os.replace(pending, bundle)
+    _ensure_local_bundle_readable(settings, bundle)
     _write_json(marker, expected)
     return bundle
 
 
-def _sync_bundle(settings: Settings, bundle: Path) -> str:
+def _remote_bundle_matches(settings: Settings) -> bool:
+    layout = _layout(settings)
+    remote_bundle = str(layout["remote_bundle"])
+    remote_spec = str(layout["remote_bundle_spec"])
+    if _remote_run(settings, ["test", "-s", remote_bundle], check=False).returncode != 0:
+        return False
+    completed = _remote_run(settings, ["cat", "--", remote_spec], check=False)
+    if completed.returncode != 0:
+        return False
+    try:
+        return json.loads(completed.stdout) == _bundle_spec()
+    except json.JSONDecodeError:
+        return False
+
+
+def _sync_bundle(settings: Settings, bundle: Path) -> None:
     _ensure_private_remote_root(settings)
     layout = _layout(settings)
     remote_bundle = str(layout["remote_bundle"])
+    remote_spec = str(layout["remote_bundle_spec"])
     remote_parent = str(Path(remote_bundle).parent)
     _remote_run(settings, ["install", "-d", "-m", "0700", remote_parent])
-    digest = _sha256(bundle)
-    existing = _remote_run(settings, ["test", "-f", remote_bundle], check=False)
-    if existing.returncode == 0 and _remote_sha256(settings, remote_bundle) == digest:
-        _log("peer already has the exact CP=2 bundle SHA-256")
-        return digest
+    if _remote_bundle_matches(settings):
+        _log("peer already has the requested CP=2 bundle configuration")
+        return
 
+    bundle_gib = bundle.stat().st_size / (1024**3)
+    _log(f"copying the {bundle_gib:.1f} GiB CP=2 bundle to the peer")
     incoming = f"{remote_bundle}.incoming.{settings.run_id}"
-    _remote_run(settings, ["rm", "-f", "--", incoming], check=False)
+    incoming_spec = f"{remote_spec}.incoming.{settings.run_id}"
+    _remote_run(
+        settings,
+        ["rm", "-f", "--", incoming, incoming_spec],
+        check=False,
+    )
     transferred = False
     try:
         _run(
@@ -1665,14 +1962,42 @@ def _sync_bundle(settings: Settings, bundle: Path) -> str:
             timeout=settings.build_timeout,
             capture=False,
         )
-        if _remote_sha256(settings, incoming) != digest:
-            raise DualSparkError("peer bundle checksum does not match the primary")
-        _remote_run(settings, ["mv", "-T", "--", incoming, remote_bundle])
+        _run(
+            [
+                *_scp_argv(settings),
+                str(layout["bundle_spec"]),
+                f"{settings.peer_target}:{incoming_spec}",
+            ],
+            timeout=120,
+            capture=False,
+        )
+        _remote_run(
+            settings,
+            [
+                "python3",
+                "-c",
+                (
+                    "import os,sys; "
+                    "os.replace(sys.argv[1],sys.argv[2]); "
+                    "os.replace(sys.argv[3],sys.argv[4])"
+                ),
+                incoming,
+                remote_bundle,
+                incoming_spec,
+                remote_spec,
+            ],
+        )
         transferred = True
     finally:
         if not transferred:
-            _remote_run(settings, ["rm", "-f", "--", incoming], check=False)
-    return digest
+            _remote_run(
+                settings,
+                ["rm", "-f", "--", incoming, incoming_spec],
+                check=False,
+            )
+    if not _remote_bundle_matches(settings):
+        raise DualSparkError("peer bundle is incomplete after transfer")
+    _log("peer CP=2 bundle synchronized")
 
 
 def prepare(settings: Settings) -> dict[str, Any]:
@@ -1681,29 +2006,32 @@ def prepare(settings: Settings) -> dict[str, Any]:
     Path(layout["models"]).mkdir(parents=True, exist_ok=True)
     facts = _preflight(settings)
 
-    image_id = _image_id(settings, remote=False)
-    if not image_id:
+    if not _image_available(settings, remote=False):
         raise DualSparkError(
             f"required image {settings.image!r} is not present locally; "
             "build it from this example's Dockerfile first"
         )
-    _log(f"using prebuilt image {settings.image} ({image_id})")
-    _sync_image(settings, image_id)
+    _log(f"using prebuilt image {settings.image}")
+    _sync_image(settings)
 
-    bundle = _prepare_bundle(settings, image_id)
-    bundle_digest = _sync_bundle(settings, bundle)
+    _prepare_checkpoint(settings)
+    bundle = _prepare_bundle(settings)
+    _sync_bundle(settings, bundle)
     preparation = {
         "schema_version": 1,
         "prepared_at_utc": datetime.now(timezone.utc).isoformat(),
         "peer": settings.peer_target,
         "model": {"id": MODEL_ID, "revision": MODEL_REVISION, "precision": PRECISION},
         "profile": _profile(),
-        "image": {"name": settings.image, "id": image_id},
+        "image": {
+            "name": settings.image,
+            "id": _image_id(settings, remote=False),
+        },
         "bundle": {
             "primary_path": str(bundle),
             "peer_path": str(layout["remote_bundle"]),
-            "sha256": bundle_digest,
             "bytes": bundle.stat().st_size,
+            "build": _bundle_spec(),
         },
         **facts,
     }
@@ -1727,35 +2055,34 @@ def _require_prepared(settings: Settings) -> dict[str, Any]:
         or preparation.get("model")
         != {"id": MODEL_ID, "revision": MODEL_REVISION, "precision": PRECISION}
         or preparation.get("profile") != _profile()
-        or preparation.get("image", {}).get("name") != settings.image
+        or preparation.get("image")
+        != {"name": settings.image, "id": _image_id(settings, remote=False)}
     ):
-        raise DualSparkError("prepared asset provenance does not match this invocation")
+        raise DualSparkError("prepared assets do not match this invocation")
 
-    expected_image_id = str(preparation.get("image", {}).get("id", ""))
-    if not expected_image_id or _image_id(settings, remote=False) != expected_image_id:
-        raise DualSparkError("the primary image changed; run prepare again")
-    if _image_id(settings, remote=True) != expected_image_id:
-        raise DualSparkError("the peer image changed; run prepare again")
+    if _image_id(settings, remote=True) != preparation["image"]["id"]:
+        raise DualSparkError("the peer image differs from the prepared image; run prepare again")
 
     bundle = Path(layout["bundle"])
     if not bundle.is_file() or bundle.stat().st_size == 0:
         raise DualSparkError(f"required bundle is missing: {bundle}")
-    expected_digest = str(preparation.get("bundle", {}).get("sha256", ""))
-    if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
-        raise DualSparkError("preparation.json contains an invalid bundle digest")
-    if _sha256(bundle) != expected_digest:
-        raise DualSparkError("the primary bundle changed; run prepare again")
-    if _remote_sha256(settings, str(layout["remote_bundle"])) != expected_digest:
-        raise DualSparkError("the peer bundle changed; run prepare again")
+    try:
+        build_spec = json.loads(Path(layout["bundle_spec"]).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DualSparkError("bundle build record is invalid; run prepare again") from exc
+    if build_spec != _bundle_spec() or preparation.get("bundle", {}).get("build") != build_spec:
+        raise DualSparkError("bundle configuration changed; run prepare again")
+    if not _remote_bundle_matches(settings):
+        raise DualSparkError("the peer bundle configuration changed; run prepare again")
     return preparation
 
 
 def _container_exists(settings: Settings, name: str, *, remote: bool) -> bool:
     argv = ["docker", "inspect", name]
     completed = (
-        _remote_run(settings, argv, check=False)
+        _remote_run(settings, argv, check=False, log_command=False)
         if remote
-        else _run(argv, check=False)
+        else _run(argv, check=False, log_command=False)
     )
     if completed.returncode == 0:
         return True
@@ -1763,14 +2090,14 @@ def _container_exists(settings: Settings, name: str, *, remote: bool) -> bool:
         return False
     detail = (completed.stderr or completed.stdout or "").strip()
     suffix = f": {detail[-500:]}" if detail else ""
-    raise DualSparkError(
-        f"could not determine whether container {name!r} exists{suffix}"
-    )
+    raise DualSparkError(f"could not determine whether container {name!r} exists{suffix}")
 
 
 def _container_state(settings: Settings, name: str, *, remote: bool) -> dict[str, Any]:
     argv = ["docker", "inspect", "--format", "{{json .State}}", name]
-    completed = _remote_run(settings, argv) if remote else _run(argv)
+    completed = (
+        _remote_run(settings, argv, log_command=False) if remote else _run(argv, log_command=False)
+    )
     try:
         return json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
@@ -1787,28 +2114,20 @@ def _sample_memory_tracker(settings: Settings, tracker: MemoryTracker) -> None:
     ]
     argv = ["cat", "--", *paths]
     completed = (
-        _remote_run(settings, argv) if tracker.remote else _run(argv)
+        _remote_run(settings, argv, log_command=False)
+        if tracker.remote
+        else _run(argv, log_command=False)
     )
     lines = [line.strip() for line in completed.stdout.splitlines()]
     values = lines[:4]
     event_lines = lines[4:]
-    if len(values) != 4 or any(
-        not re.fullmatch(r"[0-9]+", value) for value in values
-    ):
-        raise DualSparkError(
-            f"invalid cgroup-v2 memory counters for {tracker.container}"
-        )
-    if not event_lines or any(
-        not re.fullmatch(r"[a-z_]+ [0-9]+", line) for line in event_lines
-    ):
-        raise DualSparkError(
-            f"invalid cgroup-v2 memory events for {tracker.container}"
-        )
+    if len(values) != 4 or any(not re.fullmatch(r"[0-9]+", value) for value in values):
+        raise DualSparkError(f"invalid cgroup-v2 memory counters for {tracker.container}")
+    if not event_lines or any(not re.fullmatch(r"[a-z_]+ [0-9]+", line) for line in event_lines):
+        raise DualSparkError(f"invalid cgroup-v2 memory events for {tracker.container}")
     current_bytes, peak_bytes, swap_current_bytes, swap_peak_bytes = map(int, values)
     if peak_bytes < current_bytes or swap_peak_bytes < swap_current_bytes:
-        raise DualSparkError(
-            f"inconsistent cgroup-v2 memory counters for {tracker.container}"
-        )
+        raise DualSparkError(f"inconsistent cgroup-v2 memory counters for {tracker.container}")
     events = "\n".join(event_lines) + "\n"
     if tracker.samples == 0:
         tracker.initial_events = events
@@ -1834,22 +2153,14 @@ def _memory_tracker(
     remote: bool,
 ) -> MemoryTracker:
     pid_argv = ["docker", "inspect", "--format", "{{.State.Pid}}", container]
-    completed = (
-        _remote_run(settings, pid_argv) if remote else _run(pid_argv)
-    )
+    completed = _remote_run(settings, pid_argv) if remote else _run(pid_argv)
     pid_text = completed.stdout.strip()
     if not re.fullmatch(r"[1-9][0-9]*", pid_text):
         raise DualSparkError(f"container is not running for memory monitoring: {container}")
 
     cgroup_argv = ["cat", "--", f"/proc/{pid_text}/cgroup"]
-    completed = (
-        _remote_run(settings, cgroup_argv) if remote else _run(cgroup_argv)
-    )
-    relative_paths = [
-        line[3:]
-        for line in completed.stdout.splitlines()
-        if line.startswith("0::")
-    ]
+    completed = _remote_run(settings, cgroup_argv) if remote else _run(cgroup_argv)
+    relative_paths = [line[3:] for line in completed.stdout.splitlines() if line.startswith("0::")]
     if len(relative_paths) != 1:
         raise DualSparkError(f"cannot resolve cgroup-v2 path for {container}")
     relative = relative_paths[0]
@@ -1911,10 +2222,7 @@ def _write_memory_evidence_noexcept(
     try:
         _write_memory_evidence(tracker, destination)
     except Exception as exc:
-        _log(
-            f"WARNING: could not preserve cgroup memory evidence "
-            f"for {tracker.container}: {exc}"
-        )
+        _log(f"WARNING: could not preserve cgroup memory evidence for {tracker.container}: {exc}")
 
 
 def _capture_container(
@@ -1927,11 +2235,7 @@ def _capture_container(
     destination.mkdir(parents=True, exist_ok=True)
     logs_argv = ["docker", "logs", name]
     inspect_argv = ["docker", "inspect", name]
-    logs = (
-        _remote_run(settings, logs_argv, check=False)
-        if remote
-        else _run(logs_argv, check=False)
-    )
+    logs = _remote_run(settings, logs_argv, check=False) if remote else _run(logs_argv, check=False)
     inspect = (
         _remote_run(settings, inspect_argv, check=False)
         if remote
@@ -1986,51 +2290,75 @@ def _remove_container_noexcept(settings: Settings, name: str, *, remote: bool) -
             running = state.get("Running")
         except Exception:
             running = "unknown"
-        _log(
-            f"WARNING: exact container {name} still exists after cleanup "
-            f"(running={running})"
-        )
+        _log(f"WARNING: exact container {name} still exists after cleanup (running={running})")
         return False
     return True
 
 
-def _wait_for_rendezvous(settings: Settings, path: Path, container: str) -> None:
+def _mpi_diagnostics(stdout_path: Path, stderr_path: Path) -> str:
+    parts = []
+    for path in (stderr_path, stdout_path):
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        if content:
+            parts.append(content[-2000:])
+    return "\n".join(parts)[-4000:]
+
+
+def _wait_for_mpi_containers(
+    settings: Settings,
+    containers: Sequence[tuple[str, bool]],
+    process: subprocess.Popen[Any],
+    stdout_path: Path,
+    stderr_path: Path,
+) -> None:
     deadline = time.monotonic() + min(180, settings.runtime_timeout)
     while time.monotonic() < deadline:
-        if path.is_file() and path.stat().st_size == NCCL_ID_BYTES:
+        if all(_container_exists(settings, name, remote=remote) for name, remote in containers):
             return
-        state = _container_state(settings, container, remote=False)
-        if not state.get("Running", False):
+        returncode = process.poll()
+        if returncode is not None:
+            detail = _mpi_diagnostics(stdout_path, stderr_path)
+            suffix = f": {detail}" if detail else ""
             raise DualSparkError(
-                "rank 0 exited before publishing the NCCL rendezvous"
+                f"mpirun exited with code {returncode} before both containers started{suffix}"
             )
         time.sleep(1)
-    raise DualSparkError("timed out waiting for the NCCL rendezvous")
+    raise DualSparkError("timed out waiting for mpirun to start both rank containers")
 
 
-def _transfer_rendezvous(settings: Settings, local_path: Path, remote_path: str) -> None:
-    incoming = f"{remote_path}.incoming"
-    _remote_run(settings, ["rm", "-f", "--", incoming, remote_path], check=False)
-    copied = False
+def _wait_for_mpi_completion(
+    process: subprocess.Popen[Any],
+    stdout_path: Path,
+    stderr_path: Path,
+) -> None:
     try:
-        _run(
-            [*_scp_argv(settings), str(local_path), f"{settings.peer_target}:{incoming}"],
-            timeout=120,
-            capture=False,
-        )
-        size = _remote_run(
-            settings,
-            ["stat", "-c", "%s", "--", incoming],
-        ).stdout.strip()
-        if size != str(NCCL_ID_BYTES):
-            raise DualSparkError("peer received an invalid NCCL rendezvous file")
-        if _remote_sha256(settings, incoming) != _sha256(local_path):
-            raise DualSparkError("peer NCCL rendezvous checksum does not match")
-        _remote_run(settings, ["mv", "-T", "--", incoming, remote_path])
-        copied = True
-    finally:
-        if not copied:
-            _remote_run(settings, ["rm", "-f", "--", incoming], check=False)
+        returncode = process.wait(timeout=30)
+    except subprocess.TimeoutExpired as exc:
+        raise DualSparkError("MPI workers did not exit after both containers stopped") from exc
+    if returncode != 0:
+        detail = _mpi_diagnostics(stdout_path, stderr_path)
+        suffix = f": {detail}" if detail else ""
+        raise DualSparkError(f"mpirun failed with exit code {returncode}{suffix}")
+
+
+def _stop_mpi_noexcept(process: subprocess.Popen[Any] | None) -> None:
+    try:
+        if process is None or process.poll() is not None:
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=15)
+    except Exception as exc:
+        try:
+            _log(f"WARNING: could not stop mpirun cleanly: {exc}")
+        except Exception:
+            pass
 
 
 def _wait_for_containers(
@@ -2043,15 +2371,14 @@ def _wait_for_containers(
     finished_trackers: set[str] = set()
     while time.monotonic() < deadline:
         states = {
-            name: _container_state(settings, name, remote=remote)
-            for name, remote in containers
+            name: _container_state(settings, name, remote=remote) for name, remote in containers
         }
         for name, tracker in trackers.items():
             if name in finished_trackers:
                 continue
             try:
                 _sample_memory_tracker(settings, tracker)
-            except DualSparkError as exc:
+            except DualSparkError:
                 if tracker.samples == 0:
                     raise
                 if states[name].get("Running", False):
@@ -2062,10 +2389,9 @@ def _wait_for_containers(
                     )
                 if states[name].get("Running", False):
                     raise
-                _log(
-                    f"WARNING: final cgroup memory sample was unavailable "
-                    f"for {name}: {exc}"
-                )
+                # Docker may remove a stopped container's cgroup between the
+                # state probe and this final sample. Earlier memory.peak
+                # samples remain authoritative for the completed rank.
                 finished_trackers.add(name)
         if all(not state.get("Running", False) for state in states.values()):
             return states
@@ -2079,13 +2405,11 @@ def _wait_for_containers(
 
 
 def _verify_frames(frames_dir: Path) -> None:
-    expected = {f"frame_{index:04d}.png" for index in range(FRAME_COUNT)}
-    frame_paths = tuple(frames_dir.glob("frame_*.png"))
+    expected = {f"frame-{index:06d}.png" for index in range(FRAME_COUNT)}
+    frame_paths = tuple(frames_dir.glob("frame-*.png"))
     actual = {path.name for path in frame_paths if path.is_file()}
     if actual != expected or any(path.stat().st_size == 0 for path in frame_paths):
-        raise DualSparkError(
-            "rank 0 did not produce exactly 189 nonempty sequential frames"
-        )
+        raise DualSparkError("rank 0 did not produce exactly 189 nonempty sequential frames")
 
 
 def _verify_rank1_has_no_frames(settings: Settings, remote_output: str) -> None:
@@ -2099,7 +2423,7 @@ def _verify_rank1_has_no_frames(settings: Settings, remote_output: str) -> None:
             "-type",
             "f",
             "-name",
-            "frame_*.png",
+            "frame-*.png",
             "-print",
             "-quit",
         ],
@@ -2110,14 +2434,18 @@ def _verify_rank1_has_no_frames(settings: Settings, remote_output: str) -> None:
 
 def _remove_rank1_empty_frames(settings: Settings, remote_output: str) -> None:
     frames = f"{remote_output}/frames"
+    present = _remote_run(settings, ["test", "-e", frames], check=False)
+    if present.returncode == 1:
+        return
+    if present.returncode != 0:
+        detail = (present.stderr or present.stdout or "").strip()
+        suffix = f": {detail[-500:]}" if detail else ""
+        raise DualSparkError(f"could not check rank 1's verified-empty frames directory{suffix}")
     removed = _remote_run(settings, ["rmdir", "--", frames], check=False)
     if removed.returncode != 0:
         detail = (removed.stderr or removed.stdout or "").strip()
         suffix = f": {detail[-500:]}" if detail else ""
-        raise DualSparkError(
-            "could not remove rank 1's verified-empty frames directory"
-            f"{suffix}"
-        )
+        raise DualSparkError(f"could not remove rank 1's verified-empty frames directory{suffix}")
 
 
 def _validate_rank_evidence(scene_paths: Mapping[str, Any]) -> None:
@@ -2196,13 +2524,9 @@ def _parse_cosmos3_performance(
         try:
             value = float(fields[name])
         except ValueError as exc:
-            raise DualSparkError(
-                f"rank-0 Cosmos3 performance field {name} is not numeric"
-            ) from exc
+            raise DualSparkError(f"rank-0 Cosmos3 performance field {name} is not numeric") from exc
         if not math.isfinite(value) or value < 0:
-            raise DualSparkError(
-                f"rank-0 Cosmos3 performance field {name} is invalid"
-            )
+            raise DualSparkError(f"rank-0 Cosmos3 performance field {name} is invalid")
         performance[name] = value
     try:
         cp_size = int(fields["cp_size"])
@@ -2264,7 +2588,7 @@ def _package_video(
                 "-start_number",
                 "0",
                 "-i",
-                f"{frames_in_container}/frame_%04d.png",
+                f"{frames_in_container}/frame-%06d.png",
                 "-frames:v",
                 str(FRAME_COUNT),
                 "-r",
@@ -2337,7 +2661,6 @@ def _package_video(
         raise
     return {
         "path": str(output),
-        "sha256": _sha256(output),
         "bytes": output.stat().st_size,
         "video": {
             "codec": "h264",
@@ -2355,7 +2678,6 @@ def _prepare_scene_directories(settings: Settings, scene: Scene) -> None:
     paths = _scene_layout(settings, scene)
     Path(paths["rank0"]).mkdir(parents=True, exist_ok=False)
     Path(paths["rank1_capture"]).mkdir(parents=True, exist_ok=False)
-    Path(paths["rendezvous"]).parent.mkdir(parents=True, exist_ok=False)
     remote_scene_root = str(Path(paths["remote_rank1"]).parent)
     _remote_run(
         settings,
@@ -2366,7 +2688,6 @@ def _prepare_scene_directories(settings: Settings, scene: Scene) -> None:
             "0700",
             remote_scene_root,
             str(paths["remote_rank1"]),
-            str(Path(paths["remote_rendezvous"]).parent),
         ],
     )
 
@@ -2400,40 +2721,52 @@ def _run_scene(
     rank0_wall_seconds = 0.0
     trackers: dict[str, MemoryTracker] = {}
     cleanup_failures: list[str] = []
+    mpi_process: subprocess.Popen[Any] | None = None
+    mpi_stdout_path = Path(paths["mpi_stdout"])
+    mpi_stderr_path = Path(paths["mpi_stderr"])
     try:
-        _log(f"starting {scene.slug}: primary rank 0")
-        rank0_launch_attempted = True
+        _log(f"launching {scene.slug}: CP=2 across the primary and {settings.peer_host}")
+        mpi_argv = _mpirun_argv(
+            settings,
+            scene,
+            primary_uverbs=primary_uverbs,
+            peer_uverbs=peer_uverbs,
+        )
         rank0_wall_started = time.monotonic()
-        _run(
-            _rank_docker_argv(
-                settings, scene, 0, uverbs_device=primary_uverbs
+        stdout_stream = mpi_stdout_path.open("w", encoding="utf-8")
+        stderr_stream = mpi_stderr_path.open("w", encoding="utf-8")
+        try:
+            mpi_process = subprocess.Popen(
+                mpi_argv,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_stream,
+                stderr=stderr_stream,
+                text=True,
+                shell=False,
             )
-        )
-        _wait_for_rendezvous(
-            settings,
-            Path(paths["rendezvous"]),
-            rank0_name,
-        )
-        _transfer_rendezvous(
-            settings,
-            Path(paths["rendezvous"]),
-            str(paths["remote_rendezvous"]),
-        )
-        _log(f"starting {scene.slug}: peer rank 1")
+        except OSError as exc:
+            raise DualSparkError("cannot start required command: mpirun") from exc
+        finally:
+            stdout_stream.close()
+            stderr_stream.close()
+        rank0_launch_attempted = True
         rank1_launch_attempted = True
-        _remote_run(
+        containers = ((rank0_name, False), (rank1_name, True))
+        _wait_for_mpi_containers(
             settings,
-            _rank_docker_argv(
-                settings, scene, 1, uverbs_device=peer_uverbs
-            ),
+            containers,
+            mpi_process,
+            mpi_stdout_path,
+            mpi_stderr_path,
         )
+        _log("both rank containers started; MPI rendezvous complete; NCCL/RoCE inference running")
         trackers = {
             rank0_name: _memory_tracker(settings, rank0_name, remote=False),
             rank1_name: _memory_tracker(settings, rank1_name, remote=True),
         }
         states = _wait_for_containers(
             settings,
-            ((rank0_name, False), (rank1_name, True)),
+            containers,
             trackers,
         )
         rank0_wall_seconds = time.monotonic() - rank0_wall_started
@@ -2444,7 +2777,14 @@ def _run_scene(
         }
         if failures:
             raise DualSparkError(f"Cosmos3 ranks failed for {scene.slug}: {failures}")
+        _wait_for_mpi_completion(
+            mpi_process,
+            mpi_stdout_path,
+            mpi_stderr_path,
+        )
+        _log("both ranks completed successfully; validating output and telemetry")
     finally:
+        _stop_mpi_noexcept(mpi_process)
         launched = (
             (rank0_name, False, rank0_launch_attempted, Path(paths["rank0"])),
             (rank1_name, True, rank1_launch_attempted, Path(paths["rank1_capture"])),
@@ -2458,31 +2798,23 @@ def _run_scene(
                 exists = False
                 _log(f"WARNING: could not probe exact container {name}: {exc}")
             if exists:
-                _capture_container_noexcept(
-                    settings, name, destination, remote=remote
-                )
+                _capture_container_noexcept(settings, name, destination, remote=remote)
             tracker = trackers.get(name)
             if tracker is not None:
                 _write_memory_evidence_noexcept(tracker, destination)
         for name, remote, attempted, _destination in launched:
-            if attempted and not _remove_container_noexcept(
-                settings, name, remote=remote
-            ):
+            if attempted and not _remove_container_noexcept(settings, name, remote=remote):
                 cleanup_failures.append(name)
 
     if cleanup_failures:
-        raise DualSparkError(
-            f"could not verify cleanup of exact containers: {cleanup_failures}"
-        )
+        raise DualSparkError(f"could not verify cleanup of exact containers: {cleanup_failures}")
     if set(trackers) != {rank0_name, rank1_name}:
         raise DualSparkError("memory telemetry is incomplete for the two ranks")
     for destination in (Path(paths["rank0"]), Path(paths["rank1_capture"])):
         for name in ("memory.csv", "memory-events.initial.txt", "memory-events.txt"):
             evidence_path = destination / name
             if not evidence_path.is_file() or evidence_path.stat().st_size == 0:
-                raise DualSparkError(
-                    f"cgroup memory evidence is incomplete: {evidence_path}"
-                )
+                raise DualSparkError(f"cgroup memory evidence is incomplete: {evidence_path}")
 
     _validate_rank_evidence(paths)
     performance = _parse_cosmos3_performance(
@@ -2518,6 +2850,7 @@ def _run_scene(
     }
     _verify_rank1_has_no_frames(settings, str(paths["remote_rank1"]))
     _remove_rank1_empty_frames(settings, str(paths["remote_rank1"]))
+    _log(f"packaging {FRAME_COUNT} frames as a native {WIDTH}x{HEIGHT} H.264 video")
     artifact = _package_video(
         settings,
         Path(paths["rank0"]) / "frames",
@@ -2529,7 +2862,13 @@ def _run_scene(
         "seed": scene.seed,
         "prompt": _prompt_record(scene),
         "rank_hosts": {"0": socket.gethostname(), "1": settings.peer_host},
-        "rendezvous_name": Path(paths["rendezvous"]).name,
+        "rendezvous": {
+            "transport": "MPI_Bcast",
+            "root": 0,
+            "bytes": NCCL_ID_BYTES,
+            "file_transfer": False,
+        },
+        "mpi_logs": {"stdout": str(mpi_stdout_path), "stderr": str(mpi_stderr_path)},
         "performance": performance,
         "memory": memory,
         "artifact": artifact,
@@ -2587,7 +2926,7 @@ def run_scenes(settings: Settings) -> dict[str, Any]:
         "scenes": artifacts,
     }
     _write_json(Path(layout["run_json"]), run_record)
-    _log(f"all scenes complete; provenance: {layout['run_json']}")
+    _log(f"all scenes complete; run record: {layout['run_json']}")
     return run_record
 
 

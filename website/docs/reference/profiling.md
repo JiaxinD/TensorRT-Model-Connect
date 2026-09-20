@@ -1,148 +1,57 @@
-# Profiling Guide
+---
+title: Profiling Guide
+---
 
-The supported profiling entry point is `tools/trtmc_profile.py`. It compares
-the repository's Python TensorRT runner with Hugging Face eager execution and,
-unless disabled, `torch.compile`. Its prebuilt-bundle loader currently supports
-only the native bundle shape described below; it is not a generic profiler for
-optimized-runtime bundles.
+# Profiling guide
 
-Run profiling in the project development image or another environment that
-contains TensorRT, CUDA, PyTorch, Transformers, and the model checkpoint.
+TRTMC currently has no repository-supported `trtmc_profile.py`, layer-diff, or
+Nsight conversion wrapper. Profile the installed public task command with the
+standard NVIDIA tools available in your target environment.
 
-## Profile a model
+## Establish a repeatable command
 
-Build the engine in-process and save machine-readable artifacts:
+First prove that the same bundle and request complete normally:
 
 ```bash
-PYTHONPATH=python:. python3 tools/trtmc_profile.py \
-  --model Qwen/Qwen3-0.6B \
+trtmc run model.bundle \
+  --runtime-root /opt/trtmc/lib \
   --prompt "The capital of France is" \
   --max-new-tokens 20 \
-  --warmup 1 \
-  --iterations 3 \
-  --output-dir /tmp/qwen3-profile \
-  --json
+  --seed 1234
 ```
 
-Profile an existing native bundle and include the C++ runtime:
+Hold these inputs constant across comparisons:
 
-```bash
-PYTHONPATH=python:. python3 tools/trtmc_profile.py \
-  --model Qwen/Qwen3-0.6B \
-  --bundle /path/to/qwen3-0.6b.bundle \
-  --trtmc-binary ./build/trtmc \
-  --prompt "The capital of France is" \
-  --max-new-tokens 20 \
-  --warmup 1 \
-  --iterations 3 \
-  --output-dir /tmp/qwen3-profile \
-  --json
-```
+- repository commit and bundle bytes;
+- model revision and precision;
+- request inputs and generation controls;
+- runtime root, TensorRT/CUDA/driver versions, and target GPU;
+- warmup and measured iteration counts;
+- device topology for tensor or context parallel families.
 
-The current `--bundle` path requires a top-level `engine_plan` section plus
-`config.json` with a nonempty native `runtime_strategy`; it explicitly rejects
-the `vision_language` strategy. Split-plan and optimized-runtime bundle shapes
-do not satisfy this loader. `--trtmc-binary` requires `--bundle` and does not
-bypass that Python-side load.
+## Choose the measurement layer
 
-The model-only profiler path has its own diagnostic default of
-`--max-cache-length 256` and calls the lower-level single-engine builder. It
-therefore does not reproduce `trtmc build` family defaults. In particular, an
-eligible dense Qwen3 or Llama `trtmc build` bundle uses split prefill/decode
-plans and does not satisfy the profiler's current `--bundle` loader.
+- Use `trtmc-bench` for repeatable public task latency and throughput. See the
+  [Benchmarking Reference](/reference/benchmarking).
+- Use Nsight Systems around the same CLI or benchmark worker to study process,
+  CPU, CUDA API, and kernel timelines.
+- Use Nsight Compute only after narrowing the question to a specific kernel.
+- Use family-owned tests and reference comparisons to establish correctness
+  before interpreting a speedup.
 
-Use `--hf-python /path/to/python` only when the native runtime needs a Python
-helper. Add `--trust-remote-code` only after reviewing the checkpoint
-repository. `--no-compile` skips the `torch.compile` comparison, and
-`--no-layer-profile` skips the TensorRT `IProfiler` pass.
-
-For an optimized-runtime bundle, use its family-owned qualification workflow
-and the public C++ benchmark path instead:
-
-```bash
-./build/trtmc run /path/to/optimized.bundle \
-  --prompt "The capital of France is" \
-  --max-new-tokens 20 \
-  --warmup 1 \
-  --benchmark 3
-```
-
-Record the qualified implementation/profile identity, exact bundle and commit,
-target, downstream runtime, prompt, warmup/iteration counts, and the
-provider-owned timing artifact. The public inspector currently confirms
-optimized descriptor/artifact section presence but does not print descriptor
-identity values.
-
-With `--json`, the command writes:
-
-- `perf_compare.json`
-- `layer_profile.json` when the family supports layer profiling
-- `report.html`
-- `cpu_profile.json` when `--cpu-profile` is requested, the family supports
-  CPU phase profiling, and `--bundle` is also supplied
-
-The exact options are authoritative in the parser:
-
-```bash
-python3 tools/trtmc_profile.py --help
-```
-
-## Focused comparison tools
-
-Use the focused tools when a performance result first needs a correctness
-check:
-
-```bash
-PYTHONPATH=python:. python3 tools/diff_logits.py \
-  --model Qwen/Qwen3-0.6B \
-  --prompt "The capital of France is" \
-  --max-new-tokens 8 \
-  --json /tmp/qwen3-logits.json
-
-PYTHONPATH=python:. python3 tools/diff_layers.py \
-  --model Qwen/Qwen3-0.6B \
-  --prompt "The capital of France is" \
-  --atol 0.001
-```
-
-`diff_logits.py` accepts `--battery` for the repository's standard prompt
-battery. Neither command has a `--check` option; comparison types are separate
-entry points.
-
-## CPU phase breakdown
-
-The unified profiler invokes `tools/cpu_profile.py` when `--cpu-profile` is
-present and the selected family supports CPU phase profiling. In this revision,
-that unified path also requires `--bundle`; without it the optional subprocess
-fails and no `cpu_profile.json` is produced. The focused tool can also be run
-directly:
-
-```bash
-PYTHONPATH=python:. python3 tools/cpu_profile.py \
-  --model Qwen/Qwen3-0.6B \
-  --bundle /path/to/qwen3-0.6b.bundle \
-  --prompt "The capital of France is" \
-  --max-new-tokens 20 \
-  --warmup 1 \
-  --iterations 3 \
-  --json /tmp/qwen3-cpu-profile.json
-```
-
-## Nsight status
-
-Do not use `--nsight` in this revision. The option is still exposed by
-`trtmc_profile.py`, but its implementation calls a removed Nsight collection
-helper. Collect an external `nsys` trace manually if needed; there is currently
-no repository-supported conversion command for that trace.
+Profile loading separately from steady-state task execution. The public CLI
+requires `--runtime-root`; include its exact directory in the evidence so the
+loaded shared objects are reproducible.
 
 ## Interpreting results
 
-- Compare identical checkpoints, prompts, token limits, precision, profiles,
-  warmups, and iteration counts.
-- Establish parity before treating a speedup as meaningful.
-- Do not compare the `IProfiler` pass itself against uninstrumented latency;
-  the unified tool runs a separate uninstrumented TensorRT timing pass.
-- Retain JSON artifacts with the tested commit, GPU, TensorRT version, and
-  exact command when using results as qualification evidence.
+- Do not compare instrumented latency directly with an uninstrumented run.
+- Separate first-request setup from warm steady-state measurements.
+- Compare identical task outputs or accepted validation thresholds.
+- Treat a failure to build, load, or execute as an operational failure, not a
+  performance number.
+- Keep profiler artifacts with the benchmark JSON and environment metadata.
 
-{/* Collaborative review anchor: batch 2. */}
+Family implementations own their orchestration, so a family-specific hot path
+should be investigated and fixed inside that family. Shared runtime changes
+need evidence that the issue is model-agnostic.

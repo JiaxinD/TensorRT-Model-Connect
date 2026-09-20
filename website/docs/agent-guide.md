@@ -18,7 +18,7 @@ Before changing or running anything, an agent must:
 
 1. read the applicable `AGENTS.md` files and obey the closest scoped file;
 2. inspect the current branch, status, remotes, and user-owned changes;
-3. use current model descriptors and E2E manifests instead of guessing model
+3. use current family metadata and E2E manifests instead of guessing model
    IDs, paths, precision, topology, or support;
 4. separate source/static proof, GPU execution, model parity, performance, and
    publication evidence in its report; and
@@ -37,7 +37,7 @@ An agent must not:
   qualification;
 - expose credentials, gated model assets, private URLs, or retained internal
   artifacts in public output; or
-- mix native runtime support with a platform-specialized provider claim.
+- mix native runtime support with a platform-specialized offload claim.
 
 When requested work conflicts with one of these boundaries, stop, show the
 concrete conflict, and ask for human direction.
@@ -58,8 +58,9 @@ Useful source-of-truth commands:
 
 ```bash
 git status --short --branch
-python3 tools/model_ci.py validate
-python3 tools/check_doc_file_references.py --strict website/docs
+python3 -m tools.model_ci validate
+python3 tools/test_impact.py --validate
+npm --prefix website run build
 ```
 
 ## AI-native quick start prompt

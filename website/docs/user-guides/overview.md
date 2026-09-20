@@ -1,37 +1,27 @@
 ---
 title: User Guides
-description: Goal-oriented guides for building bundles, running tasks, configuring behavior, and validating results.
+description: Goal-oriented guides for building, inspecting, running, and validating family-owned bundles.
 ---
 
-User Guides are for quick lookup while doing real work. Each page starts from
-a goal, shows the relevant commands and configuration boundaries, and links to
-the exact reference surface.
-
-Use [Tutorials](../learning-path.md) instead when you want a course that builds
-understanding step by step. Use [Reference](../api/overview.md) when you already
-know the concept and need every option or API field.
-
-## Core workflow
+Use these pages while doing real work. Confirm the exact checkpoint and task in
+[Models & Recipes](../models-recipes/overview.md) before treating a generic
+command as a support claim.
 
 | Goal | Guide | Result |
 | --- | --- | --- |
-| Create an artifact | [Build a Bundle](build-a-bundle.md) | A named `.bundle` with recorded model/config inputs. |
-| Diagnose an artifact | [Inspect a Bundle](inspect-a-bundle.md) | Bundle kind, family, runtime identity, and section inventory. |
-| Execute a task | [Run Inference](run-inference.md) | The correct CLI command and typed result for the bundle. |
-| Change runtime behavior | [Configure Runtime Behavior](configure-runtime.md) | A validated config file or `--set` override at the right lifecycle layer. |
-| Establish evidence | [Validate & Benchmark](validate-benchmark.md) | Reproducible parity, quality, or performance evidence. |
-
-## Task lookup
+| Create an artifact | [Build a Bundle](build-a-bundle.md) | A format-1 `.bundle` built by exactly one family. |
+| Diagnose an artifact | [Inspect a Bundle](inspect-a-bundle.md) | Family, task, backend, and section inventory. |
+| Execute a task | [Run Inference](run-inference.md) | Correct Task command and typed JSON/media output. |
+| Expose a text bundle | [Serve Text Generation](serve-text-generation.md) | A bounded local HTTP endpoint for one bundle. |
+| Place a setting correctly | [Configure Runtime Behavior](configure-runtime.md) | Build, load, or request input at its typed boundary. |
+| Establish evidence | [Validate & Benchmark](validate-benchmark.md) | Reproducible correctness or performance evidence. |
 
 | Workload | Guide | Common command |
 | --- | --- | --- |
-| Decoder text, encoder NLP, embedding, reranking | [Text Generation](text-generation.md) | `run`, `encode`, `embed`, `rerank` |
-| Vision-language, ASR, TTS, speech-to-speech | [Multimodal & Speech](multimodal-speech.md) | `run --image`, `transcribe`, `generate-audio`, `speak` |
-| Diffusion, classification, segmentation, monocular geometry | [Image & Video Generation](image-video-generation.md) | `generate-video`, `classify`, `segment`, `segment-prompted`, `geometry` |
-| Forecasting and neural operators | [Time-Series](time-series.md) | `solve` |
+| Decoder text, encoding, embedding, reranking | [Text Generation](text-generation.md) | `run`, `encode`, `embed`, `rerank` |
+| Vision-language, ASR, TTS, speech sessions | [Multimodal & Speech](multimodal-speech.md) | `run --image`, `transcribe*`, `generate-audio`, `speak`, `speech-session` |
+| Diffusion and perception | [Image & Video](image-video-generation.md) | `generate-image`, `generate-video`, `classify`, `segment`, `geometry` |
+| Forecasting and neural operators | [Time-Series](time-series.md) | `forecast`, `solve` |
 
-The supported-model inventory is separate from these instructions. Confirm an
-exact checkpoint/configuration in [Models & Recipes](../models-recipes/overview.md)
-before treating a generic command as a support claim.
-
-{/* Collaborative review anchor: batch 2. */}
+Use [Tutorials](../learning-path.md) for progressive learning and
+[Reference](../api/overview.md) for exact API lookup.

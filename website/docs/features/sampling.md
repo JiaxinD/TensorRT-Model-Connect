@@ -47,7 +47,8 @@ to disabled top-p behavior.
 
 ### CLI
 ```bash
-$TRTMC run bundle.bundle --prompt "Once upon a time" \
+$TRTMC run bundle.bundle --runtime-root /opt/trtmc/lib \
+  --prompt "Once upon a time" \
   --temperature 0.7 --top-p 0.9 --min-p 0.05 --top-k 50 \
   --repetition-penalty 1.05 --seed 42
 ```
@@ -66,7 +67,8 @@ and then top-p/min-p inside those candidates.
 
 ## Testing
 
-Unit tests: `tests/tools/test_sampling_contract_plugin.py`
+Unit tests live with each implementing family, for example
+`families/qwen/tests/cpp/test_qwen_sampler.cpp`.
 - `test_top_p_nucleus_restricts_candidates` -- with logits {5,3,1,0.5,0.1}
   and top_p=0.7, verifies only token 0 (the nucleus) is ever sampled
 - `test_top_p_disabled_allows_full_topk` -- top_p=1.0 allows all candidates
@@ -76,7 +78,7 @@ Unit tests: `tests/tools/test_sampling_contract_plugin.py`
 - edge-case tests cover `top_k=0`, `top_p=0`, invalid/clamped values, and seeded
   `reset()` reproducibility
 
-E2E test: `tests/e2e/models/qwen/manifests/qwen3-0.6b-topp.json` (`trace_id: IT-E2E-TOPP-001`)
+E2E test: `families/qwen/tests/manifests/qwen3-0.6b-topp.json` (`trace_id: IT-E2E-TOPP-001`)
 -- runs Qwen3-0.6B with temperature=0.7/top_p=0.9/top_k=50/seed=42 under
 the `sampling_top_p` invariant contract. The contract verifies that the runtime
 CLI forwards the requested sampling flags, produces non-empty sampled text, and
@@ -85,7 +87,7 @@ compare sampled text to a greedy external reference, because stochastic decoding
 is not expected to match greedy Hugging Face output token-for-token.
 
 The E2E test covers the user-visible sampling contract, not device placement.
-The CPU/host-side implementation constraint is covered by the sampler interface
-and unit tests.
+Host-side implementation details are family-owned and covered by the owning
+sampler tests.
 
 {/* Collaborative review anchor: batch 2. */}

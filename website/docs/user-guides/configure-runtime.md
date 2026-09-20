@@ -1,36 +1,33 @@
 ---
 title: Configure Runtime Behavior
-description: Put a setting at build, bundle, load, or request time without crossing ownership boundaries.
+description: Put a setting at build, load, or request time without crossing ownership boundaries.
 ---
 
 First identify when the setting takes effect:
 
-| Lifecycle | Examples | Rebuild required? |
+| Lifecycle | Examples | Rebuild? |
 | --- | --- | --- |
-| Build | Precision, quantization, engine shapes, topology | Yes |
-| Bundle default | Packaged model/runtime defaults | Yes, unless edited by supported tooling |
-| Load | Backend/model DSO search, runtime cache, CUDA-graph policy, registered config | No |
-| Request | Prompt, sampling, diffusion steps, language, input media | No |
+| Build | Precision, engine bounds, topology, quantization, dynamic-KV graph | Yes |
+| Family bundle state | Tokenizer, preprocessing weights, engine layout, private runtime JSON | Yes |
+| Load | Runtime root, runtime-sized KV capacity, TensorRT-RTX cache/CUDA graphs, BYOK binding | No |
+| Request | Prompt, sampling, language, media, denoising steps, seed | No |
 
-Registered configuration uses a JSON file or repeatable overrides:
+The current API has no generic `--config` / `--set` registry. Build values are
+typed `BuildRequest` fields; runtime values are loader inputs or typed Task
+configs. Family-only state remains in family sections and implementation code.
 
 ```bash
 trtmc run model.bundle \
-  --config runtime.json \
-  --set runtime.disable_cuda_graph=true \
-  --prompt "Hello"
+  --runtime-root /opt/trtmc/lib \
+  --kv-cache-size 4GiB \
+  --prompt "Hello" \
+  --temperature 0
 ```
 
-The native CLI validates explicit fields against registered schemas. Unknown
-namespaces, fields, invalid types, and out-of-range values fail. An optimized
-implementation can accept or reject the same public `LoadOptions` according to
-its exact provider contract; it does not automatically inherit native config
-semantics.
+Only compatible family bundles accept runtime-sized KV cache. Likewise,
+`--runtime-cache` and `--cuda-graphs` are valid only for a `trt_rtx` bundle.
+Unsupported values fail; they are not silently ignored.
 
-Use [Configuration Reference](../features/config-and-backends.md) for the live
-schema catalog and backend/cache behavior. Use
-[Quantization](../features/quantization.md) and
-[Multi-Device Execution](../features/multi-device.md) for their model-owned
-build contracts.
-
-{/* Collaborative review anchor: batch 2. */}
+See [Configuration and Backends](../features/config-and-backends.md),
+[Quantization](../features/quantization.md), and
+[Multi-Device Execution](../features/multi-device.md).

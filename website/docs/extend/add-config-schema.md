@@ -1,106 +1,111 @@
 ---
-title: Add a Config Schema
+title: Family-owned Runtime Configuration
 ---
 
-Use config schemas for feature knobs that need build-time or runtime
-configuration. The public surface stays:
+A Task defines required inputs, outputs, and the execution lifecycle. A family
+implements that Task and declares its optional runtime parameters in a field
+table. The semantic Task SDK transports these parameters through the C API;
+it does not require a shared registry entry for every parameter name.
 
-## Why use schemas
-
-```bash
-./build/trtmc run model.bundle \
-  --prompt "Hello from the configured runtime" \
-  --config profile.json \
-  --set runtime.prefer_gpu_greedy=true
-```
-
-A schema lets new features use this generic surface instead of adding another
-bespoke flag. `--set` is repeatable, and it overrides the same field from
-`--config` for that invocation.
+Build inputs still use the existing Python `BuildRequest`. Families that have
+not migrated to the semantic SDK keep their existing execution path until
+their own migration.
 
 ## Choose the owner
 
-| Kind | Python source | C++ source | Registration |
-| --- | --- | --- | --- |
-| Shared platform/runtime feature | `python/tensorrt_model_connect/runtime_config/schemas/<namespace>.py` | `include/trtmc/config/schemas/<namespace>.h` and `src/runtime/config/schemas/<namespace>.cpp` | `cmake/trtmc_config_schemas.cmake` |
-| One model family | `python/tensorrt_model_connect/families/<family>/runtime_config_schema.py` | `src/runtime/models/<owner>/config_schema.h` and `.cpp` | `runtime_config_schemas` in `src/runtime/models/<owner>/MODEL.toml` |
+| Need | Owner |
+| --- | --- |
+| Required input such as text, an image, or source frames | The typed Task request; the family implements its meaning. |
+| Native batch or streaming execution | A separate Task interface, not a Config switch. |
+| Optional sampling, limits, or model-specific controls | The family's Config field table and implementation. |
+| Model identity, graph construction, weights, and build dependencies | The family's `support.py`, `model.py`, and dependency declarations. |
+| Model-independent loading or resource control | The existing loader or control API. |
 
-Do not put a single-model namespace in the shared schema directories. The
-Python loader discovers family sidecars without importing every family plugin;
-CMake builds a model-owned C++ schema into the same DSO as its consumer.
+## Declare and bind parameters inside the family
 
-## Define the same contract in both languages
-
-Both definitions must use the same:
-
-- namespace and field names;
-- type tags (`bool`, `int64`, `float`, `string`, and other supported registry
-  types);
-- default values;
-- allowed layers;
-- value validation.
-
-Use `audio_bark` as a complete model-owned example:
-
-- `python/tensorrt_model_connect/families/bark/runtime_config_schema.py`
-- `src/runtime/models/bark/config_schema.h`
-- `src/runtime/models/bark/config_schema.cpp`
-- `src/runtime/models/bark/MODEL.toml`
-
-Its runtime manifest declares:
-
-```toml
-runtime_config_schemas = [
-  "config_schema.cpp|register_audio_bark_schema",
-]
-```
-
-The C++ source uses
-`REGISTER_CONFIG_SCHEMA_FACTORY_WITH_MANIFEST(...)`; CMake generates the call
-inside the Bark model DSO. The Python sidecar registers its `SCHEMA` at module
-load.
-
-## Consume resolved values
-
-Build-time code receives values from the Python `ConfigBundle`. A migrated C++
-model plugin reads typed values from `ctx.runtime_config`:
+Reuse `ConfigField` from `trtmc/internal/config.h`. Supported values are int64,
+double, bool, string, and homogeneous lists of int64, double, or strings.
 
 ```cpp
-if (ctx.runtime_config != nullptr) {
-    const bool greedy =
-        ctx.runtime_config->get<bool>("audio_bark", "greedy");
-    // Pass greedy into the model-owned pipeline configuration.
+static const trtmc::internal::ConfigField sampling[] = {
+    {"temperature", trtmc::internal::ConfigKind::F64,
+     trtmc::internal::ConfigValue{1.0}, "Sampling temperature"},
+    {"max_new_tokens", trtmc::internal::ConfigKind::I64,
+     std::nullopt, "Default derived from the available context"},
+};
+
+// Inside the family's IModel implementation:
+std::vector<trtmc::internal::TaskInstance> task_bindings() override {
+    return {trtmc::internal::bind<trtmc::internal::ITextContinuation>(
+        *this, sampling)};
 }
 ```
 
-Handle the nullable pointer. It is non-null after successful runtime config
-resolution.
+The field storage is static or model-owned, not a temporary vector returned
+while constructing a binding. The Core snapshots the declared metadata during
+load; the family must continue to use the same immutable field definitions.
+The binding helper records the adjusted Task-interface address, not a copy of
+the model or a global registration.
 
-## Error behavior
+## Resolve defaults and validate behavior
 
-- Python `trtmc build` rejects malformed `--set`, unknown namespaces/fields,
-  invalid types, and invalid values, and exits nonzero.
-- The C++ CLI resolves explicit `--config`/`--set` input before dispatch and
-  also exits nonzero when that validation fails.
-- Direct `PipelineFactory` callers currently get best-effort behavior: a
-  runtime-config resolution exception prints
-  `[trtmc.config] Failed to resolve runtime config`, returns a null config to
-  the plugin, and continues with that plugin's local fallback behavior.
+The Core rejects unknown keys, duplicate keys, and incorrect value types before
+calling the family. The family checks ranges, parameter combinations, and
+input-dependent limits before changing execution state.
 
-Successful resolution writes `<bundle>.effective_config.json` beside the
-bundle. Failed factory resolution does not write a new file. Check stderr and
-the freshly written effective-config artifact when proving an override took
-effect.
+```cpp
+auto temperature = trtmc::internal::config_get<double>(
+    config, sampling, "temperature").value();
+auto requested = trtmc::internal::config_get<std::int64_t>(
+    config, sampling, "max_new_tokens");
+auto limit = requested ? *requested : context_dependent_default(request);
+validate_generation_settings(request, temperature, limit); // family-owned
+```
 
-## Validation checklist
+An absent fixed default means the family decides from its input or context, or
+rejects the request if it cannot choose a meaningful value. Explicit
+`0`, `false`, empty strings, and empty lists are not absence.
+`config_provided(config, name)` checks whether the caller supplied a value.
+The Core does not insert defaults into the caller's Config.
 
-1. Add matching Python and C++ schema tests for defaults, layer allowlists,
-   type coercion, validators, and unknown fields.
-2. Add CLI tests for `--config` and repeated `--set`.
-3. Test that the owning builder/plugin consumes the resolved value; registration
-   alone is not feature coverage.
-4. For a model-owned C++ schema, add the source/registrar entry to the runtime
-   `MODEL.toml` and build that model DSO.
-5. Verify the effective-config artifact and the user-visible behavior.
+Strings and lists in internal `ConfigView`, including values returned by
+`config_get`, are borrowed. A stream or session must copy or parse everything
+it retains before the start/create call returns.
 
-{/* Collaborative review anchor: batch 2. */}
+For a field declared as `F64List`, keep the returned optional in a local before
+iterating. For example, copying into a family-owned `std::vector<double>`:
+
+```cpp
+if (const auto steps = trtmc::internal::config_get<trtmc::Span<const double>>(
+        config, fields, "sampling_steps")) {
+    owned_steps.clear();
+    for (const double value : *steps)
+        owned_steps.push_back(value);
+}
+```
+
+In C++17, dereferencing a temporary optional directly in a range-for expression
+does not keep its contained Span alive. Naming it keeps the descriptor alive;
+copying the elements is still necessary if they must outlive the Config payload.
+
+## Call through the existing SDK and CLI
+
+```cpp
+auto text = model.task<trtmc::TextContinuation>();
+auto fields = text.config_fields();
+auto result = text.run({"Hello"}, {{"temperature", 0.8}});
+```
+
+The CLI uses the same discovered field metadata to parse `--set name=value`.
+A parameter does not need a new dedicated CLI flag. Programs using the C API
+pass the existing typed name/value entries; the family chooses which names it
+accepts.
+
+Adding an optional key using an existing value type changes the owning family
+and its tests, not the shared Task, C ABI, or wrapper. Adding a genuinely new
+Task or value type is a shared-contract change and must be implemented and
+tested at that boundary first. Do not silently ignore unsupported parameters
+or retry another family or execution path.
+
+The [config-registry status document](../context/config-registry-status.md)
+records the retired registry; it is not the semantic SDK configuration design.

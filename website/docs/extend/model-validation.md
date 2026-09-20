@@ -2,167 +2,166 @@
 title: Validate a Model Contribution
 ---
 
-Use this workflow after following
-[Add a Model Family](add-model-family.md). It separates repository consistency,
-focused tests, real inference, and qualification evidence so that a passing
-lower-level check is not mistaken for model proof.
+Use this workflow after [Add a Model Family](add-model-family.md), or after
+changing an existing family's build, runtime, dependency, or oracle.
 
 ## Identify the ownership unit
 
-A native model contribution connects three model-owned roots:
+A family contribution is one vertical slice:
 
 ```text
-python/tensorrt_model_connect/families/<builder-family>/MODEL.toml
-src/runtime/models/<runtime-owner>/MODEL.toml
-tests/e2e/models/<e2e-family>/MODEL.toml
+families/<family>/
+  support.py
+  model.py
+  requirements.txt              # optional
+  runtime/CMakeLists.txt
+  runtime/*.cpp
+  tests/test_*.py
+  tests/manifests/*.json
+  tests/thresholds/*.json       # optional numeric overrides
 ```
 
-Each descriptor `id` must match its own directory. The three physical names
-normally match, but the Python plugin and E2E manifest select the runtime owner
-through the exact family-owned `runtime_strategy`. Do not substitute a generic
-task name such as `text_generation_causal`; `task_strategy` selects the reusable
-runner/comparator contract, while `runtime_strategy` selects a concrete native
-model DSO.
+Record the family, exact model ID and immutable revision, task, testcase,
+precision, quantization, tensor/context parallel sizes, shape bounds, required
+assets/dependencies, native targets, GPU count, and oracle before testing.
 
-Before testing, record:
-
-- builder family, runtime owner, and E2E family;
-- Hugging Face model ID and immutable revision;
-- native runtime strategy and task strategy;
-- literal manifest name and testcase;
-- precision, quantization, tensor-parallel, and shape settings; and
-- required checkpoint, runtime libraries, device count, and GPU capacity.
-
-An exact delegated optimized-runtime implementation has an additional
-family-owned `IMPLEMENTATION.toml`, exact profile, semantic-source digest,
-embedded implementation DSO, and Source-side adapter/runtime-contract tests.
-Its implementation/profile identity replaces native strategy dispatch for
-that bundle. Target-hardware qualification is a separate external evidence
-layer; the public Source tree does not publish the former qualification
-descriptor or runner.
-
-## 1. Validate repository ownership
-
-Run the descriptor and impact-map checks:
+## 1. Validate ownership and impact
 
 ```bash
-PYTHONPATH=python:. python3 tools/model_ci.py validate
-PYTHONPATH=python:. python3 tools/test_impact.py --validate
+python3 -m tools.model_ci validate
+python3 tools/test_impact.py --validate
+python3 tools/test_impact.py --base github/main --head HEAD
 ```
 
-For a branch based on the repository's `github/main` remote, inspect the exact
-model impact:
+The impact report should select the owning family. Production source must not
+depend on a sibling family, and adding a normal family must not modify a
+central registry or source list.
+
+## 2. Run source and unit contracts
 
 ```bash
-git fetch github main
-PYTHONPATH=python:. python3 tools/model_ci.py impact \
-  --base github/main \
-  --head HEAD
-PYTHONPATH=python:. python3 tools/test_impact.py \
-  --base github/main \
-  --head HEAD
+python3 -m pytest core/builder/tests tools/tests -q
+python3 -m pytest families/<family>/tests -m 'not gpu and not trt and not e2e' -q
 ```
 
-If the canonical GitHub repository is named `origin` in your clone, use
-`origin/main` consistently instead.
-
-The runtime strategy matrix is a useful diagnostic:
+Build and run the exact family-owned native targets when present:
 
 ```bash
-PYTHONPATH=python:. python3 tools/check_runtime_strategy_matrix.py
+cmake -S . -B build -DTRTMC_BUILD_TESTS=ON
+cmake --build build --target trtmc_model_<family>
+ctest --test-dir build --output-on-failure
 ```
 
-At GitHub `main` commit
-`e6b798cdb145c38caf1ede8eda7f5ce83f894138`, this diagnostic has known
-repository-wide gaps for `diffusion_sana_wm` and five speech/omni runner
-entries. Do not claim the command is green on that snapshot. A model change
-must not add a new gap; report the pre-existing baseline separately from any
-new output.
+Passing shared architecture tests does not replace family-specific proof.
 
-## 2. Run focused contract tests
-
-These tests cover descriptor shape, runtime-strategy consistency behavior, and
-model ownership:
+## 3. Build and inspect a representative bundle
 
 ```bash
-PYTHONPATH=python:. python3 -m pytest \
-  tests/builder/test_manifest_validation.py \
-  tests/tools/test_runtime_strategy_matrix_checker.py \
-  tests/tools/test_model_plugin_encapsulation_static.py -q
+python -m tensorrt_model_connect build Qwen/Qwen3-0.6B \
+  --precision fp16 \
+  --output /tmp/qwen3-0.6b.bundle
+trtmc inspect /tmp/qwen3-0.6b.bundle
 ```
 
-Then run the owning family's builder, C++, tool, and model-local tests affected
-by the change. Prefer the exact tests selected by the impact report. Passing a
-shared static test is not a substitute for testing the model-owned code.
+Verify the exact `family`, `task`, `backend`, and required family-owned
+sections. Inspection proves container construction, not inference parity.
 
-## 3. Build and inspect one bundle
+## 4. Run the declared family E2E
 
-Build a representative checkpoint with the intended user options, then inspect
-the result. This concrete example matches the current Qwen L0 manifest; adapt
-the literal model, revision, and bundle name to the contribution under review:
+Family `test_e2e.py` files accept an explicit selection and require the native
+binary/runtime root through the environment:
 
 ```bash
-trtmc build Qwen/Qwen3-0.6B \
-  -o /tmp/qwen3-0.6b-native-l0.bundle
-trtmc inspect /tmp/qwen3-0.6b-native-l0.bundle
+TRTMC_BINARY="$PWD/build/apps/cli/trtmc" \
+TRTMC_RUNTIME_ROOT="$PWD/build/install/lib" \
+python3 -m pytest families/qwen/tests/test_e2e.py \
+  --e2e-testcase qwen3-0.6b-fp16 \
+  -q -x
 ```
 
-For a native bundle, verify the exact `runtime_strategy`, precision, engine
-sections, and required model/backend DSOs. For an optimized bundle, verify the
-presence of `optimized_runtime.json`, implementation metadata, the
-integrity-bound artifact tree, and the embedded implementation DSO.
+The selected test downloads or opens its declared checkpoint, builds through
+the public Python API, loads exactly the owning family DSO, invokes the public
+Task API, and applies its own oracle. Tensor-parallel cases additionally need
+the declared GPU count and `mpirun`.
 
-For a qualified contribution, pin and record an immutable model revision even
-when an older smoke manifest does not yet carry one. A successful compile or
-inspection proves artifact construction, not inference parity.
+Confirm that the manifest has a meaningful task/testcase, exact inputs,
+premerge selection where intended, and thresholds that reject adversarial or
+known-wrong outputs. Never weaken a criterion to pass CI.
 
-## 4. Run the declared E2E case
+## 5. Save and read correctness evidence
 
-Run the literal family and manifest declared by the E2E descriptor:
+Set an artifact directory when running a selected family E2E to retain the
+inputs, native and reference outputs, original assertion expressions and
+evaluated values, stage timings, and reproduction commands:
 
 ```bash
-PYTHONPATH=python:. python3 -m pytest \
-  tests/e2e/models/qwen \
-  --e2e-model qwen3-0.6b-native-l0 \
-  --engine-dir /path/to/engines \
-  --trtmc-binary ./build/trtmc \
-  --model-plugin-dir ./build/models \
-  -v
+TRTMC_E2E_ARTIFACT_DIR=/tmp/trtmc-e2e \
+TRTMC_BINARY="$PWD/build/apps/cli/trtmc" \
+TRTMC_RUNTIME_ROOT="$PWD/build/install/lib" \
+python3 -m pytest families/qwen/tests/test_e2e.py \
+  --e2e-testcase qwen3-0.6b-fp16 -q
+
+python3 -m tools.e2e_report /tmp/trtmc-e2e \
+  -o /tmp/trtmc-correctness.html
 ```
 
-Add `--hf-python /path/to/python` only when the selected runtime requires a
-Python helper. This step needs the declared checkpoint, TensorRT/CUDA, suitable
-GPU hardware, the compiled CLI, and all runtime libraries required by the
-bundle path.
+Open the HTML directly in a browser. Each testcase also writes its own
+`evidence/<family>/<case>/evidence.json` and `report.html`; failure paths retain the
+observations produced before the failure. Use a fresh artifact directory for
+each campaign. Reusing a directory replaces earlier evidence for the selected
+family and case, while untouched cases remain from their original runs.
 
-Confirm that:
+The report records existing assertions; it does not replace a family's oracle
+or change thresholds. A contract-only check is identified as such instead of
+claiming an official-reference comparison. Model-specific visualizations remain
+in the owning family's tests. Detailed arrays and original files are retained
+alongside bounded, embedded media; any omitted or truncated evidence is marked.
+The standalone report embeds up to 32 MiB per media file and 256 MiB across the
+report. Full-size raw data stays in the testcase evidence directory.
 
-1. the manifest contains a non-empty `testcases` array;
-2. the testcase names its user contract, CI tier, request, oracle, and
-   thresholds;
-3. the runtime loads the intended implementation rather than a fallback;
-4. comparison artifacts identify the exact model revision and bundle; and
-5. failures remain failures rather than being hidden by a relaxed threshold.
+When a library enforces the comparison itself, record every original check
+without adding duplicate pytest assertions. Use `independent_reference` for
+native/reference output comparisons and `contract` for counts or finiteness:
 
-## 5. Record evidence by level
+```python
+record_evidence("reference_comparison", {
+    "label": "original request",
+    "scope": "independent_reference",
+    "enforced": True,
+    "native": native_path,       # Path to an existing output file
+    "reference": reference_path, # Path to a distinct retained reference file
+    "checks": [{
+        "name": "similarity", "label": "Similarity",
+        "scope": "independent_reference",
+        "actual": metrics["similarity"], "operator": ">=",
+        "expected": thresholds["similarity_min"],
+        "passed": checks["similarity"],
+    }],  # Include all checks from the enforced library comparison.
+})
+```
 
-Keep these evidence levels separate:
+Emit each request's comparison separately, retaining its measured values,
+limits, and original verdicts. Supported operators are `==`, `>=`, and `<=`.
+The report requires complete, consistent check rows and a passed testcase;
+`passed` alone, a reference file alone, or only contract checks cannot establish
+reference verification. Record diagnostics without replacing library failures.
+
+Distinguish a testcase's actual execution result from certification of its
+whole family or pipeline. A family can fail while some of its cases pass.
+Also distinguish correctness from the latency and throughput measurements in
+`trtmc-bench` reports. Compare the same checkpoint, inputs, seed or initial
+latents, precision, and runtime configuration before interpreting a difference.
+
+## 6. Report evidence by level
 
 | Level | What it establishes |
 | --- | --- |
-| Implemented | The source and descriptors exist. |
-| Repository-consistent | Ownership, manifest, and impact checks accept the tree. |
-| Unit-tested | Focused builder, C++, or tool behavior passes. |
-| Inference-tested | The exact bundle runs the declared user task on compatible hardware. |
-| Parity-qualified | Retained comparison artifacts satisfy the intended reference contract. |
-| Performance-qualified | Exact-hardware measurements retain inputs, warmups, repetitions, baseline, and raw results. |
+| Repository-consistent | Ownership and impact validators accept the tree. |
+| Unit-tested | Focused builder, runtime, tool, and family contracts pass. |
+| Inference-tested | The exact bundle runs its declared Task on compatible hardware. |
+| Parity-qualified | Retained comparison artifacts pass the intended official-reference contract. |
+| Performance-qualified | Exact-hardware results retain inputs, warmups, repetitions, baseline, and raw measurements. |
 
-A completion report should state the exact tested code revision, model
-revision, commands, hardware, bundle, comparison artifacts, performance
-artifacts when claimed, known baseline failures, and unverified paths.
-
-For branch, pull-request, and one-shot `run-internal-ci` handling, follow
-[Contributing](contributing.md). CI success does not widen the evidence boundary
-beyond the jobs and models that actually ran.
-
-{/* Collaborative review anchor: batch 2. */}
+State exactly which revision, checkpoint, hardware, commands, and cases ran,
+plus unverified paths. For the full CI path and one-shot protected-CI label,
+follow [Contributing](contributing.md).

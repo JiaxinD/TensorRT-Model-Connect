@@ -16,7 +16,7 @@ Use the smallest test that can actually prove the claim:
 Start repository validation with ownership checks:
 
 ```bash
-python3 tools/model_ci.py validate
+python3 -m tools.model_ci validate
 ```
 
 Then run the exact E2E manifest or focused test named by the model change. A

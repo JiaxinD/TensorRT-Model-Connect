@@ -1,69 +1,69 @@
 <!-- Generated from the adjacent pinned DOT source by website/scripts/render-diagrams.mjs. -->
-<svg width="950" height="537" role="img" aria-labelledby="trtmc-extension-decision-svg-title trtmc-extension-decision-svg-description" preserveAspectRatio="xMidYMid meet"
- viewBox="0.00 0.00 950.00 537.00" xmlns="http://www.w3.org/2000/svg">
+<svg width="949" height="537" role="img" aria-labelledby="trtmc-extension-decision-svg-title trtmc-extension-decision-svg-description" preserveAspectRatio="xMidYMid meet"
+ viewBox="0.00 0.00 949.00 537.00" xmlns="http://www.w3.org/2000/svg">
 <title id="trtmc-extension-decision-svg-title">TensorRT-Model-Connect extension ownership paths</title>
 <desc id="trtmc-extension-decision-svg-description">Extension work chooses among native model support, exact-qualified optimized support, and a shared public contract; each path owns different source units and evidence while runtime dependencies remain on the host.</desc>
 <g id="graph0" class="graph" transform="scale(1 1) rotate(0) translate(25.2 511.56)">
-<polygon fill="#fbfcfe" stroke="none" points="-25.2,25.2 -25.2,-511.56 924.32,-511.56 924.32,25.2 -25.2,25.2"/>
-<text xml:space="preserve" text-anchor="start" x="201.22" y="-456.36" font-family="Arial" font-weight="bold" font-size="30.00" fill="#111827">Choose the owning extension path</text>
-<text xml:space="preserve" text-anchor="start" x="124.96" y="-438.06" font-family="Arial" font-size="17.00" fill="#111827">Model support has two artifact contracts; shared API changes are a separate decision.</text>
+<polygon fill="#fbfcfe" stroke="none" points="-25.2,25.2 -25.2,-511.56 923.32,-511.56 923.32,25.2 -25.2,25.2"/>
+<text xml:space="preserve" text-anchor="start" x="200.72" y="-456.36" font-family="Arial" font-weight="bold" font-size="30.00" fill="#111827">Choose the owning extension path</text>
+<text xml:space="preserve" text-anchor="start" x="124.46" y="-438.06" font-family="Arial" font-size="17.00" fill="#111827">Model support has two artifact contracts; shared API changes are a separate decision.</text>
 <!-- start -->
 <g id="node1" class="node">
 <title>start</title>
-<path fill="#eff6ff" stroke="#2563eb" stroke-width="2.2" d="M612.06,-431.36C612.06,-431.36 319.11,-431.36 319.11,-431.36 313.11,-431.36 307.11,-425.36 307.11,-419.36 307.11,-419.36 307.11,-384.32 307.11,-384.32 307.11,-378.32 313.11,-372.32 319.11,-372.32 319.11,-372.32 612.06,-372.32 612.06,-372.32 618.06,-372.32 624.06,-378.32 624.06,-384.32 624.06,-384.32 624.06,-419.36 624.06,-419.36 624.06,-425.36 618.06,-431.36 612.06,-431.36"/>
-<text xml:space="preserve" text-anchor="start" x="346.68" y="-402.84" font-family="Arial" font-weight="bold" font-size="20.00" fill="#111827">What are you extending?</text>
-<text xml:space="preserve" text-anchor="start" x="321.51" y="-386.44" font-family="Arial" font-size="16.00" fill="#111827">Choose exactly one ownership path first.</text>
+<path fill="#eff6ff" stroke="#2563eb" stroke-width="2.2" d="M611.06,-431.36C611.06,-431.36 318.11,-431.36 318.11,-431.36 312.11,-431.36 306.11,-425.36 306.11,-419.36 306.11,-419.36 306.11,-384.32 306.11,-384.32 306.11,-378.32 312.11,-372.32 318.11,-372.32 318.11,-372.32 611.06,-372.32 611.06,-372.32 617.06,-372.32 623.06,-378.32 623.06,-384.32 623.06,-384.32 623.06,-419.36 623.06,-419.36 623.06,-425.36 617.06,-431.36 611.06,-431.36"/>
+<text xml:space="preserve" text-anchor="start" x="345.68" y="-402.84" font-family="Arial" font-weight="bold" font-size="20.00" fill="#111827">What are you extending?</text>
+<text xml:space="preserve" text-anchor="start" x="320.51" y="-386.44" font-family="Arial" font-size="16.00" fill="#111827">Choose exactly one ownership path first.</text>
 </g>
 <!-- native -->
 <g id="node2" class="node">
 <title>native</title>
-<path fill="#ecfccb" stroke="#4d7c0f" stroke-width="2.2" d="M291.8,-311.12C291.8,-311.12 63.37,-311.12 63.37,-311.12 57.37,-311.12 51.37,-305.12 51.37,-299.12 51.37,-299.12 51.37,-216.08 51.37,-216.08 51.37,-210.08 57.37,-204.08 63.37,-204.08 63.37,-204.08 291.8,-204.08 291.8,-204.08 297.8,-204.08 303.8,-210.08 303.8,-216.08 303.8,-216.08 303.8,-299.12 303.8,-299.12 303.8,-305.12 297.8,-311.12 291.8,-311.12"/>
-<text xml:space="preserve" text-anchor="start" x="65.77" y="-282.6" font-family="Arial" font-weight="bold" font-size="20.00" fill="#111827">Native model support</text>
-<text xml:space="preserve" text-anchor="start" x="65.77" y="-266.2" font-family="Arial" font-size="16.00" fill="#111827">• Python family + MODEL.toml</text>
-<text xml:space="preserve" text-anchor="start" x="65.77" y="-250.2" font-family="Arial" font-size="16.00" fill="#111827">• unique runtime_strategy</text>
-<text xml:space="preserve" text-anchor="start" x="65.77" y="-234.2" font-family="Arial" font-size="16.00" fill="#111827">• model and backend DSOs</text>
-<text xml:space="preserve" text-anchor="start" x="95.76" y="-218.2" font-family="Arial" font-size="16.00" fill="#111827">• native E2E evidence</text>
+<path fill="#ecfccb" stroke="#4d7c0f" stroke-width="2.2" d="M290.92,-311.12C290.92,-311.12 64.25,-311.12 64.25,-311.12 58.25,-311.12 52.25,-305.12 52.25,-299.12 52.25,-299.12 52.25,-216.08 52.25,-216.08 52.25,-210.08 58.25,-204.08 64.25,-204.08 64.25,-204.08 290.92,-204.08 290.92,-204.08 296.92,-204.08 302.92,-210.08 302.92,-216.08 302.92,-216.08 302.92,-299.12 302.92,-299.12 302.92,-305.12 296.92,-311.12 290.92,-311.12"/>
+<text xml:space="preserve" text-anchor="start" x="66.65" y="-282.6" font-family="Arial" font-weight="bold" font-size="20.00" fill="#111827">Native model support</text>
+<text xml:space="preserve" text-anchor="start" x="66.65" y="-266.2" font-family="Arial" font-size="16.00" fill="#111827">• family support.py + model.py</text>
+<text xml:space="preserve" text-anchor="start" x="66.65" y="-250.2" font-family="Arial" font-size="16.00" fill="#111827">• family&#45;owned task runtime</text>
+<text xml:space="preserve" text-anchor="start" x="66.65" y="-234.2" font-family="Arial" font-size="16.00" fill="#111827">• family and backend DSOs</text>
+<text xml:space="preserve" text-anchor="start" x="69.97" y="-218.2" font-family="Arial" font-size="16.00" fill="#111827">• family&#45;owned E2E evidence</text>
 </g>
 <!-- start&#45;&gt;native -->
 <g id="edge1" class="edge">
 <title>start&#45;&gt;native</title>
-<path fill="none" stroke="#64748b" stroke-width="2.5" d="M405.91,-371.37C374.28,-355.75 334.28,-335.99 296.62,-317.39"/>
-<polygon fill="#64748b" stroke="#64748b" stroke-width="2.5" points="297.88,-314.89 289.47,-313.86 295.4,-319.91 297.88,-314.89"/>
-<text xml:space="preserve" text-anchor="middle" x="390" y="-336.92" font-family="Arial" font-size="16.00" fill="#334155"> native </text>
+<path fill="none" stroke="#64748b" stroke-width="2.5" d="M405.12,-371.37C373.6,-355.75 333.73,-335.99 296.21,-317.39"/>
+<polygon fill="#64748b" stroke="#64748b" stroke-width="2.5" points="297.5,-314.91 289.09,-313.86 295.01,-319.92 297.5,-314.91"/>
+<text xml:space="preserve" text-anchor="middle" x="389.35" y="-336.92" font-family="Arial" font-size="16.00" fill="#334155"> native </text>
 </g>
 <!-- optimized -->
 <g id="node3" class="node">
 <title>optimized</title>
-<path fill="#fffbeb" stroke="#b45309" stroke-width="2.2" d="M590.71,-311.12C590.71,-311.12 340.45,-311.12 340.45,-311.12 334.45,-311.12 328.45,-305.12 328.45,-299.12 328.45,-299.12 328.45,-216.08 328.45,-216.08 328.45,-210.08 334.45,-204.08 340.45,-204.08 340.45,-204.08 590.71,-204.08 590.71,-204.08 596.71,-204.08 602.71,-210.08 602.71,-216.08 602.71,-216.08 602.71,-299.12 602.71,-299.12 602.71,-305.12 596.71,-311.12 590.71,-311.12"/>
-<text xml:space="preserve" text-anchor="start" x="342.85" y="-282.6" font-family="Arial" font-weight="bold" font-size="20.00" fill="#111827">Exact&#45;qualified optimized</text>
-<text xml:space="preserve" text-anchor="start" x="342.85" y="-266.2" font-family="Arial" font-size="16.00" fill="#111827">• family implementation/profile</text>
-<text xml:space="preserve" text-anchor="start" x="342.85" y="-250.2" font-family="Arial" font-size="16.00" fill="#111827">• isolated adapter + qualification</text>
-<text xml:space="preserve" text-anchor="start" x="342.85" y="-234.2" font-family="Arial" font-size="16.00" fill="#111827">• optimized_runtime.json</text>
-<text xml:space="preserve" text-anchor="start" x="342.85" y="-218.2" font-family="Arial" font-size="16.00" fill="#111827">• embedded implementation DSO</text>
+<path fill="#fffbeb" stroke="#b45309" stroke-width="2.2" d="M589.71,-311.12C589.71,-311.12 339.45,-311.12 339.45,-311.12 333.45,-311.12 327.45,-305.12 327.45,-299.12 327.45,-299.12 327.45,-216.08 327.45,-216.08 327.45,-210.08 333.45,-204.08 339.45,-204.08 339.45,-204.08 589.71,-204.08 589.71,-204.08 595.71,-204.08 601.71,-210.08 601.71,-216.08 601.71,-216.08 601.71,-299.12 601.71,-299.12 601.71,-305.12 595.71,-311.12 589.71,-311.12"/>
+<text xml:space="preserve" text-anchor="start" x="341.85" y="-282.6" font-family="Arial" font-weight="bold" font-size="20.00" fill="#111827">Exact&#45;qualified optimized</text>
+<text xml:space="preserve" text-anchor="start" x="341.85" y="-266.2" font-family="Arial" font-size="16.00" fill="#111827">• family implementation/profile</text>
+<text xml:space="preserve" text-anchor="start" x="341.85" y="-250.2" font-family="Arial" font-size="16.00" fill="#111827">• isolated adapter + qualification</text>
+<text xml:space="preserve" text-anchor="start" x="341.85" y="-234.2" font-family="Arial" font-size="16.00" fill="#111827">• optimized_runtime.json</text>
+<text xml:space="preserve" text-anchor="start" x="341.85" y="-218.2" font-family="Arial" font-size="16.00" fill="#111827">• embedded implementation DSO</text>
 </g>
 <!-- start&#45;&gt;optimized -->
 <g id="edge2" class="edge">
 <title>start&#45;&gt;optimized</title>
-<path fill="none" stroke="#64748b" stroke-width="2.5" d="M465.58,-371.37C465.58,-357.48 465.58,-340.33 465.58,-323.63"/>
-<polygon fill="#64748b" stroke="#64748b" stroke-width="2.5" points="468.38,-323.97 465.58,-315.97 462.78,-323.97 468.38,-323.97"/>
-<text xml:space="preserve" text-anchor="middle" x="504.27" y="-336.92" font-family="Arial" font-size="16.00" fill="#334155"> optimized </text>
+<path fill="none" stroke="#64748b" stroke-width="2.5" d="M464.58,-371.37C464.58,-357.48 464.58,-340.33 464.58,-323.63"/>
+<polygon fill="#64748b" stroke="#64748b" stroke-width="2.5" points="467.38,-323.97 464.58,-315.97 461.78,-323.97 467.38,-323.97"/>
+<text xml:space="preserve" text-anchor="middle" x="503.27" y="-336.92" font-family="Arial" font-size="16.00" fill="#334155"> optimized </text>
 </g>
 <!-- shared -->
 <g id="node4" class="node">
 <title>shared</title>
-<path fill="#f5f3ff" stroke="#7c3aed" stroke-width="2.2" d="M887.12,-311.12C887.12,-311.12 640.05,-311.12 640.05,-311.12 634.05,-311.12 628.05,-305.12 628.05,-299.12 628.05,-299.12 628.05,-216.08 628.05,-216.08 628.05,-210.08 634.05,-204.08 640.05,-204.08 640.05,-204.08 887.12,-204.08 887.12,-204.08 893.12,-204.08 899.12,-210.08 899.12,-216.08 899.12,-216.08 899.12,-299.12 899.12,-299.12 899.12,-305.12 893.12,-311.12 887.12,-311.12"/>
-<text xml:space="preserve" text-anchor="start" x="642.45" y="-282.6" font-family="Arial" font-weight="bold" font-size="20.00" fill="#111827">Shared or public contract</text>
-<text xml:space="preserve" text-anchor="start" x="642.45" y="-266.2" font-family="Arial" font-size="16.00" fill="#111827">• IPipeline, config, or CLI</text>
-<text xml:space="preserve" text-anchor="start" x="642.45" y="-250.2" font-family="Arial" font-size="16.00" fill="#111827">• user&#45;visible contract change</text>
-<text xml:space="preserve" text-anchor="start" x="642.45" y="-234.2" font-family="Arial" font-size="16.00" fill="#111827">• test both affected paths</text>
-<text xml:space="preserve" text-anchor="start" x="660.4" y="-218.2" font-family="Arial" font-size="16.00" fill="#111827">• update API documentation</text>
+<path fill="#f5f3ff" stroke="#7c3aed" stroke-width="2.2" d="M886.12,-311.12C886.12,-311.12 639.05,-311.12 639.05,-311.12 633.05,-311.12 627.05,-305.12 627.05,-299.12 627.05,-299.12 627.05,-216.08 627.05,-216.08 627.05,-210.08 633.05,-204.08 639.05,-204.08 639.05,-204.08 886.12,-204.08 886.12,-204.08 892.12,-204.08 898.12,-210.08 898.12,-216.08 898.12,-216.08 898.12,-299.12 898.12,-299.12 898.12,-305.12 892.12,-311.12 886.12,-311.12"/>
+<text xml:space="preserve" text-anchor="start" x="641.45" y="-282.6" font-family="Arial" font-weight="bold" font-size="20.00" fill="#111827">Shared or public contract</text>
+<text xml:space="preserve" text-anchor="start" x="641.45" y="-266.2" font-family="Arial" font-size="16.00" fill="#111827">• IPipeline, config, or CLI</text>
+<text xml:space="preserve" text-anchor="start" x="641.45" y="-250.2" font-family="Arial" font-size="16.00" fill="#111827">• user&#45;visible contract change</text>
+<text xml:space="preserve" text-anchor="start" x="641.45" y="-234.2" font-family="Arial" font-size="16.00" fill="#111827">• test both affected paths</text>
+<text xml:space="preserve" text-anchor="start" x="659.4" y="-218.2" font-family="Arial" font-size="16.00" fill="#111827">• update API documentation</text>
 </g>
 <!-- start&#45;&gt;shared -->
 <g id="edge3" class="edge">
 <title>start&#45;&gt;shared</title>
-<path fill="none" stroke="#64748b" stroke-width="2.5" d="M527.33,-371.37C560.19,-355.68 601.8,-335.82 640.91,-317.15"/>
-<polygon fill="#64748b" stroke="#64748b" stroke-width="2.5" points="641.9,-319.78 647.91,-313.81 639.49,-314.73 641.9,-319.78"/>
-<text xml:space="preserve" text-anchor="middle" x="657.68" y="-336.92" font-family="Arial" font-size="16.00" fill="#334155"> public/shared </text>
+<path fill="none" stroke="#64748b" stroke-width="2.5" d="M526.33,-371.37C559.19,-355.68 600.8,-335.82 639.91,-317.15"/>
+<polygon fill="#64748b" stroke="#64748b" stroke-width="2.5" points="640.9,-319.78 646.91,-313.81 638.49,-314.73 640.9,-319.78"/>
+<text xml:space="preserve" text-anchor="middle" x="656.68" y="-336.92" font-family="Arial" font-size="16.00" fill="#334155"> public/shared </text>
 </g>
 <!-- native_runtime -->
 <g id="node5" class="node">
@@ -88,8 +88,8 @@
 <!-- optimized&#45;&gt;optimized_runtime -->
 <g id="edge5" class="edge">
 <title>optimized&#45;&gt;optimized_runtime</title>
-<path fill="none" stroke="#64748b" stroke-width="2.5" d="M490.95,-203.28C495.85,-192.97 500.91,-182.34 505.56,-172.55"/>
-<polygon fill="#64748b" stroke="#64748b" stroke-width="2.5" points="508.09,-173.76 508.99,-165.33 503.03,-171.36 508.09,-173.76"/>
+<path fill="none" stroke="#64748b" stroke-width="2.5" d="M490.38,-203.28C495.42,-192.86 500.62,-182.11 505.39,-172.23"/>
+<polygon fill="#64748b" stroke="#64748b" stroke-width="2.5" points="507.77,-173.74 508.74,-165.32 502.73,-171.31 507.77,-173.74"/>
 </g>
 <!-- host -->
 <g id="node7" class="node">
@@ -101,9 +101,9 @@
 <!-- shared&#45;&gt;host -->
 <g id="edge6" class="edge">
 <title>shared&#45;&gt;host</title>
-<path fill="none" stroke="#64748b" stroke-width="2.5" stroke-dasharray="5,2" d="M735.36,-203.41C711.64,-158.7 681.58,-102.04 681.58,-102.04 681.58,-102.04 640.13,-83.15 599.82,-64.79"/>
+<path fill="none" stroke="#64748b" stroke-width="2.5" stroke-dasharray="5,2" d="M734.71,-203.41C711.28,-158.7 681.58,-102.04 681.58,-102.04 681.58,-102.04 640.13,-83.15 599.82,-64.79"/>
 <polygon fill="#64748b" stroke="#64748b" stroke-width="2.5" points="601.23,-62.36 592.79,-61.59 598.91,-67.46 601.23,-62.36"/>
-<text xml:space="preserve" text-anchor="middle" x="789.7" y="-126.76" font-family="Arial" font-size="16.00" fill="#334155"> prove affected paths </text>
+<text xml:space="preserve" text-anchor="middle" x="789.32" y="-126.76" font-family="Arial" font-size="16.00" fill="#334155"> prove affected paths </text>
 </g>
 <!-- native_runtime&#45;&gt;host -->
 <g id="edge7" class="edge">

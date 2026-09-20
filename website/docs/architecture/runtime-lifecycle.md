@@ -1,169 +1,73 @@
 ---
 title: Runtime Lifecycle
-description: How PipelineFactory loads a bundle, constructs a pipeline, and serves requests.
 ---
 
-import Diagram from '@site/src/components/Diagram';
+The native runtime performs one exact load and returns an abstract Task:
 
-The C++ runtime begins at `trtmc::load()` or
-`PipelineFactory::from_bundle()`. It reads the bundle header before choosing one
-of two mutually exclusive construction paths.
+```cpp
+auto task = trtmc::load_task("model.bundle", "/opt/trtmc/lib");
+```
 
-## Authoritative pipeline-load sequences
+## Load sequence
 
-<Diagram
-  src="/img/diagrams/architecture/native-bundle-load.svg"
-  alt="Native bundle load sequence reading runtime strategy metadata, loading the owning model and compatible backend DSOs, and creating a concrete pipeline"
-  caption="After the header does not claim an optimized descriptor, the native route materializes config.json, resolves strategy ownership and plugin registration, then loads a compatible backend and constructs PipelineContext."
-  sequence
-/>
+1. `BundleReader` validates the format-1 header and all section bounds.
+2. The loader validates the `family` and `backend` names as safe DSO tokens.
+3. It loads `libtrtmc_backend_<backend>.so` from the explicit runtime root.
+4. It loads `libtrtmc_model_<family>.so` from that same root.
+5. It resolves the single `trtmc_create_family` factory and passes a
+   `FamilyContext` containing the read-only bundle reader and abstract backend.
+6. It verifies that the returned `ITask::task()` matches the bundle header.
 
-<Diagram
-  src="/img/diagrams/architecture/optimized-bundle-load.svg"
-  alt="Optimized bundle load sequence validating the descriptor and embedded artifact tree, loading the exact implementation DSO, and creating a public pipeline"
-  caption="Descriptor presence claims the optimized route; identity, integrity, DSO, or private-factory failures are terminal and never fall back to native."
-  sequence
-/>
+There is no current-directory search, environment fallback, registry lookup,
+strategy switch, sibling-family probe, or load retry.
 
-The order matters. On the native path, strategy ownership and plugin lookup are
-established before backend loading. On the optimized path, descriptor presence
-claims the path before native materialization; an invalid descriptor, artifact,
-DSO, or factory is terminal.
+## Ownership after transfer
 
-## Native dispatch
+The selected family implements one or more interfaces in
+`core/runtime/include/trtmc/task.h`. It owns preprocessing, postprocessing,
+request orchestration, tokenizer/sampler state, family sections, and engine
+binding. It creates engines only through the abstract `IBackend`/`IEngine`
+contract. The backend owns TensorRT runtime objects, not model policy.
 
-For a native bundle:
+`FamilyContext.reader` is read-only. A factory may consume its sections before
+returning or copy the lightweight `BundleReader` into the pipeline for deferred
+reads; it must not retain a reference to the temporary factory context.
 
-1. `config.json` supplies `runtime_strategy` and strategy-specific metadata.
-2. Generated manifest data maps that strategy to one runtime owner and library.
-3. `PipelinePluginLoader` loads the owning
-   `libtrtmc_model_<owner>.so`.
-4. The exported registrar publishes the declared `IPipelinePlugin` into
-   `PipelineRegistry`.
-5. `BackendLoader` resolves a compatible backend DSO and TensorRT ABI.
-6. The factory resolves run-time configuration and creates `PipelineContext`.
-7. The model plugin validates sections, creates modules and helpers, and
-   returns a concrete `IPipeline`.
+## Multichannel streaming audio
 
-Legacy native strategy aliases may be normalized through generated
-compatibility metadata. An unknown strategy, unavailable model DSO, undeclared
-registration, incompatible backend, or invalid required section fails
-explicitly.
+Families can opt into `IMultichannelStreamingAudioGeneration` without changing
+the existing mono `IStreamingAudioGeneration` interface. A family implementing
+both is dispatched through the multichannel capability by the CLI.
 
-Native runtime manifests live at
-`src/runtime/models/<owner>/MODEL.toml`. CMake uses them to generate the
-strategy-to-library index and model registrar entry points; contributors do not
-append a family switch inside `PipelineFactory`.
+Each `AudioChunkView` borrows interleaved float PCM (`L0, R0, L1, R1, ...` for
+stereo), with an explicit channel count and sample rate. `num_samples` counts
+scalar samples, not frames per channel. Chunks must be nonempty whole frames;
+the sample rate and channel count stay constant within a call. Callbacks are
+synchronous, ordered, and non-concurrent. Their pointers are valid only during
+the callback. Normal return ends the stream and reports the sum of delivered
+scalar samples; callback exceptions must stop generation and propagate.
 
-## Optimized dispatch
+`trtmc generate-audio ... --stream true --output audio.raw` writes interleaved
+float32 samples and reports `format`, `sample_rate`, `num_channels`, and
+`num_samples` in its success JSON. Playback duration is
+`num_samples / num_channels / sample_rate`. This is raw PCM, not a WAV file.
+Invalid chunks, format changes, inconsistent totals, and file-write errors fail
+the command without success JSON. A failed stream can leave a partial output
+file; callers must not treat file existence alone as success.
 
-For an optimized bundle, `OptimizedRuntimeHost`:
+This capability does not add HTTP transport, encoded formats, or streaming
+support to models that do not already produce incremental audio. Existing mono
+families remain unchanged and report `num_channels: 1`.
 
-1. reads and validates `optimized_runtime.json`;
-2. reads bounded private implementation metadata;
-3. verifies and materializes the embedded artifact tree;
-4. opens the exact embedded `libtrtmc_impl_*.so`;
-5. validates the versioned private factory, implementation identity, and
-   toolchain/runtime contract; and
-6. asks that factory to create the public `IPipeline`.
+## Optional load settings
 
-The generic host treats model-owned implementation metadata as opaque. It does
-not substitute an installed same-name DSO, use the native strategy index, or
-select a native backend DSO.
+Runtime-sized KV capacity is passed directly to compatible families.
+TensorRT-RTX runtime cache and CUDA graph settings are accepted only when the
+bundle selects `trt_rtx`; the standard backend rejects them. TVM-FFI BYOK is an
+explicit extension DSO and three-part binding, not a general plugin registry.
 
-Embedding the implementation library does not make the bundle hermetic. The
-host still supplies compatible driver, CUDA, TensorRT, loader, and system
-libraries.
+## Teardown
 
-## Plugin construction
-
-`IPipelinePlugin::create()` receives a `PipelineContext` containing:
-
-- the materialized bundle and parsed base config;
-- original config text and bundle path;
-- the selected `IBackend`;
-- Python helper and runtime-cache paths;
-- CUDA-graph and KV-cache load options;
-- a resolved `ConfigBundle` when resolution succeeded.
-
-The plugin reads its required sections, creates one or more `ITrtModule`
-instances through `IBackend`, constructs model-owned state and preprocessing
-helpers, then returns a concrete pipeline.
-
-## Request sequence: text generation
-
-Text generation illustrates the common request boundary without implying that
-every modality uses a decoder.
-
-<Diagram
-  src="/img/diagrams/architecture/text-generation-request.svg"
-  alt="Text-generation request sequence covering tokenization, one prefill, sampling, semantic stop checks before the next engine step, token-budget loop control, KV-cache updates, and TextResult construction"
-  caption="Prefill produces the first logits. EOS or an answer-stop skips the next engine step; max_new_tokens is the loop boundary, so the last budgeted non-stop token still runs through the engine and advances the cache before the loop exits."
-  sequence
-/>
-
-Other pipelines implement only the public task methods they support:
-
-| Task shape | Typical runtime work |
-| --- | --- |
-| Vision-language | Image preprocessing, vision execution, embedding injection, text generation |
-| Speech recognition | Audio preprocessing, encoder/decoder or RNNT state, token decoding |
-| Diffusion/image/video | Prompt encoding, denoising schedule, component engines, media decode |
-| Encoder/embedding/reranking | Tokenization, encoder execution, pooling or scoring |
-| Segmentation/detection | Image preprocessing, model execution, geometric postprocessing |
-| Time series/operator | Numeric tensor preparation, engine execution, structured output |
-
-The method's presence in `IPipeline` is not model-support evidence. Default
-implementations throw when a concrete pipeline does not support an operation.
-
-## Configuration behavior
-
-For native construction, the factory currently supplies:
-
-- schema defaults;
-- an optional `defaults` object from materialized `config.json` as bundle
-  defaults; and
-- `LoadOptions.config_path` plus `LoadOptions.set_tokens` as the session
-  request.
-
-Although `ConfigBundle` defines build-time and platform-profile layer types,
-this factory path does not inject separate contributions for them.
-
-Direct `PipelineFactory` calls diagnose a configuration-resolution exception
-and continue with a null run-time config so the model plugin can apply its local
-fallback. The CLI performs explicit config validation before dispatch and exits
-nonzero on invalid input. Library applications that require fail-fast config
-semantics must enforce that policy around the current factory behavior.
-
-## Concurrency and pipeline pools
-
-One `IPipeline` owns mutable execution context, CUDA stream, cache/state, and
-adapter bindings. The public interface does not promise concurrent calls on one
-instance.
-
-For native bundles, `PipelineFactory::from_bundle_pool()` creates independent
-lanes and returns a `PipelinePool`. A move-only lease gives one request
-exclusive access to one lane. Optimized bundles are rejected by this native
-pool API because the delegated implementation owns batching and scheduling.
-
-## Shape and engine constraints
-
-Run-time inputs must fit the optimization profiles baked into the selected
-artifact. Do not assume that two models in the same modality share engine
-sections, batch limits, prefill/decode layout, KV capacity, or dynamic-shape
-support. Use bundle inspection plus the owning build/profile contract.
-
-## Runtime source map
-
-| Concern | Source |
-| --- | --- |
-| Public task API | `include/trtmc/pipeline.h` |
-| Pipeline factory | `src/runtime/registry/pipeline_factory.cpp` |
-| Native DSO loader | `src/runtime/registry/pipeline_plugin_loader.cpp` |
-| Native registry | `src/runtime/registry/pipeline_registry.cpp` |
-| Optimized host | `src/runtime/providers/optimized_runtime_host.cpp` |
-| Plugin context | `include/trtmc/runtime/pipeline_plugin.h` |
-| Backend abstraction | `include/trtmc/runtime/trt_backend.h`, `include/trtmc/runtime/trt_module.h` |
-| Model pipelines | `src/runtime/models/<owner>/` |
-
-{/* Collaborative review anchor: batch 2. */}
+Applications destroy Task objects before the loaded family and backend
+libraries leave scope. Families release their streams, buffers, communicators,
+engines, and family-local state; the loader owns the dynamic-library handles.
