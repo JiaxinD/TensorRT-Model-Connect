@@ -45,3 +45,10 @@ From the repository root:
 ```sh
 PYTHONPATH=core/builder:. python -m pytest families/parakeet_tdt/tests -q
 ```
+
+The selected E2E builds `test_parakeet_tdt_sdk_cpp` in the configured
+`TRTMC_NATIVE_BUILD_DIR` before invoking the public SDK consumer. Community GPU
+builds the family DSO and registered CTests, so an unregistered consumer cannot
+be assumed to exist. `test_gpu_ci.py` checks the selected pinned checkpoint and
+uses a real minimal CMake build to verify the consumer helper. Checkpoint
+identity tests live in `test_support.py` for public CPU discovery.

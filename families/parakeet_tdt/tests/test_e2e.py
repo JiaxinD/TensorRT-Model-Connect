@@ -150,12 +150,22 @@ def _reference(model_dir, audio, rate, channels, max_new_tokens):
     return {"text": decoded[0] if isinstance(decoded, (list, tuple)) else str(decoded)}
 
 
+def _sdk_consumer_binary() -> Path:
+    native = _required_path(os.environ.get("TRTMC_NATIVE_BUILD_DIR"), "TRTMC_NATIVE_BUILD_DIR")
+    subprocess.run(
+        ["cmake", "--build", str(native), "--parallel", "8", "--target", "test_parakeet_tdt_sdk_cpp"],
+        check=True,
+        timeout=600,
+    )
+    consumer = native / "test_parakeet_tdt_sdk_cpp"
+    assert consumer.is_file(), "native build did not produce the family-owned SDK consumer"
+    return consumer
+
+
 def test_official_checkpoint_e2e(case_name, tmp_path):
     _, manifest, case = CASES[case_name]
     runtime = _required_path(os.environ.get("TRTMC_RUNTIME_ROOT"), "TRTMC_RUNTIME_ROOT")
-    native = _required_path(os.environ.get("TRTMC_NATIVE_BUILD_DIR"), "TRTMC_NATIVE_BUILD_DIR")
-    consumer = native / "test_parakeet_tdt_sdk_cpp"
-    assert consumer.is_file(), "build the family-owned SDK consumer"
+    consumer = _sdk_consumer_binary()
     assert (runtime / "libtrtmc_model_parakeet_tdt.so").is_file()
     assert (runtime / "libtrtmc_backend_trt.so").is_file()
     import torch
