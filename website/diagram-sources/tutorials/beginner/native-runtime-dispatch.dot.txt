@@ -30,7 +30,7 @@ digraph NativeRuntimeDispatch {
   edge [color="#64748b", penwidth="2.2", arrowsize="0.8", fontname="Arial", fontsize="16", fontcolor="#334155"];
 
   load [fillcolor="#f5f3ff", color="#7c3aed", label=<<B>trtmc::load</B><BR/><FONT POINT-SIZE="16">PipelineFactory reads bundle metadata</FONT>>];
-  strategy [fillcolor="#fffbeb", color="#b45309", label=<<B>runtime_strategy</B><BR/><FONT POINT-SIZE="16">example: qwen_decoder_kv_cache</FONT>>];
+  strategy [fillcolor="#fffbeb", color="#b45309", label=<<B>Bundle task identity</B><BR/><FONT POINT-SIZE="16">example: qwen + generate + trt</FONT>>];
   index [fillcolor="#eff6ff", color="#2563eb", label=<<B>Generated plugin index</B><BR/><FONT POINT-SIZE="16">PipelinePluginLoader resolves owner</FONT>>];
   dso [fillcolor="#eff6ff", color="#2563eb", label=<<B>Model DSO</B><BR/><FONT POINT-SIZE="16">libtrtmc_model_qwen.so</FONT>>];
   registry [fillcolor="#ecfeff", color="#0e7490", label=<<B>PipelineRegistry</B><BR/><FONT POINT-SIZE="16">find registered IPipelinePlugin</FONT>>];

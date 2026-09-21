@@ -7,7 +7,8 @@ Date: 2026-04-16
 Commands, temporary artifact paths, benchmark numbers, and hypotheses on this
 page are evidence from the dated TriAttention bring-up. They are not current
 setup instructions and are not automatically revalidated on later revisions.
-Use current Qwen descriptors, tests, and CLI help for the live contract.
+PR #1093 removed this runtime path. Use the current Qwen family, tests, and CLI
+help for the live contract.
 
 :::
 

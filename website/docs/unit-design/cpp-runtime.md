@@ -10,6 +10,6 @@ import {Redirect} from '@docusaurus/router';
 
 <Redirect to="/architecture/runtime-lifecycle" />
 
-Native and optimized load paths are documented in Runtime Lifecycle.
+Family-task loading is documented in Runtime Lifecycle.
 
 {/* Collaborative review anchor: batch 2. */}

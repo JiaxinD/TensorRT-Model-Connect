@@ -2,148 +2,116 @@
 title: Model Recipes
 ---
 
-This page is an optional task index after the
-[Quick Start](quick-start.md), not a second Getting Started path. Each model
-can add its own dependencies, memory requirements, and qualified hardware
-boundary.
+This page is a task index after the [Quick Start](quick-start.md). Exact
+checkpoint, task, precision, topology, dependency, and validation support is
+generated on [Models & Recipes](../models-recipes/overview.md) from the current
+family-owned manifests.
 
-If the command itself is unavailable, return to
-[System Requirements](environment-and-repro.md) and
-[Installation](installation.md). If you have not yet built and run the Qwen
-first-inference bundle, complete the Quick Start before choosing a recipe here.
+Set the runtime root once for the examples:
+
+```bash
+export TRTMC_RUNTIME_ROOT=/opt/trtmc/lib
+```
 
 ## Text generation
 
-The canonical build-inspect-run sequence lives only in the
-[Quick Start](quick-start.md). Continue with the
-[Text Generation tutorial](../tutorials/beginner/text-generation.md) to learn
-sampling, deterministic decoding, chat templates, and other request-time
-controls without repeating setup.
+```bash
+python -m tensorrt_model_connect build Qwen/Qwen3-0.6B \
+  --precision fp16 \
+  --max-sequence-length 256 \
+  --output /tmp/qwen.bundle
+
+trtmc run /tmp/qwen.bundle \
+  --runtime-root "$TRTMC_RUNTIME_ROOT" \
+  --prompt "What is the capital of France? Answer in one word." \
+  --max-new-tokens 10 \
+  --temperature 0 \
+  --use-chat-template true \
+  --enable-thinking false
+```
+
+Continue with [Text Generation](../tutorials/beginner/text-generation.md) for
+sampling and request framing.
 
 ## Vision-language generation
 
 ```bash
-trtmc build Qwen/Qwen2.5-VL-3B-Instruct \
-  -o /tmp/qwen25vl.bundle \
+python -m tensorrt_model_connect build Qwen/Qwen2.5-VL-3B-Instruct \
   --precision fp16 \
-  --max-cache-length 384
+  --max-sequence-length 384 \
+  --output /tmp/qwen25vl.bundle
 
 trtmc run /tmp/qwen25vl.bundle \
+  --runtime-root "$TRTMC_RUNTIME_ROOT" \
   --prompt "Describe this image." \
-  --image tests/assets/test_image.jpg \
+  --image families/qwen_vl/tests/data/test_img.jpeg \
   --max-new-tokens 48
 ```
 
-These length controls have different scopes. `--max-cache-length 384` fixes
-the bundle's KV-cache capacity. The Qwen-VL build field
-`qwen_vl_decoder.max_prefill_length` defaults to `0`, which uses that cache
-length as the prefill-profile maximum; an explicit value is clamped to the
-cache length, and `opt_prefill_length` is clamped to the resulting prefill
-maximum. `--max-new-tokens 48` is only the request-time decode-loop limit: it
-does not resize either build-time profile. After the Qwen-VL cache fills, its
-runtime advances with a sliding cache, so earlier context rows are evicted.
-See [Configuration and Backends](../features/config-and-backends.md) for the
-exact family fields and defaults.
-
-This Qwen-VL bundle routes through the model-owned
-`runtime_strategy="qwen_vl_vision_language"`. Other vision-language families
-use their own strategy keys and DSOs even when they implement the same public
-`generate(prompt, image, ...)` task shape.
+The Qwen-VL family owns image preprocessing, cache policy, Task implementation,
+and validation. Similar Task shape does not imply shared runtime code.
 
 ## Speech and audio
 
 ```bash
-trtmc build openai/whisper-large-v3-turbo -o /tmp/whisper.bundle --precision fp16
+python -m tensorrt_model_connect build openai/whisper-large-v3-turbo \
+  --precision fp16 \
+  --output /tmp/whisper.bundle
 
 trtmc transcribe /tmp/whisper.bundle \
-  --audio tests/e2e/models/whisper/data/Recording.wav \
-  --max-new-tokens 224
+  --runtime-root "$TRTMC_RUNTIME_ROOT" \
+  --input families/whisper/tests/data/Recording.wav \
+  --max-output-tokens 224
 ```
 
 ```bash
-trtmc build nvidia/magpie_tts_multilingual_357m -o /tmp/magpie.bundle --precision fp16
+python -m tensorrt_model_connect build nvidia/magpie_tts_multilingual_357m \
+  --precision fp16 \
+  --output /tmp/magpie.bundle
 
 trtmc generate-audio /tmp/magpie.bundle \
+  --runtime-root "$TRTMC_RUNTIME_ROOT" \
   --prompt "A clear short test sentence." \
   --output /tmp/magpie.wav
 ```
 
-Streaming paths are exposed through `trtmc transcribe --stream` for cache-aware ASR and `trtmc serve-audio` for prompt-driven audio serving. Add `--hf-python /opt/venv/bin/python` only for runtime strategies that still need helper Python code.
+Use `transcribe-batch` for repeated `--input`, `transcribe-streaming` for the
+streaming Task, and `speech-session` for full-duplex family contracts. Each is
+a distinct public Task interface.
 
-## Diffusion and video
+## Image, video, and perception
 
-Follow [Diffusion, Vision, and Time-Series Pipelines](../tutorials/intermediate/diffusion-and-time-series.md)
-for FLUX, PixArt-Sigma, Wan, and the hardware-qualified Jetson Thor Wan2.2
-recipe. Those workloads are intentionally kept out of the first-inference
-path: they have larger artifacts, longer builds, and model-specific profiles.
-
-## Segmentation
-
-This example follows the real
-`tests/e2e/models/segformer/manifests/segformer-b0-ade.json` manifest from model
-ID through inference:
+Use `generate-image`, `generate-image-batch`, or `generate-video` according to
+the family task. Perception commands include `classify`, `extract-features`,
+`disparity`, `geometry`, `segment`, `segment-prompted`, and `video-segment`.
 
 ```bash
-trtmc build nvidia/segformer-b0-finetuned-ade-512-512 \
-  -o /tmp/segformer-b0-ade.bundle \
-  --precision fp16
+python -m tensorrt_model_connect build nvidia/segformer-b0-finetuned-ade-512-512 \
+  --precision fp16 \
+  --output /tmp/segformer.bundle
 
-trtmc segment /tmp/segformer-b0-ade.bundle \
-  --image tests/e2e/models/segformer/data/test_img.jpeg \
-  --output /tmp/segformer-b0-ade-mask.png
+trtmc segment /tmp/segformer.bundle \
+  --runtime-root "$TRTMC_RUNTIME_ROOT" \
+  --image families/segformer/tests/data/test_img.jpeg
 ```
 
-The JPEG is a checked-in E2E input, so the path works when the command is run
-from the repository root. `segment` loads it as normalized HWC pixels and
-writes a grayscale PNG whose pixel values are class indices. Success means the
-command exits with status 0, the output PNG exists, and the CLI prints a line
-like:
+The command prints task JSON. Inspect the exact family manifest before
+assuming a checkpoint, task, shape, or output format is supported.
 
-```text
-Segmentation saved: /tmp/segformer-b0-ade-mask.png (<width>x<height>)
-```
+## Time-series forecasting
 
-Building the bundle needs the supported TensorRT/CUDA GPU environment and
-network access or a cached copy of the NVIDIA checkpoint. Running it needs a
-compatible NVIDIA GPU and the `segformer_segmentation` runtime DSO.
-
-The public API and CLI reserve `IPipeline::detect()` and `trtmc detect`, but
-the current model manifests and E2E catalog do not include an object-detection
-owner. There is therefore no supported detector bundle to run in this guide.
-Treat the command as an API contract for a future model implementation, not as
-current support evidence.
-
-## Chronos-Bolt time-series forecasting
-
-This build-to-solve example follows
-`tests/e2e/models/chronos_bolt/manifests/chronos-bolt-tiny-official.json`:
+Chronos-Bolt uses the `forecast` Task. Its input is a raw float32 file, not a
+comma-separated CLI value:
 
 ```bash
-trtmc build amazon/chronos-bolt-tiny \
-  -o /tmp/chronos-bolt-tiny-official.bundle \
-  --precision fp32
+python -m tensorrt_model_connect build amazon/chronos-bolt-tiny \
+  --precision fp32 \
+  --output /tmp/chronos.bundle
 
-trtmc solve /tmp/chronos-bolt-tiny-official.bundle \
-  --branch-input "100.1,100.15,100.18,100.22,100.21,100.27,100.31,100.35,100.37,100.4,100.44,100.5"
+trtmc forecast /tmp/chronos.bundle \
+  --runtime-root "$TRTMC_RUNTIME_ROOT" \
+  --input /path/to/history.f32
 ```
 
-The branch input is the manifest's 12-value, ordered univariate history.
-Chronos-Bolt forecasts directly from this context, so its current model
-contract does not take `--trunk-input`. Keep FP32 for the officially qualified
-path; the manifest notes that the FP16 attention path does not satisfy its
-framework-reference accuracy contract.
-
-On its first build, the CLI may materialize the family-owned `chronos` Python
-profile, which pins `chronos-forecasting==2.2.2`. The build therefore needs the
-TensorRT/CUDA GPU environment plus access to the checkpoint and Python
-packages, or populated caches. The resulting bundle runs through the native
-`chronos_bolt_trt` C++/TensorRT strategy and does not invoke that Python profile
-during `solve`.
-
-Success means both commands exit with status 0, the named bundle exists, and
-`solve` prints one line in the form `Output [N]:` followed by `N`
-floating-point forecast values. See
-[Diffusion, Vision, and Time-Series Pipelines](../tutorials/intermediate/diffusion-and-time-series.md)
-for the input/output mental model and dependency boundaries.
-
-{/* Collaborative review anchor: batch 2. */}
+Neural operators use `solve --branch FILE --trunk FILE`. Do not interchange
+the contracts. See [Time-Series](../user-guides/time-series.md).

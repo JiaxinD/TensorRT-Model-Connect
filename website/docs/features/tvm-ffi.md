@@ -1,164 +1,76 @@
 ---
-title: TVM FFI Kernel Bridge
+title: TVM-FFI Kernel Bridge
 ---
 
-Model Connect can replace one selected TensorRT graph region with an
-[Apache TVM FFI](https://tvm.apache.org/ffi/) kernel. The TensorRT engine fixes
-the region boundary; the external kernel DSO is chosen when a new pipeline
-loads.
+TVM-FFI BYOK is an explicit one-way extension. A family builder or application
+uses the public BYOK API; the core never depends on an example or model-specific
+kernel.
 
-There are two ways to select the region:
+## Build the bridge
 
-| Path | Who selects the TensorRT nodes | When to use it |
-| --- | --- | --- |
-| Family Recipe | The model family records an exact, versioned region and instance while building the graph. | Use this first when a matching Recipe exists. |
-| Manual selection | The user inspects the raw graph and supplies exact node IDs. | Use this when no Recipe matches the required boundary. |
-
-Both paths call the same region validator, graph replacement, TensorRT plugin,
-and load-time binding implementation. A Recipe is only a shortcut for a known
-manual selection.
-
-## Path 1: use a family Recipe
-
-List the Recipes recorded for a build:
+The project dependency supplies TVM-FFI. Configure with BYOK enabled and build
+the bridge plus example test:
 
 ```bash
-trtmc graph inspect \
-  --snapshot graph.json \
-  --engine-role decode \
-  MODEL [build options...]
-
-trtmc graph recipes graph.json
+python -m pip install -e .
+cmake -S . -B build -DTRTMC_ENABLE_BYOK=ON -DTRTMC_BUILD_EXAMPLES=ON
+cmake --build build --target trtmc_byok_identity_copy test_byok_tvm_ffi
+ctest --test-dir build -R '^byok_tvm_ffi$' --output-on-failure
 ```
 
-Build one exact Recipe instance:
+## Add a kernel to a family graph
+
+The selected family can add a named TVM-FFI TensorRT plugin layer directly:
+
+```python
+from tensorrt_model_connect.byok import add_kernel
+
+output, = add_kernel(
+    network,
+    plugin_library="/absolute/path/libtrtmc_byok_tvm_ffi.so",
+    kernel_name="my_family.residual_add",
+    inputs=[hidden, residual],
+    output_specs=[{"dims": [256, 768], "dtype": "float16"}],
+)
+```
+
+The family reconnects the returned tensor into its graph before serialization.
+The kernel name accepts only letters, digits, `_`, `.`, `@`, and `-`; inputs,
+outputs, workspace, shapes, dtypes, and optional scalar/null arguments are
+explicit.
+
+## Application graph transform
+
+An application can pass `BuildRequest.graph_transform`, an in-place
+`transform(network, engine_index)` callback. The callback inspects the live
+TensorRT network, adds the BYOK layer, and reconnects all external consumers.
+It runs immediately before each engine is serialized. Transform failures abort
+the build; transforms cannot run concurrently in one process.
+
+There is no graph snapshot/recipe/selection CLI, graph IR, node fingerprint,
+ABI hash, compatibility fallback, or runtime graph patch in the current API.
+
+## Bind the runtime function
+
+Load the external function before the bundle Task runs:
 
 ```bash
-trtmc build MODEL [the same build options...] \
-  --recipe RECIPE_ID INSTANCE_ID \
-  -o model-slot.bundle
+trtmc run model.bundle \
+  --runtime-root /opt/trtmc/lib \
+  --byok-library ./residual_add.so \
+  --byok-function run \
+  --byok-name my_family.residual_add \
+  --prompt "Hello"
 ```
 
-The command captures the graph, resolves the Recipe, validates its nodes, and
-applies the ordinary graph patch. It also writes
-`model-slot.selection.json`, which is the boundary and ABI receipt.
+All three BYOK options are required together. The runtime loads
+`libtrtmc_byok_tvm_ffi.so` from the runtime root, then binds the explicit
+external DSO/function/name. The serialized engine contains the plugin layer but
+not the external kernel DSO.
 
-## Path 2: select a region manually
+TVM-FFI does not let Model Connect verify the external function signature or
+library contents. The kernel author must implement the exact ordered tensor,
+workspace, and extra-argument contract used at build time.
 
-Capture and inspect the same graph:
-
-```bash
-trtmc graph inspect \
-  --snapshot graph.json \
-  --engine-role decode \
-  MODEL [build options...]
-
-trtmc graph list graph.json --match '*attention*'
-```
-
-Select exact node IDs copied from that snapshot:
-
-```bash
-trtmc graph select graph.json \
-  --nodes node:120 node:121 node:122 \
-  --binding-id my.attention@1 \
-  --workspace-bytes 0 \
-  --output-shape-like-input 0 \
-  -o attention.selection.json
-```
-
-`--output-shape-like-input` is required only for a dynamic output. Fixed scalar
-or null arguments can be appended in call order with repeatable
-`--extra-arg JSON`.
-
-Build the selected replacement:
-
-```bash
-trtmc build MODEL [the same build options...] \
-  --graph-patch attention.selection.json \
-  -o model-slot.bundle
-```
-
-Selections are tied to the captured graph fingerprint and engine role. Reuse
-the same model revision and graph-producing build options, and recapture after
-either changes.
-
-## Bind a kernel when the pipeline loads
-
-A slot-ready bundle contains `kernel_slots.json` with one binding ID and its
-ABI SHA-256. It does not contain the external kernel DSO.
-
-Create a strict JSON binding manifest beside the DSO:
-
-```json
-{
-  "schema_version": 1,
-  "bindings": [
-    {
-      "id": "my.attention@1",
-      "abi_sha256": "<abi_sha256 from attention.selection.json>",
-      "library": "./attention-kernel.so",
-      "function": "run"
-    }
-  ]
-}
-```
-
-The library path must be relative to the manifest. Load and run:
-
-```bash
-trtmc run model-slot.bundle \
-  --kernel-bindings kernel-bindings.json \
-  --prompt "Hello" \
-  --max-new-tokens 32
-```
-
-The manifest carries the ABI hash only. That hash describes the selected call
-contract; it is not a DSO or library-content hash, and the runtime does not pin
-the DSO bytes. To use another implementation, point a new manifest at another
-DSO with the same binding ID and ABI, then construct a new pipeline from the
-same bundle. A running pipeline is not rebound in place.
-
-This flow uses JSON selections and bindings. There is no kernel YAML
-configuration.
-
-## Kernel ABI
-
-The selection receipt records the ordered tensor boundary, workspace size,
-fixed arguments, output-shape rule, and ABI SHA-256. The hash covers:
-
-- input and output tensor dtypes and declared shapes;
-- workspace size;
-- fixed scalar or null arguments;
-- the dynamic-output shape rule.
-
-The exported TVM-FFI function receives arguments in this order:
-
-1. boundary input DLTensors;
-2. one CUDA `uint8` workspace DLTensor when workspace is nonzero;
-3. boundary output DLTensors;
-4. fixed arguments from the selection.
-
-Matching the ABI hash confirms that the manifest targets the engine's recorded
-contract. TVM FFI does not provide a signature that Model Connect can compare
-with the DSO, so the kernel author must implement the ordered contract exactly.
-
-## Current limits
-
-- Only native TensorRT bundles built with TVM-FFI support are accepted.
-  TensorRT-RTX and optimized-runtime bundles are rejected.
-- Graph-slot builds currently require tensor parallel size 1 and reject
-  quantized or FP8 builds.
-- V1 replaces one connected, convex region with exactly one output in one
-  engine role.
-- A selected region cannot include a network output, shape or host tensors,
-  control-flow or collective layers, or an existing plugin layer.
-- Boundary tensors must be linear, rank 8 or lower, and use BF16, FP16, FP32,
-  or INT32.
-- The selected engine must deserialize while the pipeline loads so the runtime
-  can capture the bound function.
-
-For a complete worked example, see
-[Bring Your Own Kernel with TVM FFI](../tutorials/advanced/bring-your-own-kernel.md).
-
-{/* Collaborative review anchor: batch 2. */}
+For complete examples, see `examples/byok/` and
+[Bring Your Own Kernel](../tutorials/advanced/bring-your-own-kernel.md).

@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Family-owned model and task support for qwen."""
+
+from tensorrt_model_connect.model_support import FamilySupport, ModelMetadata, family_support
+
+
+_generation = family_support(
+    model_types=("qwen", "Qwen2", "qwen2", "qwen3", "qwq"),
+    tasks=("text_generation",),
+    default_task="text_generation",
+)
+
+
+def describe(metadata: ModelMetadata) -> FamilySupport | None:
+    support = _generation(metadata)
+    if support is not None and metadata.model_type == "qwen3" and "modules.json" in metadata.files:
+        return FamilySupport(
+            tasks=("embedding",), default_task="embedding", default_precision="bf16"
+        )
+    return support

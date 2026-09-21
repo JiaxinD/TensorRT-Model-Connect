@@ -1,472 +1,248 @@
 ---
-title: Performance Benchmarking
+title: Benchmarking Reference
 ---
 
-import Diagram from '@site/src/components/Diagram';
+# Benchmarking reference
 
-`trtmc-bench` measures public TRTMC pipeline calls across text, vision-language,
-diffusion, audio, segmentation, classification, image-feature extraction, encoder, reranking,
-speech-transcription, and neural-operator models. The default path is one
-command:
+The benchmark application sits above TRTMC's public build and task APIs. It
+does not register model families or import family implementation code.
+
+## Single-model benchmark
+
+Install the optional benchmark dependencies, then select an installed runtime
+root containing the core runtime, TensorRT backend, and required family DSOs:
 
 ```bash
-trtmc-bench run --model distilgpt2
+python -m pip install -r apps/benchmark/performance/requirements.txt
+
+trtmc-bench list models
+trtmc-bench run \
+  --model distilgpt2 \
+  --runtime-root /opt/trtmc/lib \
+  -o results/distilgpt2
 ```
+
+`trtmc-bench` reads family-owned manifests under
+`families/*/tests/manifests/`. Missing bundles are built through the public
+builder and cached; pass `--no-build` when every selected bundle must already
+exist.
+
+Run a checked-in multi-model specification with:
+
+```bash
+trtmc-bench run apps/benchmark/example.yaml -o results/example
+```
+
+Use `trtmc-bench --help` and subcommand help as the authoritative option list
+for the installed version.
+
+## Timing boundary
+
+Candidate timing measures the public family task call. Bundle construction,
+process startup, task loading, warmup, telemetry, and report generation are
+outside that measurement. Asset loading is also excluded unless a case
+explicitly includes it.
+
+The native worker stops the clock before formatting an observation or
+destroying the previous iteration's result. New receipts explicitly include
+`observation_serialization_included: false`. Earlier worker revisions included
+observation formatting in the measured duration; account for that boundary
+change when comparing historical measurements. No comparison threshold changes
+with this correction.
+
+Generated media is retained automatically for semantic tasks. Each measured
+audio output is an interleaved FLOAT32 WAV; images and ordered video frames use
+the existing CLI PNG encoding. Consumed conditioning images are also retained.
+The JSON observations reference these files relative to the case directory, so
+keep that directory with its report when moving or archiving results. Warmup
+does not write media, and the summary references the final measured result.
+Legal empty audio is explicitly marked empty, without a fabricated waveform.
+
+Speech-dialogue observations retain the consumed input as a FLOAT32 WAV and
+separate WAVs for audio events. `event_audio_artifacts` follows the unchanged
+`events` array: null entries have no audio file. The HTML shows input audio,
+effective system prompt, text/tool events and per-event players with epoch and
+sequence numbers. It does not splice events or epochs into a fabricated timeline.
+
+WAV and PNG serialization is outside the call timer. Streaming TTS must copy
+borrowed callback samples while they are valid; that copy is inside the public
+call and is declared by `streaming_pcm_copy_included: true`. Account for this
+receiving cost when comparing a streaming reference. PNGs are visual previews,
+not a substitute for the family's original floating-point correctness checks.
+Dialogue input buffers remain alive through observation so the retained input
+is the decoded data actually supplied, not a later reread of the source file.
+Their release, like result release, is outside the measured call; the existing
+asset-loading option still controls whether file decoding is timed.
+For older dialogue workers with timed asset loading, decoded-input release was
+inside the timer; account for this boundary change in historical comparisons.
+
+The HTML report displays recorded text, playable audio, and image/frame previews
+next to the input prompt. Image editing also shows the images actually supplied
+to the task. Video frames retain their recorded order and timestamps; no frame
+rate is inferred when a timeline is absent. Missing or unsafe media references
+are shown as unavailable rather than embedded from outside the case directory.
+
+The release suite defaults to three warmups and ten measured iterations. A
+reference within five percent of candidate p50 is considered equivalent.
+Candidate or reference execution failures are operational failures, not slow
+performance results.
 
 ## Release performance matrix
 
-`trtmc-bench` measures one resolved workload. The release performance matrix
-adds a repository-owned comparison layer around it: `tools/perf_matrix.py`
-runs TRTMC through `trtmc-bench`, runs the reference backend declared by each
-suite row in a separate Python process, and checks that both sides used the
-same workload and timing boundary.
-
-The checked-in suite at `benchmarks/performance/release.yaml` currently covers
-108 release-relevant, ready, single-process model-profile comparisons across
-78 families and 79 `(family, operation)` contracts. Short `l0` smoke duplicates
-are excluded by rule; any other omission must appear in `excluded_profiles`
-with a reason. Validate coverage and all machine prerequisites without
-measuring a model:
+The matrix coordinates candidate and reference runs without introducing a
+second model registry:
 
 ```bash
+export TRTMC_PERF_WORKER=/opt/trtmc/bin/trtmc_benchmark_worker
+export TRTMC_PERF_RUNTIME_ROOT=/opt/trtmc/lib
+export TRTMC_PERF_BUNDLE_CACHE=/data/trtmc-bundles
+
 python3 tools/perf_matrix.py check \
-  benchmarks/performance/release.yaml \
-  --environment benchmarks/performance/environments/gb300.yaml
-```
+  apps/benchmark/performance/release.yaml \
+  --environment apps/benchmark/performance/environments/gb300.yaml
 
-The checked-in GB300 environment requires these repository variables to point
-at the installed worker, caches, bundles, and runtime libraries:
+python3 tools/perf_matrix.py prepare \
+  apps/benchmark/performance/release.yaml \
+  --environment apps/benchmark/performance/environments/gb300.yaml \
+  --entry gpt2.generate \
+  --output artifacts/perf/bundle-preparation.json
 
-```text
-TRTMC_PERF_WORKER
-TRTMC_PERF_BUNDLE_CACHE
-TRTMC_PERF_BUNDLE_ROOTS
-TRTMC_PERF_RUNTIME_DIRS
-```
-
-Both `check` and `run` perform the same preflight: suite coverage, expanded
-environment, free storage, required executables, candidate Release-build
-revision, selected `trtmc-bench` testcases, and candidate/reference timing
-contracts. Reference-specific upstream checkout paths and prebuilt Python
-profiles described in `benchmarks/performance/README.md` are additional
-operator prerequisites; dependency installation is outside the measured
-campaign.
-
-Reference precision is resolved from the suite row's explicit
-`baseline.precision`, then the selected testcase's `reference_precision`, then
-the model manifest's top-level `reference_precision`, and finally the resolved
-TRTMC model precision. The chosen value is passed to the reference runner,
-recorded as `resolved_settings.baseline_precision` in `results.json`, and
-checked against the runner result. A mismatch is a contract mismatch and does
-not receive a performance light.
-
-Diffusers media references also reject non-finite numeric pixels before image
-conversion can hide the invalid values. Such output is a reference execution
-failure, not a completed performance comparison.
-
-Run the complete matrix, one exact row, resume an interrupted run, or
-regenerate an existing report with task-level preparation evidence:
-
-```bash
 python3 tools/perf_matrix.py run \
-  benchmarks/performance/release.yaml \
-  --environment benchmarks/performance/environments/gb300.yaml
-python3 tools/perf_matrix.py run \
-  benchmarks/performance/release.yaml \
-  --environment benchmarks/performance/environments/gb300.yaml \
+  apps/benchmark/performance/release.yaml \
+  --environment apps/benchmark/performance/environments/gb300.yaml \
   --entry gpt2.generate
-python3 tools/perf_matrix.py resume artifacts/perf/example-run
-python3 tools/perf_matrix.py report artifacts/perf/example-run \
-  --preparation-receipt artifacts/perf/bundle-preparation.json
 ```
 
-Every new run writes `results.json`, `report.json`, and `report.html` below the
-configured results root. Before timing preflight starts, it also freezes the
-ordered selected-case inventory in `ledger/campaign.json` and creates one
-atomic receipt per case under `ledger/cases/`. `report.json` is rebuilt from
-those receipts after each state transition, so a caller can poll per-model
-pending, running, and terminal progress. Resume marks a leftover running
-case attempt interrupted, preserves comparable and non-retryable receipts,
-and starts a new attempt for unfinished or explicitly retryable White cases.
-The receipt keeps the earlier failed result and its attempt evidence.
-`results.json` remains the compatibility projection with resolved
-configuration, provenance, raw samples, exact leaf commands, timing policies,
-and bundle preparation. `report.html` is only the renderer for `report.json`.
-
-A separately run bundle-preparation step can be attached with the `report`
-command shown above. The receipt must use schema
-`trtmc.perf-bundle-preparation/v1`, scope `test_task`, the run's exact Git
-commit, and the exact model and bundle paths consumed by that campaign.
-Revision mismatches, duplicate records, invalid build times, and unused bundle
-paths are rejected. A matching preparation receipt takes precedence over a
-later cache hit, so a task-level rebuild remains visible as `Built`.
-
-Green, yellow, and red are completed comparison results and therefore return
-zero.
-Configuration errors, command failures, incomplete measurements, and timing or
-output-contract mismatches return nonzero and do not receive a performance
-light.
-
-Controlled Internal CI can run the same matrix and retain the unique run
-directory as a private artifact. A green documentation build, sanitized
-premerge status, or host-only matrix `check` is not target-hardware performance
-evidence: a release claim requires the retained target-hardware run, reference
-result, exact revision, and report.
-
-List the model profiles currently supported by the installed benchmark catalog:
+Preparation is deliberately separate and untimed. Resume or regenerate a
+report from stored observations with:
 
 ```bash
-trtmc-bench list models
+python3 tools/perf_matrix.py resume artifacts/perf/<run-directory>
+python3 tools/perf_matrix.py report artifacts/perf/<run-directory>
 ```
 
-The command lists every profile declared by the canonical `MODEL.toml` files.
-`STATUS=ready` means it can run in the current single-process worker.
-`STATUS=distributed` keeps an MPI/TP profile visible but explains why it cannot
-yet run. Invalid or unknown task contracts are reported explicitly instead of
-silently disappearing from the list.
+The release YAML owns model, testcase, operation, measurement, reference, and
+comparison semantics. Machine-specific paths belong in the environment YAML.
+Reference implementations run in separate processes so their dependencies do
+not enter the candidate worker or shared runtime.
 
-## Install a packaged build
+## Adding coverage
 
-A TRTMC native wheel is the end-user distribution. It contains the Python
-orchestrator, `trtmc-bench` command, native measurement worker, TRTMC runtime
-libraries, model plugins, and the canonical model catalog snapshot:
+- Add a weight or profile to the owning family's test manifest catalog.
+- Add a matrix entry that names the family, model, operation, workload, and
+  reference runner.
+- Add benchmark code only when a genuinely new public task interface needs a
+  task adapter.
 
-```bash
-python -m pip install /path/to/tensorrt_model_connect-*.whl
-trtmc-bench run --model distilgpt2
-```
+Retain raw observations and reports together with the commit, model revision,
+runtime root, target GPU, TensorRT version, warmup count, and iteration count.
+Correctness validation should precede performance comparison.
 
-No separate worker install or CMake build is required. The wheel must match the
-supported Python, CUDA, TensorRT, and machine platform. Source installation is
-the development workflow described below.
+## Semantic Task SDK integration
 
-If no compatible bundle is available, the command invokes the existing
-`trtmc build` implementation with settings from the model manifest and stores
-the bundle in a managed cache. It writes `result.json`, `report.html`, resolved
-inputs, build evidence, all timed observations, worker logs, and optional
-low-frequency GPU telemetry into one new result directory. Bundle building,
-model loading, and warmup are excluded from the reported latency. The timed
-boundary is named `public_pipeline_call_wall` in the machine-readable result.
+Migrated bundles select the C Task SDK before execution; non-migrated bundles
+retain their existing path. A failed C call is never retried through an old
+interface. The worker currently has semantic routes for prompt continuation,
+conditional generation, corrupted-text reconstruction, summarization,
+image/text generation, point, quantile or joint forecasting, and the following
+media, perception and feature workloads. An SDK Task not listed here needs its
+own explicit benchmark inputs; a shared operation name does not imply support.
 
-A successful case keeps a small, user-facing evidence set:
-
-```text
-<result-dir>/
-├── result.json
-├── report.html
-└── 001-<model>-<case>/
-    ├── resolved-case.json
-    ├── observations.jsonl
-    ├── telemetry.json       # only when telemetry is enabled
-    └── worker.log
-```
-
-`result.json` contains the reduced metrics used by reports.
-`resolved-case.json` records the effective request and the source of every
-field. `observations.jsonl` keeps one raw timed observation per line.
-`worker.log` combines worker stdout and stderr. A failed worker additionally
-retains its internal `worker-request.json` and, when produced,
-`worker-result.json` protocol files for diagnosis; successful cases remove
-those redundant intermediates.
-
-## Build from source
-
-In a prepared development environment that already contains the repository's
-Python and TensorRT dependencies, install only the editable Python source. The
-following minimal build creates the measurement worker, TensorRT backend, and
-GPT-2 model plugin used by the first example:
-
-```bash
-python -m pip install --no-deps -e . -C py-only=true
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target \
-  trtmc_benchmark_worker trtmc_backend_trt trtmc_model_gpt2 -j
-```
-
-`--no-deps` prevents pip from replacing the TensorRT stack supplied by the
-development environment. Do not use it in an empty environment: provision the
-supported development container or install the required dependencies first.
-
-The commands above use CMake's default generator, normally Unix Makefiles on
-Linux. Ninja is optional. To use it, install `ninja` and add `-G Ninja` during
-configuration. CMake stores the generator in the build directory, so use a
-fresh directory when changing generators. For example, if `build` was already
-configured for Ninja on a machine without Ninja:
-
-```bash
-cmake -S . -B build-make -DCMAKE_BUILD_TYPE=Release
-cmake --build build-make --target \
-  trtmc_benchmark_worker trtmc_backend_trt trtmc_model_gpt2 -j
-```
-
-The source wrapper discovers workers in `build`, `build-make`, and
-`build-local`, so the first benchmark remains one command:
-
-```bash
-./scripts/trtmc-bench run --model distilgpt2
-```
-
-Replace `trtmc_model_gpt2` when benchmarking a different model family.
-`cmake --build build -j` is the simpler alternative when all model plugins are
-wanted. A packaged native wheel installs `trtmc-bench` on `PATH`; the
-source-tree editable workflow uses the explicit `./scripts/trtmc-bench`
-wrapper shown above. The wheel also carries a build-time snapshot of the
-repository's canonical `MODEL.toml` and E2E manifest files, so model names and
-default cases resolve without a source checkout. The snapshot is copied from
-those files during packaging rather than maintained as a second catalog.
-
-## Bundle resolution and automatic builds
-
-Bundle resolution has one predictable order: an explicit `--bundle`, a match
-below `--bundle-root`, a compatible managed-cache entry, and finally an
-automatic build. The cache key includes the manifest, resolved build settings,
-TensorRT version, machine architecture, and GPU target. Request-only changes
-reuse a bundle; changes that affect engine shape, such as a larger diffusion
-batch, produce a different cache entry.
-
-The default build settings come from the existing model manifest. For example,
-`distilgpt2` resolves to `distilbert/distilgpt2`, FP16, and a 256-token KV
-cache. Build logs, structured build timing, and the resolved command are stored
-next to the cached bundle and referenced from `result.json`. They are marked as
-excluded from performance metrics.
-
-Before building, the benchmark compares the TensorRT ABI declared by the
-runtime backend beside the measurement worker with the Python builder ABI. It
-uses a compatible installed Python binding when available and creates a
-separate cache entry. If no compatible binding exists, it fails before the
-expensive engine build instead of producing a bundle that cannot be loaded.
-
-Use an existing bundle explicitly when required:
-
-```bash
-trtmc-bench run --model distilgpt2 --bundle /engines/distilgpt2.bundle
-```
-
-Use `--no-build` for a strict CI run that must fail when no bundle exists, or
-`--rebuild` to replace the compatible entry in the managed cache. `--dry-run`
-resolves the planned cache path without downloading a model or building an
-engine.
-
-Additional resolver and execution controls are:
-
-| Option | Contract |
+| Operation | Semantic Tasks |
 | --- | --- |
-| `--bundle-cache PATH` | Override the managed bundle-cache root used for compatible automatic builds. |
-| `--manifest-root PATH` | Resolve `MODEL.toml` and E2E benchmark profiles from an alternate catalog root. It applies to both `run` and `list models`. |
-| `--case NAME` | Select a literal named case; repeat to select several. Named cases remain independent and never form a Cartesian product. |
-| `--runtime-dir PATH` | Repeatable directory added to both backend and model-plugin runtime search paths. |
-| `--worker PATH` | Use one explicit `trtmc_benchmark_worker` executable instead of packaged, source-build, or `PATH` discovery. |
-| `--telemetry auto|off` | Enable best-effort low-frequency GPU telemetry or disable it. Sampling surrounds the worker process and is outside the timed public-pipeline calls. |
+| `generate_audio` | `TextToAudio`, `TextToSpeech`, `StreamingTextToSpeech` |
+| `transcribe` | `SpeechTranscription`, `SpeechTranslation`, `StreamingSpeechTranscription` |
+| `speak` | `SpeechToSpeechResponse` |
+| `generate_image` | `TextToImage`, `ImagesTextToImageEdit`, `BatchTextToImage`, `TextToVideo`, `ImageTextActionToVideo` |
+| `classify` | `ImageToClassScores` |
+| `extract_features` | `ImageToTokenFeatures`, `ImageToPooledFeatures`, `ImageToTokenAndPooledFeatures`, `ImageToSpatialFeatures` |
+| `segment` | `ImageToSemanticSegmentation`, `ImagePointsToMasks` center helper |
+| `segment_prompted` | `ImagePointsToMasks`, `ImageTextToInstanceMasks` |
+| `disparity` | `StereoImagesToDisparity` |
+| `encode` | `TextToPooledFeatures`, `TextToTokenFeatures` |
+| `embed` | `TextToEmbedding` |
+| `rerank` | `TextQueryDocumentsToRelevance` |
+| `control` | `ImageStateToActionChunk` |
 
-## Architecture
+For semantic Task manifests, explicitly specified generation controls retain
+their types; omitted controls use the family defaults. A testcase can supply
+additional family-declared keys through its `config` object. Flat and nested
+duplicate keys are errors, not an implicit override mechanism. Model data stays
+in typed request fields, never in Config. A quantile or channel axis is not a
+request batch. Joint forecasts retain both point and quantile outputs from one
+family evaluation.
 
-<Diagram
-  src="/img/diagrams/reference/benchmark-orchestration.svg"
-  alt="Benchmark orchestration from catalog resolution through an existing bundle path or managed build to the Python service and C++ worker"
-  caption="Python resolves one concrete case and bundle path, building a managed-cache entry only when needed, then starts the native worker; explicit bundle paths are not shown as compatibility-verified."
-/>
+Audio SDK inputs retain WAV sample rate and interleaved channels. Duration uses
+frames divided by sample rate; `num_samples`/`output_samples` remain scalar PCM
+counts, with explicit `channels` and `output_frames`. Transcription retains text,
+token IDs and the family's actual segment timestamps. The worker's existing
+`max_new_tokens` spelling maps to the declared `max_output_tokens` Config key for
+one-shot transcription/translation only; streaming ASR keeps `max_new_tokens`.
+`language` is the typed ASR source language or TTS language, and translation has
+a separate optional `target_language`. Absent languages use family defaults.
 
-<Diagram
-  src="/img/diagrams/reference/benchmark-measurement-reporting.svg"
-  alt="Benchmark measurement boundary where native and optimized bundles converge on IPipeline before raw observations, metrics, and reports"
-  caption="Both bundle formats load through trtmc::load and converge on the public IPipeline operation; the worker records raw timing while Python computes task-aware metrics and reports."
-/>
+Streaming ASR measures a fresh stream for every invocation, including creation,
+chunk submission, finalization and release. Its separate `first_partial_ms`
+clock begins after stream creation. Packetization defaults to 160 ms and never
+splits an interleaved frame. Streaming TTS measures the direct synchronous
+callback API, including copies of borrowed PCM. Retained WAV files are written
+after that call, outside its timer; no extra worker or inference is added.
+An explicit `streaming` input must agree with the semantic Task. Failed or stopped
+calls are operational failures, never completed measurements. Native-batch
+audio and dialogue-session benchmarks are not included in these routes.
 
-Python owns configuration, matrix expansion, orchestration, metrics, and
-reporting. The native worker owns the timed loop and calls the same public C++
-pipeline API as an application. It loads the bundle with `trtmc::load`, which
-either follows native `runtime_strategy` dispatch through model and backend
-DSOs or recognizes `optimized_runtime.json` and loads the exact embedded
-implementation path. Both paths return `IPipeline`, so the task operation and
-measurement boundary stay the same. Model family, task semantics, runtime
-implementation, and public operation are separate extension points:
+Image batches make one native batch call with ordered prompts and optional
+`seeds`/`item_configs` arrays. Their lengths must match the request count, and
+shared/item duplicate keys are rejected. Scalar replay uses
+`initial_latents_path`; this does not define a broadcast input for a batch.
+Video metrics count actual clips and all returned frames, including any
+`conditioned_prefix_frames`. Thus `frames_per_s` is returned-frame throughput,
+not newly predicted-frame throughput or an inferred playback FPS. Returned
+timestamps and the conditioned prefix remain explicit in the output.
+A worker-only completion has no produced media and fails this
+single-process benchmark instead of counting as an image or video.
 
-| Change | Benchmark work |
-| --- | --- |
-| New weight/profile in a known family and task | Add the normal manifest and `MODEL.toml.test_manifests` entry; no benchmark code |
-| New native family using a known `task_strategy` | Add its normal runtime model plugin and manifest; no benchmark code |
-| New optimized implementation/profile for a known model and operation | Add the family-owned `IMPLEMENTATION.toml`, exact profile, qualification evidence, and normal E2E/catalog ownership; no benchmark code |
-| New task using an existing public `IPipeline` operation | Add one task adapter that translates its testcase contract |
-| New public pipeline capability | Add an operation metric contract and one native runner, then map task adapters to it |
+Pooled and token features remain different workloads. The joint image feature
+Task returns both hidden and pooled arrays from one call. Classification keeps
+the original score representation, and document-list reranking preserves order;
+the list interface alone is not evidence of native GPU batching. SAM's `segment`
+helper uses a center foreground point and thresholds the **first** family-selected
+mask at zero; explicit points use `segment_prompted`, which keeps all masks.
+Empty masks remain empty. Confidence and predicted IoU are reported separately.
 
-The benchmark never registers individual families or `runtime_strategy`
-values. For example, a new Wan video family using
-`diffusion_media_generation` and `generate_image` is discovered automatically,
-and a new native or optimized decoder implementation behind `generate` remains
-invisible to the benchmark layer. This is the same rule for source checkouts
-and the catalog snapshot packaged in a wheel.
+Disparity writes the final F32 map beside the result JSON after measurement,
+retaining dimensions and the left-grid `x_left_minus_x_right` convention. File
+flush errors fail the run. New semantic image/feature routes honor an explicit
+`asset_loading_included=true`; older legacy image/feature paths did not all honor
+that flag, so historical comparisons must account for this boundary. Stateless
+action chunks preserve schema, values and timing; they do not emulate a queue.
 
-## Run several models
+`trtmc_dataset_benchmark` preserves its separate, explicit benchmark workload:
+12000 maximum new tokens, temperature/top-p 1, top-k 1, min-p 0, seed -1,
+chat formatting off, thinking on, boxed-answer stopping off and check interval
+16. These defaults apply only to controls declared by the selected Task; an
+explicit unsupported flag fails even when its value equals a default. They are
+application workload choices, not shared runtime or QuickStart defaults.
+`--set NAME=VALUE` accepts additional declared scalar/list controls on semantic
+bundles, using the same text parser as the CLI. Each successful sample records
+the exact `submitted_config`; absent, family-computed values are not fabricated.
 
-Repeat `--model` to run a batch. Each missing bundle is built once and then
-reused from the managed cache:
+Use `--task TASK_ID` to select a bound prompt-only Task, including a secondary
+text capability of a multimodal bundle. Without it, the dataset benchmark uses
+a prompt-compatible primary Task, or the sole bound prompt-compatible Task.
+Multiple candidates require an explicit selection. Unknown, unbound or
+incomplete-input Tasks fail; a failed call never retries another Task or the
+existing family path. The result's `task` identifies the executed Task and
+`bundle_task` retains the bundle's primary identity. Existing bundle modes reject
+`--task`, just as they reject `--set`.
 
-```bash
-trtmc-bench run \
-  --model distilgpt2 \
-  --model flux-schnell-l0 \
-  --model chronos-bolt-tiny-official
-```
+Translation passes the prompt as source text, leaving source and target languages
+absent so the family can use its declared bundle defaults. A family without an
+applicable default rejects the request; the benchmark does not invent a language.
+Tasks needing additional inputs, such as images or latent tensors, are not
+complete dataset-prompt requests and are not synthesized from the prompt.
 
-Use one YAML file when models need different cases or measurement counts:
-
-```bash
-trtmc-bench run examples/trtmc_bench.yaml -o results/current
-```
-
-An explicit `-o/--output` is a replaceable result slot. If that directory
-already exists, the command writes the new run to a sibling staging directory
-and replaces the complete old result after the new report is ready. An
-exception while producing the staged run leaves the previous result intact.
-The command never merges new artifacts with an older run. For safety, it only
-replaces an empty directory or a directory containing a recognized
-`trtmc-bench` `result.json`; unrelated directories and symlinks are rejected.
-Omit `-o` to create a new timestamped result directory for every invocation.
-
-The YAML reuses the repository's existing model names, manifests,
-`task_strategy`, `runtime_strategy`, testcase inputs, and `.bundle` bundle
-names. It does not introduce a second model catalog.
-
-### Combine separate model runs in one report
-
-Separate CLI invocations can share one collection directory while retaining an
-independent result directory per model:
-
-```bash
-trtmc-bench run --model distilgpt2 \
-  -o result-20260721/distilgpt2
-trtmc-bench run --model bart-base \
-  -o result-20260721/bart-base
-trtmc-bench run --model flux-schnell-l0 \
-  -o result-20260721/flux-schnell-l0
-```
-
-Recursively discover their `trtmc.benchmark-run/v1` results and build one
-collection report in place:
-
-```bash
-trtmc-bench report result-20260721
-```
-
-This writes `result-20260721/report.json` and
-`result-20260721/report.html`. The per-model `result.json` files remain the
-authoritative evidence and are not rewritten or copied. Add another model
-subdirectory and run the same report command again to atomically rebuild the
-summary; no append flag or report database is required.
-
-Several result roots can be combined when an explicit report output is given:
-
-```bash
-trtmc-bench report results/gb300 results/h100 -o reports/combined
-```
-
-## Cases, sweeps, and batches
-
-A named case is one complete request. Two cases are two runs; their fields are
-never combined:
-
-```yaml
-cases:
-  - name: fast
-    set:
-      request.num_inference_steps: 4
-  - name: standard
-    set:
-      request.num_inference_steps: 20
-```
-
-Only `--sweep` requests a Cartesian product:
-
-```bash
-trtmc-bench run --model flux-schnell-l0 \
-  --sweep request.batch_size=1,2 \
-  --sweep request.num_inference_steps=4,20
-```
-
-Batch behavior follows the public pipeline capability. Diffusion uses
-`generate_image_batch`, so `request.batch_size` measures one batch call and
-reports generated samples/s. Built-in batch profiles preserve their individual
-prompts and seeds rather than cloning one scalar request. Operations without a
-public batch API reject batch sizes above one instead of silently simulating a
-batch with sequential requests.
-
-## Defaults and metrics
-
-The first existing E2E testcase supplies the default workload. Operation
-defaults are 5 warmups and 50 timed calls for text generation, 1 and 5 for
-diffusion, and 50 and 500 for encoder/neural-operator workloads. Override them
-without editing a plan file:
-
-```bash
-trtmc-bench run --model distilgpt2 \
-  --warmup 10 --iterations 100 --set request.max_new_tokens=32
-```
-
-Every operation reports wall-latency min/mean/p50/p95/max and request/s.
-Task-aware reducers additionally report:
-
-| Operation | Additional metrics |
-| --- | --- |
-| Text and vision-language generation | output token/s and runtime-reported prefill/decode stages |
-| Image diffusion | image/s and seconds/image |
-| Video diffusion | video/s, frame/s, and seconds/video |
-| Audio generation | generated audio seconds/s, sample/s, and real-time factor |
-| Speech-to-speech | consumed and generated audio seconds/s, plus input real-time factor |
-| Segmentation | image/s, mask/s where applicable, and mask pixel/s |
-| Classification and object detection | image/s |
-| Reranking | document/s |
-| Encoder/embedding | embedding vector/s and element/s |
-| Speech transcription | audio seconds/s, real-time factor, output token/s, and streaming first-partial latency |
-| Neural operator | window/s and forecast element/s |
-
-Text requests preserve the selected testcase's sampling parameters, text
-generation mode, and chat-template contract. Greedy cases without an explicit
-seed use the public pipeline default of `-1`; seeded sampling cases retain their
-declared seed.
-
-Some metrics cannot share a valid measurement boundary. For example, a long
-profiler capture perturbs baseline latency, and model loading is not request
-latency. Keep those as separate runs/artifacts rather than mixing them into the
-baseline result.
-
-## Relationship to reference validation and NVIDIA tools
-
-`trtmc-validate` answers whether model outputs satisfy a reference-consistency
-contract using datasets, references, and comparators. `trtmc-bench` answers
-how the runtime performs for a resolved workload. A built-in testcase makes a
-benchmark runnable, but it is not proof of task quality; the result explicitly
-records `task_quality_evaluated: false`.
-
-Baseline runs optionally sample `nvidia-smi` outside the timed call. Use Nsight
-Systems or existing profiling tools as a separate diagnostic pass when a
-baseline exposes a bottleneck. Compute Sanitizer/memcheck is a correctness
-diagnostic and should not be part of a normal performance run.
-
-## Add a model, family, or task type
-
-Keep model knowledge in the existing model manifest and runtime plugin. The
-benchmark reads `MODEL.toml.test_manifests`; there is no benchmark-owned model
-allowlist.
-
-For a model or family on an existing task, add the normal model implementation,
-manifest, and `MODEL.toml` entry, then verify that `trtmc-bench list models`
-shows `ready`. No import or `if family == ...` branch belongs in benchmark code.
-
-For a genuinely new task contract, add its testcase translator to
-`benchmark/task_adapters.py`. Reuse an existing operation whenever the task can
-be expressed by an existing public `IPipeline` call. Only a genuinely new
-public capability adds a metric declaration in `benchmark/operations.py` and a
-timed runner in `trtmc_benchmark_worker.cpp`. The registry validates task-to-
-operation references at import time. Unsupported task strategies and malformed
-default testcases remain visible with a reason in `list models` and fail closed
-when selected.
-
-Artifact inputs follow the existing manifest-relative paths. For example,
-speech transcription resolves `test_input_audio` once, hashes it into the case
-identity, decodes WAV outside the timed region, and measures only offline or
-streaming public pipeline calls. Image-conditioned generation resolves and
-hashes `test_image` the same way. Packaged default audio, image, and FP8 scale
-assets are copied from the canonical E2E model directory with the catalog
-snapshot.
-
-{/* Collaborative review anchor: batch 2. */}
+For nonnegative base seeds, both dataset paths add `seed_index` when present,
+otherwise the sample's zero-based row index. Overflow fails instead of wrapping.
+Dataset timing ends before answer extraction and JSON output. Preserve the
+bundle, submitted parameters and software revision when comparing these runs.

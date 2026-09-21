@@ -34,7 +34,7 @@ digraph BenchmarkMeasurementReporting {
   route [shape="diamond", style="filled", fillcolor="#fffbeb", color="#b45309", label=<<B>Bundle runtime<BR/>metadata</B>>];
   worker -> load -> route;
 
-  native [fillcolor="#ecfccb", color="#4d7c0f", label=<<B>Native path</B><BR/><FONT POINT-SIZE="16">runtime_strategy<BR/>model + backend DSOs</FONT>>];
+  native [fillcolor="#ecfccb", color="#4d7c0f", label=<<B>Native path</B><BR/><FONT POINT-SIZE="16">family + task + backend<BR/>family + backend DSOs</FONT>>];
   optimized [fillcolor="#ecfccb", color="#4d7c0f", label=<<B>Optimized path</B><BR/><FONT POINT-SIZE="16">optimized_runtime.json<BR/>embedded implementation DSO</FONT>>];
   { rank=same; native; optimized; }
   route -> native [label="native bundle"];

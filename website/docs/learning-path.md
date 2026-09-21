@@ -8,7 +8,7 @@ import Diagram from '@site/src/components/Diagram';
 Tutorials teach; they are not a lookup reference. Each module introduces one
 mental model, asks you to change or inspect something concrete, and ends with a
 self-check. Start after completing [Getting Started](getting-started/overview.md);
-the first modules reuse the Qwen bundle from the Quick Start instead of asking
+the first modules reuse the GPT-2 bundle from the Quick Start instead of asking
 you to rebuild it.
 
 Use [User Guides](user-guides/overview.md) when you already know the concept
@@ -46,9 +46,8 @@ Read and run these pages in order:
 2. [Installation](getting-started/installation.md)
 3. [Quick Start](getting-started/quick-start.md)
 
-**Milestone:** `trtmc run` returns generated text from
-`./qwen3-0.6b.bundle`, and `inspect` reports the `qwen` family and
-`qwen_decoder_kv_cache` runtime strategy.
+**Milestone:** `trtmc run` returns generated text from `./gpt2.bundle`, and
+`inspect` reports the `gpt2` family with the expected bundle sections.
 
 If that milestone does not pass, stay in Getting Started. Architecture,
 quantization, and other model recipes will add variables without fixing the
@@ -64,7 +63,7 @@ Read:
 - [Inspect Bundles](tutorials/beginner/inspect-bundles.md) for artifact-first
   debugging.
 
-Use the bundle you already built. Inspect its metadata and engine list, then
+Use the bundle you already built. Inspect its metadata and section list, then
 identify which evidence came from model conversion, which was stored in the
 bundle, and which was produced only when the C++ runtime loaded it.
 
@@ -74,7 +73,7 @@ and a `.bundle` bundle are different artifacts.
 ## Module 2: Control text generation
 
 Continue with [Text Generation](tutorials/beginner/text-generation.md). Reuse
-`./qwen3-0.6b.bundle` to compare greedy decoding with sampling
+`./gpt2.bundle` to compare deterministic decoding with sampling
 controls such as temperature, top-k, top-p, min-p, and a fixed seed.
 
 Use the [CLI Reference](api/cli-reference.md) when you need the exact option
@@ -154,9 +153,9 @@ implementation, continue with:
 Then choose the extension guide owned by your change:
 
 - [Add a Model Family](extend/add-model-family.md)
-- [Add an Optimized Runtime Implementation](extend/add-optimized-runtime.md)
-- [Add a Runtime Strategy](extend/add-runtime-strategy.md)
-- [Add a Configuration Schema](extend/add-config-schema.md)
+- [Add Complete-Network Platform Offload](extend/add-optimized-runtime.md)
+- [Extend a Family Runtime](extend/add-runtime-strategy.md)
+- [Add an Explicit Configuration Field](extend/add-config-schema.md)
 - [Validate a Model Contribution](extend/model-validation.md)
 - [Bring Your Own Kernel](tutorials/advanced/bring-your-own-kernel.md)
 - [Contributing](extend/contributing.md)
@@ -165,8 +164,8 @@ Bring Your Own Kernel is an advanced extension workflow, not part of the
 beginner or common user path. Use it only when replacing or adding a kernel
 implementation is the goal.
 
-**Milestone:** before editing, you can name the model-owned Python descriptor,
-runtime strategy and DSO owner, public API boundary, tests, E2E manifest, and
-documentation that form the vertical slice of your change.
+**Milestone:** before editing, you can name the family-owned Python entry,
+runtime DSO owner, public API boundary, tests, E2E manifest, and documentation
+that form the vertical slice of your change.
 
 {/* Collaborative review anchor: batch 2. */}

@@ -3,15 +3,25 @@
 
 # Nemotron VoiceChat full-duplex microphone example
 
-This example runs one local, in-process `ISpeechSession`. It continuously
+This example runs one local, in-process full-duplex session. SDK-enabled bundles
+use `DuplexSpeechDialogue` over the C ABI. It continuously
 captures a Linux ALSA microphone while playing the agent's audio, so a user can
 interrupt the agent without waiting for playback to finish. It does not start a
 server, open a network port, or use WebSocket or Python at runtime.
 
 On top of the repository-pinned TensorRT base, the application layer adds only
-the example executable, `trtmc_core`, the TensorRT backend, the Nemotron
-VoiceChat model DSO, and ALSA runtime packages. It does not contain the
-checkpoint or a bundle.
+the example executable, the core and explicit runtime loader, the TensorRT
+backend, the Nemotron VoiceChat model DSO, and ALSA runtime packages. It does
+not contain the checkpoint or a bundle.
+
+SDK session events retain their ownership until audio is copied into the
+existing playback queue. Input backpressure retries the same captured chunk
+without dropping it; session timeouts are distinct from termination. The
+resolved mono input/output rates must match the configured ALSA endpoints.
+All existing device/rate/latency/seed/system-prompt flags remain available.
+For SDK bundles the runtime root defaults to the C SDK library directory.
+Existing bundle primary modes explicitly select the previous session path and
+retain its `/opt/trtmc/lib` default. An SDK failure never retries that path.
 
 ## Requirements
 
@@ -32,34 +42,23 @@ Run the build from the repository root. The default Docker base and CUDA target
 are the repository-pinned aarch64 TensorRT 26.07 image and GB300 SM 10.3:
 
 ```bash
-VOICECHAT_SOURCE_REVISION="$(git rev-parse HEAD)"
-
 docker build \
   --platform linux/arm64 \
   --file examples/models/nemotron_voicechat/full_duplex/Dockerfile \
-  --build-arg TRTMC_SOURCE_REVISION="${VOICECHAT_SOURCE_REVISION}" \
   --tag trtmc-voicechat-full-duplex:local \
   .
 ```
-
-The Dockerfile uses its adjacent `Dockerfile.dockerignore` to project the
-native source tree while excluding every other model family. Docker's retired
-legacy builder does not support Dockerfile-specific ignore files; enable
-BuildKit or use a current Docker release.
 
 For a native x86_64 build, override both the pinned architecture-specific base
 digest and the CUDA architecture. Derive the latter from the GPU that the
 bundle targets; this example shows a B200 (`sm_100`):
 
 ```bash
-VOICECHAT_SOURCE_REVISION="$(git rev-parse HEAD)"
-
 docker build \
   --platform linux/amd64 \
   --file examples/models/nemotron_voicechat/full_duplex/Dockerfile \
   --build-arg TENSORRT_IMAGE='nvcr.io/nvidia/tensorrt:26.07-py3@sha256:b82db1abc23750ab0069abc99bbe4ea29138dbdc23ea39861199e2346638b48a' \
   --build-arg TRTMC_CUDA_ARCHITECTURES=100-real \
-  --build-arg TRTMC_SOURCE_REVISION="${VOICECHAT_SOURCE_REVISION}" \
   --tag trtmc-voicechat-full-duplex:local \
   .
 ```

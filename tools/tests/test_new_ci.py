@@ -1,0 +1,1293 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import inspect
+import io
+import json
+import re
+import shutil
+import subprocess
+import tarfile
+import zipfile
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import yaml
+
+from tools.ci.context import CiContext
+from tools.ci.container import CiContainer
+from tools.ci.docker_image import DockerImageManager
+from tools.ci.e2e import E2ERunner, _require_e2e_junit, _require_passing_junit
+from tools.ci.package import (
+    SourceArchiveValidator,
+    WheelArchiveValidator,
+    WheelPackageManager,
+    load_native_libraries,
+    validate_installed_sdk,
+)
+from tools.ci.pipeline import CiPipeline
+from tools.ci.process import CiError
+from tools.ci.quality import SourceQualityChecks, UnitTestRunner
+from tools import perf_matrix
+
+
+class RecordingContext:
+    def __init__(self, repository: Path, env: dict[str, str]):
+        self.repository = repository
+        self.env = env
+        self.calls = []
+        self.runtime_snapshots = []
+        self.skip_ctest = False
+        self.no_cpu_family_tests = False
+        self.missing_e2e_testcases = set()
+
+    def run(self, command, **kwargs):
+        self.calls.append((list(command), kwargs))
+        runtime_root = kwargs.get("updates", {}).get("TRTMC_RUNTIME_ROOT")
+        if runtime_root:
+            self.runtime_snapshots.append(
+                tuple(sorted(path.name for path in Path(runtime_root).iterdir()))
+            )
+        if "--show-only=json-v1" in command:
+            return SimpleNamespace(
+                stdout=json.dumps(
+                    {
+                        "tests": [
+                            {
+                                "name": "beta_runtime",
+                                "properties": [
+                                    {
+                                        "name": "WORKING_DIRECTORY",
+                                        "value": str(
+                                            Path(self.env["TRTMC_NATIVE_BUILD_DIR"])
+                                            / "families/beta"
+                                        ),
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                )
+            )
+        if "--output-junit" in command:
+            report = Path(command[command.index("--output-junit") + 1])
+            outcome = '<skipped message="not run" />' if self.skip_ctest else ""
+            report.write_text(
+                f'<testsuites><testsuite><testcase name="beta_runtime">{outcome}'
+                "</testcase></testsuite></testsuites>",
+                encoding="utf-8",
+            )
+        if "--junitxml" in command:
+            report = Path(command[command.index("--junitxml") + 1])
+            empty = self.no_cpu_family_tests and "-unit-junit.xml" in report.name
+            testcases = "" if empty else '<testcase name="hardware" />'
+            if any(str(item).endswith("/test_e2e.py") for item in command):
+                family = str(command[3]).split("/")[1]
+                if "--e2e-testcase" in command:
+                    raw = str(command[command.index("--e2e-testcase") + 1])
+                    selected = set(raw.split(",")) - self.missing_e2e_testcases
+                else:
+                    selected = {
+                        str(case["name"])
+                        for path in (self.repository / f"families/{family}/tests/manifests").glob(
+                            "*.json"
+                        )
+                        for case in json.loads(path.read_text(encoding="utf-8"))["testcases"]
+                    }
+                testcases = "".join(
+                    f'<testcase name="test_e2e[{name}]" />' for name in sorted(selected)
+                )
+            report.write_text(
+                f"<testsuites><testsuite>{testcases}</testsuite></testsuites>",
+                encoding="utf-8",
+            )
+            if empty:
+                return SimpleNamespace(stdout="", returncode=5)
+        return SimpleNamespace(stdout="", returncode=0)
+
+
+@pytest.mark.parametrize(
+    ("testcases", "selector", "external_junit"),
+    (
+        (None, ["--e2e-model", "beta"], False),
+        (["beta-case"], ["--e2e-testcase", "beta-case"], False),
+        (["beta-case"], ["--e2e-testcase", "beta-case"], True),
+    ),
+)
+def test_selective_e2e_calls_family_tests_directly(
+    tmp_path: Path,
+    testcases: list[str] | None,
+    selector: list[str],
+    external_junit: bool,
+) -> None:
+    for family in ("alpha", "beta"):
+        root = tmp_path / "families" / family
+        (root / "tests").mkdir(parents=True)
+        (root / "tests/manifests").mkdir()
+        (root / "model.py").write_text("def build(request, writer): pass\n")
+        (root / "tests/test_e2e.py").write_text("def test_e2e(): pass\n")
+        manifest = json.dumps({"testcases": [{"name": f"{family}-case"}]})
+        if family == "beta" and testcases is not None:
+            # Explicit auxiliary E2E cases do not depend on model manifests.
+            manifest = "invalid manifest"
+        (root / "tests/manifests/case.json").write_text(manifest, encoding="utf-8")
+        if family == "beta":
+            (root / "tests/test_model.py").write_text(
+                "def test_model(): pass\n",
+                encoding="utf-8",
+            )
+            (root / "tests/test_gpu.py").write_text(
+                "import pytest\n\n@pytest.mark.gpu\ndef test_gpu(): pass\n",
+                encoding="utf-8",
+            )
+    binary = tmp_path / "trtmc"
+    binary.write_text("")
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    (runtime / "libtrtmc_core.so").write_text("")
+    (runtime / "libtrtmc_runtime.so").write_text("")
+    (runtime / "libtrtmc_c.so").write_text("")
+    (runtime / "libtrtmc_c.so.1").write_text("")
+    (runtime / "libtrtmc_backend_trt.so").write_text("")
+    (runtime / "libtrtmc_model_beta.so").write_text("")
+    native_build = tmp_path / "native-build"
+    native_build.mkdir()
+    (native_build / "CTestTestfile.cmake").write_text("")
+    impact = {"families": ["beta"]}
+    if testcases is not None:
+        impact["testcases"] = testcases
+    (tmp_path / "impact.json").write_text(json.dumps(impact))
+    env = {
+        "TRTMC_BINARY": str(binary),
+        "TRTMC_RUNTIME_ROOT": str(runtime),
+        "TRTMC_NATIVE_BUILD_DIR": str(native_build),
+    }
+    expected_e2e_junit = native_build / "trtmc-beta-e2e-junit.xml"
+    if external_junit:
+        expected_e2e_junit = tmp_path / ".ci/family-beta-junit.xml"
+        expected_e2e_junit.parent.mkdir()
+        env["PYTEST_ADDOPTS"] = f"--maxfail=2 --junitxml={expected_e2e_junit}"
+    context = RecordingContext(tmp_path, env)
+
+    E2ERunner(context).selective()
+
+    assert context.calls[0][0][:3] == ["ctest", "--test-dir", native_build]
+    assert context.calls[1][0][-1] == "test_beta_runtime"
+    assert context.calls[2][0][0] == "ctest"
+    assert "--output-junit" in context.calls[2][0]
+    unit_command, unit_options = context.calls[3]
+    assert unit_command[:5] == [
+        "python",
+        "-m",
+        "pytest",
+        "families/beta/tests/test_gpu.py",
+        "families/beta/tests/test_model.py",
+    ]
+    assert ["-m", "not gpu and not trt"] == unit_command[5:7]
+    assert unit_command[-2:] == [
+        "--junitxml",
+        native_build / "trtmc-beta-unit-junit.xml",
+    ]
+    assert unit_options["unset"] == ("PYTEST_ADDOPTS",)
+    assert unit_options["check"] is False
+
+    hardware_command, _ = context.calls[4]
+    assert hardware_command[:4] == [
+        "python",
+        "-m",
+        "pytest",
+        "families/beta/tests/test_gpu.py",
+    ]
+    assert ["-m", "gpu or trt"] == hardware_command[4:6]
+    assert hardware_command[-2:] == [
+        "--junitxml",
+        native_build / "trtmc-beta-hardware-junit.xml",
+    ]
+    assert context.calls[4][1]["unset"] == ("PYTEST_ADDOPTS",)
+
+    command, options = context.calls[5]
+    assert command[:4] == ["python", "-m", "pytest", "families/beta/tests/test_e2e.py"]
+    assert selector == command[4:6]
+    assert command[-2:] == [
+        "--junitxml",
+        expected_e2e_junit,
+    ]
+    rendered = " ".join(map(str, command))
+    assert "e2e_harness" not in rendered
+    assert "--trtmc-binary" not in rendered
+    assert "--model-plugin-dir" not in rendered
+    assert options["updates"]["TRTMC_BINARY"] == str(binary)
+    assert options["updates"]["TRTMC_RUNTIME_ROOT"] != str(runtime)
+    assert options["unset"] == ("PYTEST_ADDOPTS",)
+    assert context.runtime_snapshots == [
+        (
+            "libtrtmc_backend_trt.so",
+            "libtrtmc_c.so",
+            "libtrtmc_c.so.1",
+            "libtrtmc_core.so",
+            "libtrtmc_model_beta.so",
+            "libtrtmc_runtime.so",
+        )
+    ]
+
+
+def test_family_with_only_hardware_tests_accepts_exact_empty_cpu_result(
+    tmp_path: Path,
+) -> None:
+    family = tmp_path / "families/beta"
+    (family / "tests").mkdir(parents=True)
+    (family / "tests/manifests").mkdir()
+    (family / "model.py").write_text("def build(request, writer): pass\n")
+    (family / "tests/test_e2e.py").write_text("def test_e2e(): pass\n")
+    (family / "tests/manifests/case.json").write_text(
+        json.dumps({"testcases": [{"name": "beta-case"}]}),
+        encoding="utf-8",
+    )
+    (family / "tests/test_gpu.py").write_text(
+        "import pytest\n\n@pytest.mark.gpu\ndef test_gpu(): pass\n",
+        encoding="utf-8",
+    )
+    binary = tmp_path / "trtmc"
+    binary.write_text("")
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    for name in (
+        "libtrtmc_core.so",
+        "libtrtmc_runtime.so",
+        "libtrtmc_c.so",
+        "libtrtmc_c.so.1",
+        "libtrtmc_backend_trt.so",
+        "libtrtmc_model_beta.so",
+    ):
+        (runtime / name).write_text("")
+    native_build = tmp_path / "native-build"
+    native_build.mkdir()
+    (native_build / "CTestTestfile.cmake").write_text("")
+    context = RecordingContext(
+        tmp_path,
+        {
+            "TRTMC_BINARY": str(binary),
+            "TRTMC_RUNTIME_ROOT": str(runtime),
+            "TRTMC_NATIVE_BUILD_DIR": str(native_build),
+        },
+    )
+    context.no_cpu_family_tests = True
+
+    E2ERunner(context)._run(("beta",))
+
+    unit_command, unit_options = context.calls[3]
+    assert ["-m", "not gpu and not trt"] == unit_command[4:6]
+    assert unit_options["check"] is False
+    assert context.calls[-1][0][:4] == [
+        "python",
+        "-m",
+        "pytest",
+        "families/beta/tests/test_e2e.py",
+    ]
+
+
+def test_family_cpp_skip_fails_closed(tmp_path: Path) -> None:
+    family = tmp_path / "families/beta"
+    family.mkdir(parents=True)
+    build = tmp_path / "native-build"
+    build.mkdir()
+    context = RecordingContext(
+        tmp_path,
+        {"TRTMC_NATIVE_BUILD_DIR": str(build)},
+    )
+    context.skip_ctest = True
+
+    with pytest.raises(CiError, match=r"family C\+\+ tests skipped"):
+        E2ERunner(context)._run_family_ctests(build, ("beta",))
+
+
+def test_family_hardware_skip_fails_closed(tmp_path: Path) -> None:
+    report = tmp_path / "hardware.xml"
+    report.write_text(
+        '<testsuites><testsuite><testcase name="gpu"><skipped />'
+        "</testcase></testsuite></testsuites>",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CiError, match="family hardware tests skipped: gpu"):
+        _require_passing_junit(report, "family hardware tests")
+
+
+@pytest.mark.parametrize(
+    ("element", "outcome"),
+    (("skipped", "skipped"), ("error", "errors"), ("failure", "failures")),
+)
+def test_family_python_unit_junit_fails_closed(
+    tmp_path: Path,
+    element: str,
+    outcome: str,
+) -> None:
+    report = tmp_path / "unit.xml"
+    report.write_text(
+        f'<testsuites><testsuite><testcase name="unit"><{element} />'
+        "</testcase></testsuite></testsuites>",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CiError, match=f"family Python unit tests {outcome}: unit"):
+        _require_passing_junit(report, "family Python unit tests")
+
+
+def test_e2e_junit_reports_exact_requested_result(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    report = tmp_path / "e2e.xml"
+    report.write_text(
+        '<testsuites><testsuite><testcase name="test_e2e[alpha]" />'
+        '<testcase name="test_e2e[beta]"><skipped /></testcase>'
+        '<testcase name="test_helper" /></testsuite></testsuites>',
+        encoding="utf-8",
+    )
+
+    _require_e2e_junit(report, "family", ("alpha",))
+
+    assert (
+        "family E2E results: requested=1 executed=1 passed=1 failed=0 skipped=0"
+        in capsys.readouterr().out
+    )
+
+
+@pytest.mark.parametrize(
+    ("testcases", "requested", "message"),
+    (
+        ("", ("missing",), "missing requested E2E testcase: missing"),
+        (
+            '<testcase name="test_e2e[duplicate]" />'
+            '<testcase name="test_official_checkpoint_e2e[duplicate]" />',
+            ("duplicate",),
+            "duplicate E2E testcase result: duplicate",
+        ),
+        (
+            '<testcase name="test_e2e[skipped]"><skipped /></testcase>',
+            ("skipped",),
+            "requested E2E testcase skipped: skipped",
+        ),
+        (
+            '<testcase name="test_e2e[failed]"><failure /></testcase>',
+            ("failed",),
+            "requested E2E testcase failed: failed",
+        ),
+        (
+            '<testcase name="test_e2e[duplicate-request]" />',
+            ("duplicate-request", "duplicate-request"),
+            "duplicate requested E2E testcase: duplicate-request",
+        ),
+    ),
+)
+def test_e2e_junit_fails_closed_for_invalid_result_cardinality_or_skip(
+    tmp_path: Path,
+    testcases: str,
+    requested: tuple[str, ...],
+    message: str,
+) -> None:
+    report = tmp_path / "e2e.xml"
+    report.write_text(
+        f"<testsuites><testsuite>{testcases}</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CiError, match=message):
+        _require_e2e_junit(report, "family", requested)
+
+
+def test_e2e_rejects_multiple_family_environments(tmp_path: Path) -> None:
+    context = RecordingContext(tmp_path, {})
+
+    with pytest.raises(CiError, match="exactly one family"):
+        E2ERunner(context)._run(("alpha", "beta"))
+
+
+@pytest.mark.parametrize("missing", (None, "libtrtmc_c.so.1", "libtrtmc_runtime.so"))
+def test_isolated_family_runtime_carries_public_api_only_for_selected_family(
+    tmp_path: Path, missing: str | None
+) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    required = {
+        "libtrtmc_core.so",
+        "libtrtmc_runtime.so",
+        "libtrtmc_c.so",
+        "libtrtmc_c.so.1",
+        "libtrtmc_backend_trt.so",
+        "libtrtmc_model_alpha.so",
+    }
+    for name in required | {"libtrtmc_model_beta.so"}:
+        if name != missing:
+            (runtime / name).write_text("")
+    runner = E2ERunner(RecordingContext(tmp_path, {}))
+    if missing:
+        with pytest.raises(CiError, match=re.escape(missing)):
+            with runner._isolated_runtime_root(runtime, "alpha"):
+                pytest.fail("incomplete runtime must be rejected")
+    else:
+        with runner._isolated_runtime_root(runtime, "alpha") as isolated:
+            assert {path.name for path in isolated.iterdir()} == required
+            assert all(path.is_file() for path in isolated.iterdir())
+
+
+def test_isolated_family_runtime_preserves_installed_byok(tmp_path: Path) -> None:
+    site_packages = tmp_path / "site-packages"
+    runtime = site_packages / "tensorrt_model_connect/bin"
+    runtime.mkdir(parents=True)
+    expected = {
+        "libtrtmc_core.so",
+        "libtrtmc_runtime.so",
+        "libtrtmc_c.so",
+        "libtrtmc_c.so.1",
+        "libtrtmc_backend_trt.so",
+        "libtrtmc_model_alpha.so",
+        "libtrtmc_byok_tvm_ffi.so",
+    }
+    for name in expected | {"libtrtmc_model_beta.so"}:
+        (runtime / name).write_text("")
+    ffi = site_packages / "tvm_ffi"
+    ffi.mkdir()
+    runner = E2ERunner(RecordingContext(tmp_path, {}))
+    with runner._isolated_runtime_root(runtime, "alpha") as isolated:
+        assert {path.name for path in isolated.iterdir()} == expected
+        assert (isolated.parent.parent / "tvm_ffi").resolve() == ffi
+
+
+@pytest.mark.parametrize("state", ["python", "native", "missing_declaration", "missing_adapter"])
+def test_isolated_family_runtime_preserves_only_owner_cli(tmp_path: Path, state: str) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    for name in (
+        "libtrtmc_core.so", "libtrtmc_runtime.so", "libtrtmc_c.so", "libtrtmc_c.so.1",
+        "libtrtmc_backend_trt.so", "libtrtmc_model_alpha.so", "libtrtmc_cli_beta.so",
+    ):
+        (runtime / name).write_bytes(b"native")
+    source = tmp_path / "families/alpha/cli.json"
+    source.parent.mkdir(parents=True)
+    executor = "native" if state in {"native", "missing_adapter"} else "python"
+    source.write_text(json.dumps({"version": 1, "commands": [{"executor": executor}]}))
+    if state == "native":
+        (runtime / "libtrtmc_cli_alpha.so").write_bytes(b"adapter")
+    for family in ("alpha", "beta"):
+        if family == "alpha" and state == "missing_declaration":
+            continue
+        declaration = runtime / "families" / family / "cli.json"
+        declaration.parent.mkdir(parents=True)
+        declaration.write_bytes(source.read_bytes())
+    runner = E2ERunner(RecordingContext(tmp_path, {}))
+    if state.startswith("missing_"):
+        message = "no CLI declaration for alpha" if state == "missing_declaration" else "libtrtmc_cli_alpha.so"
+        with pytest.raises(CiError, match=message):
+            with runner._isolated_runtime_root(runtime, "alpha"):
+                pytest.fail("declared family CLI must be installed")
+        return
+    with runner._isolated_runtime_root(runtime, "alpha") as isolated:
+        assert (isolated / "families/alpha/cli.json").read_bytes() == source.read_bytes()
+        assert not (isolated / "families/beta").exists()
+        assert (isolated / "libtrtmc_cli_alpha.so").is_file() == (state == "native")
+        assert not (isolated / "libtrtmc_cli_beta.so").exists()
+
+
+def test_e2e_nonexistent_testcase_fails_closed(tmp_path: Path) -> None:
+    repository = Path(__file__).resolve().parents[2]
+    binary = tmp_path / "trtmc"
+    binary.write_text("")
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    for name in (
+        "libtrtmc_core.so",
+        "libtrtmc_runtime.so",
+        "libtrtmc_c.so",
+        "libtrtmc_c.so.1",
+        "libtrtmc_backend_trt.so",
+        "libtrtmc_model_gpt2.so",
+    ):
+        (runtime / name).write_text("")
+    native_build = tmp_path / "native-build"
+    native_build.mkdir()
+    (native_build / "CTestTestfile.cmake").write_text("")
+    context = RecordingContext(
+        repository,
+        {
+            "TRTMC_BINARY": str(binary),
+            "TRTMC_RUNTIME_ROOT": str(runtime),
+            "TRTMC_NATIVE_BUILD_DIR": str(native_build),
+        },
+    )
+    context.missing_e2e_testcases.add("does-not-exist")
+
+    with pytest.raises(CiError, match="missing requested E2E testcase: does-not-exist"):
+        E2ERunner(context)._run(("gpt2",), ("does-not-exist",))
+
+
+def test_pipeline_exposes_only_active_stages(tmp_path: Path) -> None:
+    pipeline = CiPipeline(CiContext(tmp_path, {}))
+    assert tuple(pipeline.stages) == (
+        "impact",
+        "family-coverage",
+        "complexity",
+        "lint",
+        "source-quality",
+        "premerge-unit",
+        "package",
+        "setup",
+        "selective-e2e",
+    )
+
+
+def test_package_build_uses_the_preinstalled_offline_toolchain() -> None:
+    source = inspect.getsource(WheelPackageManager.build)
+    assert '"--no-isolation"' in source
+    assert '"build>=1.2"' not in source
+    repository = Path(__file__).resolve().parents[2]
+    conanfile = (repository / "conanfile.py").read_text()
+    assert "self.requires(" not in conanfile
+    assert "CMakeDeps" not in conanfile
+    assert "libtrtmc_model_sana_wm" not in conanfile
+    assert '"--print-needed"' in conanfile
+    # Conan's output_dirs block overrides a cache-only CMAKE_INSTALL_LIBDIR.
+    # The SDK library must share the wheel's bin directory with its runtime.
+    assert 'self.cpp.package.libdirs = ["bin"]' in conanfile
+    assert 'cache_variables["CMAKE_INSTALL_LIBDIR"]' not in conanfile
+    dockerfile = (repository / "Dockerfile").read_text()
+    assert "openmpi-bin" in dockerfile
+    assert "nvidia/nccl/lib" in dockerfile
+
+
+def test_internal_ci_image_supports_embedded_workflow_shell_regressions() -> None:
+    """Protected units need the same jq executable used by workflow scripts."""
+    repository = Path(__file__).resolve().parents[2]
+    dockerfile = (repository / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "      jq \\\n" in dockerfile
+
+
+def test_source_quality_runs_complexity_before_other_checks() -> None:
+    source = inspect.getsource(SourceQualityChecks.run)
+    assert source.index("self.family_coverage()") < source.index("self.complexity()")
+    assert source.index("self.complexity()") < source.index("self.lint_changed_files()")
+    assert source.index("self.lint_changed_files()") < source.index("self.architecture_contracts()")
+
+
+def test_source_quality_lints_only_files_that_still_exist(tmp_path: Path) -> None:
+    (tmp_path / "kept.py").write_text("", encoding="utf-8")
+    context = RecordingContext(tmp_path, {})
+    context.run = lambda *_args, **_kwargs: SimpleNamespace(stdout="kept.py\ndeleted.py\n")
+
+    assert SourceQualityChecks(context)._changed_files("base", "*.py") == ["kept.py"]
+
+
+def test_retired_central_ci_modules_are_absent() -> None:
+    repository = Path(__file__).resolve().parents[2]
+    retired = (
+        "coverage.py",
+        "e2e_schedule.py",
+        "e2e_scheduler.py",
+        "gpu_lease.py",
+        "isolation.py",
+        "model_proof.py",
+        "model_proof_inner.py",
+        "model_proof_selection.py",
+        "model_reference_cache.py",
+        "selected_wheel.py",
+        "validation.py",
+    )
+    assert not [name for name in retired if (repository / "tools/ci" / name).exists()]
+    assert not (repository / "scripts/schedule_e2e.py").exists()
+
+
+def test_internal_bridge_waits_for_the_exact_run_until_the_job_timeout() -> None:
+    workflow = Path(__file__).resolve().parents[2] / ".github/workflows/internal-ci-bridge.yml"
+    source = workflow.read_text(encoding="utf-8")
+    assert "timeout-minutes: 360" in source
+    wait = source.split("- name: Wait for the exact Internal CI result", 1)[1].split(
+        "\n  publish:", 1
+    )[0]
+    assert "while true; do" in wait
+    assert "sleep 15" in wait
+    assert "seq " not in wait
+    assert "gh run download" not in source
+    assert "tools.public_failure" not in source
+    assert "policy_sha" not in source
+    assert "Protected failure details are not transferred to the public repository." in source
+
+
+def test_internal_bridge_remains_a_one_shot_maintainer_label_trigger() -> None:
+    workflow = Path(__file__).resolve().parents[2] / ".github/workflows/internal-ci-bridge.yml"
+    source = workflow.read_text(encoding="utf-8")
+
+    assert "\n  pull_request_target:\n" in source
+    assert "types: [labeled]" in source
+    assert "github.event.label.name == 'run-internal-ci'" in source
+    assert "maintain|admin" in source
+    assert "issues/$PR_NUMBER/labels/run-internal-ci" in source
+    assert "workflow_run:" not in source
+    assert "Community CPU / Required must pass" in source
+    assert "/actions/runs/$candidate_run/jobs?filter=latest&per_page=100" in source
+    assert 'name == "Community CPU / Required"' in source
+    assert '[ "$cpu_status" = "completed" ] && [ "$cpu_conclusion" = "success" ]' in source
+    assert "/compare/$candidate_base...$base_sha?per_page=1" in source
+    assert '.status == "ahead" and .merge_base_commit.sha == $base' in source
+    assert '[ "$candidate_base" = "$base_sha" ]' in source
+    assert '[ "$candidate_head" != "$head_sha" ]' in source
+    assert '[ "$candidate_tree" = "$merge_tree" ] || continue' in source
+    assert "Community CI must pass" not in source
+
+
+def test_community_activity_alert_uses_only_trusted_external_metadata() -> None:
+    path = (
+        Path(__file__).resolve().parents[2] / ".github/workflows/community-activity-slack-alert.yml"
+    )
+    source = path.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(source)
+    ready = workflow["jobs"]["notify-ready-pr"]
+    merge_ready = workflow["jobs"]["notify-merge-ready-pr"]
+    activity = workflow["jobs"]["notify-activity"]
+
+    events = workflow.get("on", workflow.get(True))
+    assert events["workflow_run"]["workflows"] == [
+        "Community CI",
+        "PR Metadata",
+        "TensorRT-Model-Connect Internal CI Bridge",
+    ]
+    assert "schedule" in events
+    assert "workflow_dispatch" in events
+    assert workflow["permissions"] == {}
+    assert "github.event.workflow_run.name == 'Community CI'" in ready["if"]
+    assert "github.event.workflow_run.event == 'pull_request'" in ready["if"]
+    assert "merge_revision_matches_tested" in source
+    assert '[ "$current_base_sha" = "$tested_base_sha" ]' in source
+    assert '[ "$current_head_sha" = "$HEAD_SHA" ]' in source
+    assert '[ "$current_tree_sha" = "$tested_tree_sha" ]' in source
+    assert '[ "$current_merge_sha" != "$MERGE_SHA" ]' not in source
+    assert ready["permissions"] == {
+        "actions": "read",
+        "checks": "read",
+        "contents": "read",
+        "pull-requests": "read",
+    }
+    assert activity["permissions"] == {}
+    assert ready["timeout-minutes"] == 7
+    assert merge_ready["timeout-minutes"] == 10
+    assert merge_ready["permissions"] == {
+        "checks": "read",
+        "pull-requests": "read",
+        "statuses": "write",
+    }
+    assert merge_ready["concurrency"] == {
+        "group": "slack-merge-ready-alerts",
+        "cancel-in-progress": False,
+    }
+    merge_ready_script = merge_ready["steps"][0]["run"]
+    for trusted in ("OWNER", "MEMBER", "COLLABORATOR"):
+        assert f'.author_association != "{trusted}"' in merge_ready_script
+    assert activity["timeout-minutes"] == 5
+    assert all(
+        "uses" not in step for job in (ready, merge_ready, activity) for step in job["steps"]
+    )
+    assert "actions/checkout" not in source
+
+    condition = activity["if"]
+    assert "github.repository == 'NVIDIA/TensorRT-Model-Connect'" in condition
+    assert "github.event.sender.type != 'Bot'" in condition
+    association_fields = {
+        "issues": "github.event.issue.author_association",
+        "issue_comment": "github.event.comment.author_association",
+        "discussion": "github.event.discussion.author_association",
+        "discussion_comment": "github.event.comment.author_association",
+    }
+    for event_name, association in association_fields.items():
+        assert f"github.event_name == '{event_name}'" in condition
+        for trusted in ("OWNER", "MEMBER", "COLLABORATOR"):
+            assert f"{association} != '{trusted}'" in condition
+
+    assert set(re.findall(r"secrets\.([A-Z][A-Z0-9_]*)", source)) == {
+        "SLACK_COMMUNITY_ACTIVITY_WEBHOOK_URL"
+    }
+    post = activity["steps"][0]
+    assert post["env"]["SLACK_WEBHOOK_URL"] == (
+        "${{ secrets.SLACK_COMMUNITY_ACTIVITY_WEBHOOK_URL }}"
+    )
+
+    script = post["run"]
+    assert "${{" not in script
+    assert "External maintainer request" in script
+
+    ready_script = ready["steps"][0]["run"]
+    assert "· community CI · head" in ready_script
+    assert "· merge" in ready_script
+    assert "Unexpected Community CI run name" in ready_script
+    assert "for attempt in {1..30}; do" in ready_script
+    assert "sleep 10" in ready_script
+    assert (
+        ready_script.count(
+            'current_merge_sha="$(jq -r ".merge_commit_sha // empty" <<<"$pr_json")"'
+        )
+        == 2
+    )
+    for check in ("Community CPU / Required", "PR Metadata / Required", "DCO"):
+        assert check in ready_script
+    assert "sort_by(.started_at) | last" in ready_script
+    assert "External PR ready for maintainer" in ready_script
+    merge_ready_script = merge_ready["steps"][0]["run"]
+    assert "pulls?state=open&base=main" in merge_ready_script
+    assert 'marker="Slack / Merge-ready alert #$number"' in merge_ready_script
+    assert 'and .mergeable_state == "clean"' in merge_ready_script
+    assert "TRTMC Internal CI / Automated premerge gate" in merge_ready_script
+    assert "✅ PASS · PR ready to merge" in merge_ready_script
+    assert "Merge-ready Slack notification delivered" in merge_ready_script
+    assert 'if [ -z "$SLACK_WEBHOOK_URL" ]; then' in script
+    assert 'gsub("&"; "&amp;")' in script
+    assert 'gsub("<"; "&lt;")' in script
+    assert 'gsub(">"; "&gt;")' in script
+    assert "($title | slack_escape)" in script
+    assert '" + $title +' not in script
+    assert "curl --fail-with-body --silent --show-error" in script
+    assert "--header 'Content-Type: application/json'" in script
+    assert '--data "$payload"' in script
+    assert '"$SLACK_WEBHOOK_URL"' in script
+
+
+def test_performance_preflight_requires_executable_native_entrypoints(tmp_path: Path) -> None:
+    trtmc_bench = tmp_path / "trtmc-bench"
+    worker = tmp_path / "trtmc-worker"
+    hf_runner = tmp_path / "hf-runner.py"
+    task_runner = tmp_path / "task-runner.py"
+    for path in (trtmc_bench, worker, hf_runner, task_runner):
+        path.write_text("#!/bin/sh\n")
+    environment = perf_matrix.Environment(
+        name="test",
+        trtmc_bench=trtmc_bench,
+        worker=worker,
+        hf_runner=hf_runner,
+        task_runner=task_runner,
+        results_root=tmp_path / "results",
+        scratch_root=tmp_path / "scratch",
+        bundle_cache=tmp_path / "bundles",
+        bundle_roots=(),
+        runtime_root=tmp_path / "runtime",
+        bundle_retention="retain",
+        local_files_only=True,
+        timeout_seconds=1,
+        references={},
+    )
+
+    with pytest.raises(perf_matrix.PerfMatrixError, match="trtmc-bench is not executable"):
+        perf_matrix.preflight([], environment, require_runtime=False)
+
+    trtmc_bench.chmod(0o755)
+    assert perf_matrix.preflight([], environment, require_runtime=False) == []
+
+
+def test_dev_images_install_the_pinned_requirements_without_deleted_docs() -> None:
+    repository = Path(__file__).resolve().parents[2]
+    for name in ("Dockerfile.dev.aarch64", "Dockerfile.dev.x86"):
+        source = (repository / name).read_text(encoding="utf-8")
+        assert "COPY community-ci.txt" in source
+        assert "source-build.md" not in source
+
+
+def test_gpu_free_unit_scope_keeps_family_python_in_physical_jobs(tmp_path: Path) -> None:
+    context = RecordingContext(
+        tmp_path,
+        {"TRTMC_CORE_BUILD_DIR": str(tmp_path / "core-build")},
+    )
+
+    UnitTestRunner(context).premerge()
+
+    python_command = context.calls[2][0]
+    assert python_command[:3] == ["python", "-m", "pytest"]
+    assert python_command[3:9] == [
+        "core/builder/tests",
+        "apps/benchmark/trtmc_benchmark/tests",
+        "examples/audio_streaming/test_audio_streaming.py",
+        "examples/models/cosmos3/dual_spark/test_cosmos3_dual_spark_source.py",
+        ("examples/models/nemotron_voicechat/full_duplex/test_voicechat_full_duplex_source.py"),
+        "tools/tests",
+    ]
+    assert "families" not in python_command
+
+    ctest_command = context.calls[5][0]
+    assert ctest_command[-2:] == ["--label-exclude", "gpu"]
+
+    source = inspect.getsource(UnitTestRunner.premerge)
+    assert "TRTMC_PREMERGE_UNIT_SCOPE" not in source
+    assert '"pytest"' in source
+    assert '"not gpu and not trt"' in source
+    assert '"cmake"' in source
+    assert '"ctest"' in source
+    assert '"--target"' not in source
+    assert '"-R"' not in source
+
+    physical = inspect.getsource(E2ERunner._run)
+    assert '"not gpu and not trt"' in physical
+    assert '"test_e2e.py"' in physical
+    assert '"trtmc-{family}-unit-junit.xml"' in physical
+    assert '"gpu or trt"' in physical
+    assert '"pip"' not in physical
+    assert "requirements.txt" not in physical
+
+
+def test_premerge_adds_physical_family_support_tests_without_expanding_runtime_scope(
+    tmp_path: Path,
+) -> None:
+    support_paths = [
+        "families/zeta/tests/test_support.py",
+        "families/alpha/tests/test_support.py",
+    ]
+    excluded_paths = [
+        "families/alpha/tests/test_runtime.py",
+        "families/alpha/tests/test_unknown.py",
+        "families/alpha/tests/gpu/test_support.py",
+        "families/alpha/test_support.py",
+        "other/tests/test_support.py",
+    ]
+    for name in (*support_paths, *excluded_paths):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# Discovery fixture; not a runtime test.\n", encoding="utf-8")
+    # A directory with the matching basename is not a test file.
+    (tmp_path / "families/empty/tests/test_support.py").mkdir(parents=True)
+    context = RecordingContext(tmp_path, {"TRTMC_CORE_BUILD_DIR": str(tmp_path / "core-build")})
+    runner = UnitTestRunner(context)
+    runner.premerge()
+    python_commands = [command for command, _ in context.calls if command[:3] == ["python", "-m", "pytest"]]
+    assert len(python_commands) == 1
+    command = python_commands[0]
+    assert command[9:11] == sorted(support_paths)
+    assert all(name not in command for name in excluded_paths)
+    assert "families/empty/tests/test_support.py" not in command
+    assert "families" not in command
+    assert command[command.index("-m", 3) + 1] == "not gpu and not trt"
+
+    new_path = tmp_path / "families/new_owner/tests/test_support.py"
+    new_path.parent.mkdir(parents=True)
+    new_path.write_text("# A new family is discovered without editing CI lists.\n", encoding="utf-8")
+    runner.premerge()
+    python_commands = [command for command, _ in context.calls if command[:3] == ["python", "-m", "pytest"]]
+    assert len(python_commands) == 2  # Still exactly one pytest invocation per premerge.
+    assert python_commands[1][9:12] == sorted([*support_paths, str(new_path.relative_to(tmp_path))])
+    assert python_commands[1][python_commands[1].index("-m", 3) + 1] == "not gpu and not trt"
+
+
+def test_docker_ensure_builds_the_current_dockerfile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    github_env = tmp_path / "github-env"
+    manager = DockerImageManager(
+        tmp_path,
+        {"TRTMC_CI_IMAGE": "trtmc:test", "GITHUB_ENV": str(github_env)},
+    )
+    commands = []
+    monkeypatch.setattr(
+        manager.commands,
+        "run",
+        lambda command, **_kwargs: commands.append(command) or SimpleNamespace(returncode=0),
+    )
+
+    assert manager.ensure() == "trtmc:test"
+    assert commands == [["docker", "build", "--file", "Dockerfile", "--tag", "trtmc:test", "."]]
+    assert github_env.read_text() == "TRTMC_CI_IMAGE=trtmc:test\n"
+
+
+def test_container_does_not_chmod_the_shared_workspace() -> None:
+    source = Path(inspect.getsourcefile(CiContainer)).read_text()
+    assert '"chmod"' not in source
+
+
+def test_trusted_container_mounts_hugging_face_caches_read_only(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    cache = tmp_path / "cache"
+    nested_cache = cache / "hub"
+    modules_cache = tmp_path / "modules"
+    runtime = tmp_path / "runtime"
+    model = tmp_path / "model"
+    for path in (workspace, nested_cache, modules_cache, runtime, model):
+        path.mkdir(parents=True)
+    container = CiContainer(
+        {
+            "TRTMC_CI_WORKSPACE": str(workspace),
+            "TRTMC_CI_IMAGE": "trtmc:test",
+            "TRTMC_CI_CONTAINER_NAME": "trtmc-test",
+            "HF_HOME": str(cache),
+            "HF_HUB_CACHE": str(nested_cache),
+            "HUGGINGFACE_HUB_CACHE": str(cache),
+            "HF_MODULES_CACHE": str(modules_cache),
+            "TRTMC_RUNTIME_ROOT": str(runtime),
+            "TRTMC_ALPHA_MODEL_DIR": str(model),
+        }
+    )
+
+    _options, mounts = container._runtime_boundary()
+    specifications = set(mounts[1::2])
+
+    assert f"{cache}:{cache}:ro" in specifications
+    assert f"{modules_cache}:{modules_cache}" in specifications
+    assert f"{nested_cache}:{nested_cache}" not in specifications
+    assert f"{runtime}:{runtime}" in specifications
+    assert f"{model}:{model}" in specifications
+    assert not any(
+        specification.startswith(f"{cache}:{cache}") and not specification.endswith(":ro")
+        for specification in specifications
+    )
+
+
+def test_workspace_local_hub_state_uses_the_workspace_mount(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    hub = tmp_path / "hub"
+    workspace.mkdir()
+    hub.mkdir()
+    container = CiContainer(
+        {
+            "TRTMC_CI_WORKSPACE": str(workspace),
+            "TRTMC_CI_IMAGE": "trtmc:test",
+            "HF_HOME": str(workspace / ".ci/hf-home"),
+            "HF_HUB_CACHE": str(hub),
+            "HUGGINGFACE_HUB_CACHE": str(hub),
+            "HF_MODULES_CACHE": str(workspace / ".ci/hf-modules"),
+        }
+    )
+    (workspace / ".ci/hf-home").mkdir(parents=True)
+    (workspace / ".ci/hf-modules").mkdir(parents=True)
+
+    _options, mounts = container._runtime_boundary()
+
+    assert mounts == ["-v", f"{hub}:{hub}:ro"]
+
+
+def test_source_archive_carries_base_and_family_requirements(tmp_path: Path) -> None:
+    (tmp_path / "requirements").mkdir()
+    (tmp_path / "requirements/base.txt").write_text("build\n")
+    family = tmp_path / "families/alpha"
+    family.mkdir(parents=True)
+    (family / "model.py").write_text("def build(request, writer): pass\n")
+    (family / "requirements.txt").write_text("family-dependency\n")
+    archive_path = tmp_path / "package.tar.gz"
+
+    def write_archive(paths: tuple[str, ...]) -> None:
+        with tarfile.open(archive_path, "w:gz") as archive:
+            for path in paths:
+                payload = b"content\n"
+                member = tarfile.TarInfo(f"package-0.1/{path}")
+                member.size = len(payload)
+                archive.addfile(member, io.BytesIO(payload))
+
+    write_archive(("requirements/base.txt",))
+    with pytest.raises(CiError, match="dependency declarations are missing"):
+        SourceArchiveValidator(CiContext(tmp_path, {})).validate([archive_path])
+
+    write_archive(("requirements/base.txt", "families/alpha/requirements.txt"))
+    SourceArchiveValidator(CiContext(tmp_path, {})).validate([archive_path])
+
+
+@pytest.mark.parametrize("executor", ["python", "native"])
+def test_wheel_validation_requires_exact_new_payload(tmp_path: Path, executor: str) -> None:
+    family_names = ("alpha", "beta", "gamma")
+    for family in family_names:
+        root = tmp_path / "families" / family
+        root.mkdir(parents=True)
+        (root / "model.py").write_text("def build(request, writer): pass\n")
+    wheel = tmp_path / "package.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("tensorrt_model_connect/__init__.py", "")
+        archive.writestr("tensorrt_model_connect/__main__.py", "def main(): pass\n")
+        archive.writestr("trtmc_benchmark/__init__.py", "")
+        server_source = tmp_path / "apps/server/python/trtmc_server/__init__.py"
+        server_source.parent.mkdir(parents=True)
+        server_source.write_text("")
+        archive.writestr("trtmc_server/__init__.py", "")
+        archive.writestr("families/__init__.py", "")
+        archive.writestr("tensorrt_model_connect/bin/trtmc", "")
+        archive.writestr("tensorrt_model_connect/bin/trtmc-server", "")
+        archive.writestr("tensorrt_model_connect/bin/trtmc_benchmark_worker", "")
+        archive.writestr("tensorrt_model_connect/bin/trtmc_dataset_benchmark", "")
+        archive.writestr("tensorrt_model_connect/bin/libtrtmc_core.so", "")
+        archive.writestr("tensorrt_model_connect/bin/libtrtmc_runtime.so", "")
+        archive.writestr("tensorrt_model_connect/bin/libtrtmc_c.so", "")
+        archive.writestr("tensorrt_model_connect/bin/libtrtmc_c.so.1", "")
+        archive.writestr("tensorrt_model_connect/bin/libtrtmc_backend_trt.so", "")
+        archive.writestr("tensorrt_model_connect/bin/libtrtmc_byok_tvm_ffi.so", "")
+        archive.writestr(
+            "package-0.1.dist-info/entry_points.txt",
+            "[console_scripts]\ntrtmc = tensorrt_model_connect.__main__:main\n"
+            "trtmc-bench = trtmc_benchmark.cli:main\n"
+            "trtmc-server = trtmc_server.cli:main\n",
+        )
+        archive.writestr(
+            "package-0.1.dist-info/METADATA",
+            "Metadata-Version: 2.4\n"
+            "Name: package\n"
+            "Version: 0.1\n"
+            "Provides-Extra: cutedsl\n"
+            "Provides-Extra: serve\n"
+            "Provides-Extra: test\n",
+        )
+        for name in ("trtmc.h", "trtmc.hpp"):
+            archive.writestr(f"tensorrt_model_connect/include/trtmc/{name}", "")
+        archive.writestr("tensorrt_model_connect/include/trtmc/runtime/span.h", "")
+        for name in ("trtmcConfig.cmake", "trtmcConfigVersion.cmake", "trtmcTargets.cmake"):
+            archive.writestr(f"tensorrt_model_connect/share/cmake/trtmc/{name}", "")
+        for family in family_names:
+            archive.writestr(
+                f"families/{family}/model.py",
+                (tmp_path / "families" / family / "model.py").read_bytes(),
+            )
+            archive.writestr(f"tensorrt_model_connect/bin/libtrtmc_model_{family}.so", "")
+
+    WheelArchiveValidator(CiContext(tmp_path, {})).validate([wheel])
+
+    for missing_name, message in (
+        ("tensorrt_model_connect/bin/libtrtmc_c.so.1", "native package is missing"),
+        ("tensorrt_model_connect/include/trtmc/trtmc.hpp", "public SDK is missing"),
+        ("tensorrt_model_connect/share/cmake/trtmc/trtmcTargets.cmake", "public SDK is missing"),
+        ("tensorrt_model_connect/__main__.py", "console launcher is missing"),
+        ("package-0.1.dist-info/entry_points.txt", "console entrypoints are missing"),
+    ):
+        missing_wheel = tmp_path / "missing.whl"
+        with zipfile.ZipFile(wheel) as source, zipfile.ZipFile(missing_wheel, "w") as output:
+            for entry in source.infolist():
+                if entry.filename != missing_name:
+                    output.writestr(entry, source.read(entry.filename))
+        with pytest.raises(CiError, match=message):
+            WheelArchiveValidator(CiContext(tmp_path, {})).validate([missing_wheel])
+
+    for name, payload, message in (
+        ("package-0.1.data/scripts/trtmc", "native", "must not be duplicated"),
+        ("package-0.1.data/scripts/libtrtmc_c.so.1", "library", "must not be duplicated"),
+        ("package-0.1.dist-info/entry_points.txt",
+         "[console_scripts]\ntrtmc-bench = trtmc_benchmark.cli:main\n",
+         "trtmc console entrypoint is missing"),
+        ("package-0.1.dist-info/entry_points.txt",
+         "[console_scripts]\ntrtmc = other_module:main\n"
+         "trtmc-bench = trtmc_benchmark.cli:main\n", "trtmc console entrypoint is missing"),
+    ):
+        invalid = tmp_path / "invalid-entrypoint.whl"
+        with zipfile.ZipFile(wheel) as source, zipfile.ZipFile(invalid, "w") as output:
+            for entry in source.infolist():
+                if entry.filename != name:
+                    output.writestr(entry, source.read(entry.filename))
+            output.writestr(name, payload)
+        with pytest.raises(CiError, match=message):
+            WheelArchiveValidator(CiContext(tmp_path, {})).validate([invalid])
+
+    typed_header = tmp_path / "core/api/include/trtmc/tasks/image.h"
+    typed_header.parent.mkdir(parents=True)
+    typed_header.write_text("/* typed image API */\n")
+    with pytest.raises(CiError, match="public SDK is missing"):
+        WheelArchiveValidator(CiContext(tmp_path, {})).validate([wheel])
+    with zipfile.ZipFile(wheel, "a") as archive:
+        archive.writestr(
+            "tensorrt_model_connect/include/trtmc/tasks/image.h", typed_header.read_bytes()
+        )
+
+    corrupt = tmp_path / "corrupt.whl"
+    with zipfile.ZipFile(wheel) as source, zipfile.ZipFile(corrupt, "w") as output:
+        for entry in source.infolist():
+            payload = source.read(entry.filename)
+            if entry.filename == "families/alpha/model.py":
+                payload = b"def build(request, writer):\n    raise RuntimeError('corrupt')\n"
+            output.writestr(entry, payload)
+    with pytest.raises(CiError, match="family Python files differ from Source"):
+        WheelArchiveValidator(CiContext(tmp_path, {})).validate([corrupt])
+
+    helper = tmp_path / "families/alpha/helper.py"
+    helper.write_text("VALUE = 1\n")
+    with pytest.raises(CiError, match="family Python files are missing"):
+        WheelArchiveValidator(CiContext(tmp_path, {})).validate([wheel])
+    helper.unlink()
+
+    requirements = tmp_path / "families/alpha/requirements.txt"
+    requirements.write_text("family-dependency\n")
+    with pytest.raises(CiError, match="family build data is missing"):
+        WheelArchiveValidator(CiContext(tmp_path, {})).validate([wheel])
+    with zipfile.ZipFile(wheel, "a") as archive:
+        archive.writestr("families/alpha/requirements.txt", "family-dependency\n")
+
+    declaration = tmp_path / "families/alpha/cli.json"
+    declaration.write_text(json.dumps({"version": 1, "commands": [{"executor": executor}]}))
+    with zipfile.ZipFile(wheel, "a") as archive:
+        archive.writestr("families/alpha/cli.json", declaration.read_bytes())
+    with pytest.raises(CiError, match="family CLI declaration is missing"):
+        WheelArchiveValidator(CiContext(tmp_path, {})).validate([wheel])
+    with zipfile.ZipFile(wheel, "a") as archive:
+        archive.writestr(
+            "tensorrt_model_connect/bin/families/alpha/cli.json", declaration.read_bytes()
+        )
+    if executor == "native":
+        with pytest.raises(CiError, match="family CLI adapter set does not match"):
+            WheelArchiveValidator(CiContext(tmp_path, {})).validate([wheel])
+        with zipfile.ZipFile(wheel, "a") as archive:
+            archive.writestr("tensorrt_model_connect/bin/libtrtmc_cli_alpha.so", "adapter")
+    WheelArchiveValidator(CiContext(tmp_path, {})).validate([wheel])
+    unexpected_cli = tmp_path / "unexpected-cli.whl"
+    shutil.copyfile(wheel, unexpected_cli)
+    with zipfile.ZipFile(unexpected_cli, "a") as archive:
+        archive.writestr("tensorrt_model_connect/bin/libtrtmc_cli_beta.so", "unexpected")
+    with pytest.raises(CiError, match="family CLI adapter set does not match"):
+        WheelArchiveValidator(CiContext(tmp_path, {})).validate([unexpected_cli])
+    for changed in ("families/alpha/cli.json", "tensorrt_model_connect/bin/families/alpha/cli.json"):
+        corrupt_cli = tmp_path / "corrupt-cli.whl"
+        with zipfile.ZipFile(wheel) as source, zipfile.ZipFile(corrupt_cli, "w") as output:
+            for entry in source.infolist():
+                payload = b'{"version":2}' if entry.filename == changed else source.read(entry)
+                output.writestr(entry, payload)
+        with pytest.raises(CiError, match="family CLI declaration differs from Source"):
+            WheelArchiveValidator(CiContext(tmp_path, {})).validate([corrupt_cli])
+
+    benchmark_asset = tmp_path / "families/alpha/tests/data/input.txt"
+    benchmark_asset.parent.mkdir(parents=True)
+    benchmark_asset.write_text("input\n")
+    with pytest.raises(CiError, match="benchmark catalog is missing"):
+        WheelArchiveValidator(CiContext(tmp_path, {})).validate([wheel])
+    benchmark_asset.unlink()
+
+    with zipfile.ZipFile(wheel, "a") as archive:
+        archive.writestr("tensorrt_model_connect/bin/libtrtmc_backend_trt_rtx.so", "")
+    WheelArchiveValidator(CiContext(tmp_path, {})).validate([wheel])
+
+    with zipfile.ZipFile(wheel, "a") as archive:
+        archive.writestr("tensorrt_model_connect/bin/libtrtmc_backend_trt_11_1.so", "")
+    with pytest.raises(CiError, match="unaliased"):
+        WheelArchiveValidator(CiContext(tmp_path, {})).validate([wheel])
+
+
+@pytest.mark.parametrize("library", ["libtrtmc_model_beta.so", "libtrtmc_cli_alpha.so"])
+def test_native_validation_rejects_unresolved_family_symbols(tmp_path: Path, library: str) -> None:
+    def compile_library(name: str, source: str) -> None:
+        source_path = tmp_path / f"{name}.c"
+        source_path.write_text(source)
+        subprocess.run(
+            ["cc", "-shared", "-fPIC", source_path, "-o", tmp_path / name],
+            check=True,
+        )
+
+    compile_library("libtrtmc_core.so", "void core_symbol(void) {}\n")
+    compile_library("libtrtmc_runtime.so", "void runtime_symbol(void) {}\n")
+    compile_library("libtrtmc_c.so.1", "void api_symbol(void) {}\n")
+    compile_library("libtrtmc_backend_trt.so", "void backend_symbol(void) {}\n")
+    compile_library("libtrtmc_byok_tvm_ffi.so", "void byok_symbol(void) {}\n")
+    compile_library("libtrtmc_model_alpha.so", "void alpha_symbol(void) {}\n")
+    compile_library("libtrtmc_model_beta.so", "void beta_symbol(void) {}\n")
+    compile_library("libtrtmc_cli_alpha.so", "void cli_symbol(void) {}\n")
+    declaration = tmp_path / "families/alpha/cli.json"
+    declaration.parent.mkdir(parents=True)
+    declaration.write_text('{"version":1,"commands":[{"executor":"native"}]}')
+    load_native_libraries(tmp_path, ("alpha", "beta"))
+
+    compile_library(
+        library,
+        "extern void missing_symbol(void); void beta_symbol(void) { missing_symbol(); }\n",
+    )
+    with pytest.raises(CiError, match="undefined symbol: missing_symbol"):
+        load_native_libraries(tmp_path, ("alpha", "beta"))
+
+
+def test_sdk_package_component_configuration(tmp_path: Path) -> None:
+    repository = Path(__file__).resolve().parents[2]
+    prefix = tmp_path / "installed"
+    config = prefix / "share/cmake/trtmc"
+    config.mkdir(parents=True)
+    (config / "trtmcTargets.cmake").write_text("add_library(trtmc::c INTERFACE IMPORTED)\n")
+    producer = tmp_path / "producer"
+    producer.mkdir()
+    (producer / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.20)\n"
+        "project(package_config LANGUAGES NONE)\n"
+        "include(CMakePackageConfigHelpers)\n"
+        "configure_package_config_file(\n"
+        f'  "{repository / "cmake/trtmcConfig.cmake.in"}"\n'
+        f'  "{config / "trtmcConfig.cmake"}"\n'
+        "  INSTALL_DESTINATION share/cmake/trtmc)\n"
+    )
+    subprocess.run(
+        ["cmake", "-S", str(producer), "-B", str(tmp_path / "producer-build")],
+        check=True, capture_output=True, text=True,
+    )
+    for component in ("", "sdk", "unknown"):
+        consumer = tmp_path / (component or "default")
+        consumer.mkdir()
+        requested = " COMPONENTS " + component if component else ""
+        (consumer / "CMakeLists.txt").write_text(
+            "cmake_minimum_required(VERSION 3.20)\n"
+            "project(package_consumer LANGUAGES NONE)\n"
+            f"find_package(trtmc CONFIG REQUIRED{requested})\n"
+            "if(NOT TARGET trtmc::c)\n"
+            '  message(FATAL_ERROR "public SDK target missing")\n'
+            "endif()\n"
+        )
+        completed = subprocess.run(
+            ["cmake", "-S", str(consumer), "-B", str(consumer / "build"),
+             f"-DCMAKE_PREFIX_PATH={prefix}", "-DCMAKE_DISABLE_FIND_PACKAGE_CUDAToolkit=TRUE"],
+            check=False, capture_output=True, text=True,
+        )
+        if component == "unknown":
+            assert completed.returncode != 0
+        else:
+            assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    "broken", (None, "header", "cuda_dependency", "library", "cpp_wrapper", "cpp_runtime")
+)
+def test_installed_sdk_builds_plain_c_and_cpp_without_cuda(
+    tmp_path: Path, broken: str | None
+) -> None:
+    prefix = tmp_path / "installed"
+    include = prefix / "include/trtmc"
+    config = prefix / "share/cmake/trtmc"
+    include.mkdir(parents=True)
+    config.mkdir(parents=True)
+    (prefix / "bin").mkdir()
+    repository = Path(__file__).resolve().parents[2]
+    shutil.copytree(repository / "core/api/include", prefix / "include", dirs_exist_ok=True)
+    (include / "runtime").mkdir()
+    shutil.copy2(
+        repository / "core/runtime/include/trtmc/runtime/span.h", include / "runtime/span.h"
+    )
+    if broken == "header":
+        (include / "trtmc.hpp").unlink()
+    elif broken == "cpp_wrapper":
+        (include / "trtmc.hpp").write_text("#include <trtmc/trtmc.h>\n")
+    version = "{0, 0}" if broken == "cpp_runtime" else '{"fixture", 7}'
+    library_source = tmp_path / "api.c"
+    library_source.write_text(
+        "#include <trtmc/trtmc.h>\n"
+        f"static trtmc_string_view version(void) {{ return (trtmc_string_view){version}; }}\n"
+        "trtmc_status trtmc_get_api(uint32_t major, uint32_t minor, const trtmc_core_api_v1 **out) {\n"
+        "    static trtmc_core_api_v1 table = {0};\n"
+        "    table.header.major = 1; table.header.minor = 0;\n"
+        "    table.header.byte_size = sizeof(table); table.runtime_version = version;\n"
+        "    (void)major; (void)minor; *out = &table; return TRTMC_OK;\n"
+        "}\n"
+    )
+    if broken != "library":
+        subprocess.run(
+            [
+                "cc",
+                "-shared",
+                "-fPIC",
+                "-I",
+                prefix / "include",
+                library_source,
+                "-Wl,-soname,libtrtmc_c.so.1",
+                "-o",
+                prefix / "bin/libtrtmc_c.so.1",
+            ],
+            check=True,
+        )
+    (config / "trtmcConfig.cmake").write_text(
+        ("find_package(CUDAToolkit REQUIRED)\n" if broken == "cuda_dependency" else "")
+        + 'get_filename_component(_prefix "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)\n'
+        "add_library(trtmc::c SHARED IMPORTED)\n"
+        "set_target_properties(trtmc::c PROPERTIES\n"
+        '  IMPORTED_LOCATION "${_prefix}/bin/libtrtmc_c.so.1"\n'
+        '  INTERFACE_INCLUDE_DIRECTORIES "${_prefix}/include")\n'
+    )
+    if broken:
+        with pytest.raises(CiError, match="installed public SDK consumer failed"):
+            validate_installed_sdk(prefix)
+    else:
+        validate_installed_sdk(prefix)

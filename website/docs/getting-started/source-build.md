@@ -6,6 +6,80 @@ description: Build the CLI, TensorRT backend, and Qwen DSO for one selected GPU.
 Use this path on Linux x86_64 or aarch64 for the first Qwen inference from
 source. Start at the repository root.
 
+## Automated environment preparation
+
+The repository-local `apps/devtoolkit` Python API selects
+`Dockerfile.dev.x86` or `Dockerfile.dev.aarch64` from the host architecture,
+runs the direct development-image build, starts a persistent container for the
+current checkout, and optionally installs one family's declared dependencies:
+
+```python
+from pathlib import Path
+import subprocess
+import sys
+
+repo = Path.cwd()
+sys.path.insert(0, str(repo / "apps" / "devtoolkit"))
+
+from trtmc_devtoolkit import DevToolkit, DockerTargetPolicy
+
+gpu = "0"
+sm = subprocess.run(
+    [
+        "nvidia-smi",
+        "-i",
+        gpu,
+        "--query-gpu=compute_cap",
+        "--format=csv,noheader,nounits",
+    ],
+    check=True,
+    capture_output=True,
+    text=True,
+).stdout.strip().replace(".", "")
+
+toolkit = DevToolkit.from_checkout(repo)
+environment = toolkit.prepare_docker(
+    family="qwen",
+    gpu=gpu,
+    environment={"TRTMC_SM": sm},
+    policy=DockerTargetPolicy.ENSURE,
+)
+print(" ".join(environment.command("bash")))
+```
+
+Runnable end-to-end examples are available for both supported execution paths:
+
+```bash
+# Build in a checkout-owned development container.
+python3 apps/devtoolkit/examples/docker_build.py --gpu 0
+
+# Build directly on a prepared host interpreter/toolchain.
+python3 apps/devtoolkit/examples/local_build.py \
+  --python /path/to/python3.12 \
+  --tensorrt 11.0.0.114
+```
+
+The local path expects the generic native build prerequisites documented in
+`apps/devtoolkit/README.md`; use its `--cmake-python` and
+`--cmake-prefix-path` options when those dependencies live in isolated
+prefixes.
+
+The toolkit reuses a container only when its checkout-owned configuration still
+matches. A foreign name collision or configuration drift fails without removing
+or replacing the container. Unknown host architectures fail before Docker is
+invoked. This preparation call remains separate from the toolkit's optional
+`resolve`, `provision`, `build`, and `run` capabilities; use
+`environment.execution_target()` to pass the prepared container into that
+evidence-producing path. Each development Dockerfile's first `FROM` is its
+base-image pin; repository CI continues to use the root `Dockerfile`. Optional
+Python dependencies remain in `families/<family>/requirements.txt`. See
+`apps/devtoolkit/README.md` for lifecycle policies, immutable environment
+identity and receipts, managed toolchain catalogs, and the explicit
+existing-interpreter local path.
+
+The manual commands below remain the direct source-build path and show the
+operations performed by development mode.
+
 ## 1. Select the GPU and start the container
 
 Change only `GPU`. The commands derive the SM used by CMake and select the
@@ -55,24 +129,36 @@ TRTMC_BUILD_DIR="build-sm${TRTMC_SM}"
 cmake -S . -B "$TRTMC_BUILD_DIR" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_ARCHITECTURES="${TRTMC_SM}-real" \
-  -DTRTMC_BUILD_BACKEND_TRT=ON \
   -DTRTMC_BUILD_BACKEND_RTX=OFF \
   -DTRTMC_BUILD_TESTS=OFF \
-  -DTRTMC_BUILD_BENCHMARKS=OFF \
-  -DTRTMC_ENABLE_LIBTORCH_MULTINOMIAL=OFF
+  -DTRTMC_BUILD_EXAMPLES=OFF
 
 cmake --build "$TRTMC_BUILD_DIR" --parallel "$(nproc)" --target \
   trtmc \
+  trtmc-server \
   trtmc_backend_trt \
   trtmc_model_qwen
 
-export TRTMC_MODEL_PLUGIN_DIR="$TRTMC_BUILD_DIR/models"
 export PATH="$PWD/$TRTMC_BUILD_DIR:$PATH"
 ```
 
+To run the optional text server from this build, install its Python control
+plane dependencies with `python -m pip install -e '.[serve]' -C py-only=true`.
+
+TensorRT-RTX is an explicit optional build. When its SDK is installed, enable
+only its backend DSO with the exact include and library directories:
+
+```bash
+cmake -S . -B "$TRTMC_BUILD_DIR" \
+  -DTRTMC_BUILD_BACKEND_RTX=ON \
+  -DTRTMC_RTX_INCLUDE_DIR=/absolute/tensorrt-rtx/include \
+  -DTRTMC_RTX_LIBRARY_DIR=/absolute/tensorrt-rtx/lib
+cmake --build "$TRTMC_BUILD_DIR" --target trtmc_backend_rtx
+```
+
 This path skips CI-only Python profiles and unrelated model DSOs. Continue to
-[Quick Start](quick-start.md) in the same container shell. Full-repository and
-advanced backend options belong in the
-[Build System](../architecture/build-system.md) reference.
+[Quick Start](quick-start.md) in the same container shell. Full-repository
+ownership and backend boundaries are documented in the
+[AI-Native Horizontal Scaling Architecture](../architecture/ai-native-horizontal-scaling.md).
 
 {/* Collaborative review anchor: batch 2. */}

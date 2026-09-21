@@ -1,20 +1,14 @@
 # Family-Owned Optimized Runtime Adapter Design Record
 
-Status: Implemented for exact qualified Qwen x Edge-LLM profiles; the former
-A100 qualification runner is not published.
+Status: Historical design record superseded by PR #1093.
 
-:::note Current implementation and support boundary
+:::caution Archived before the family-isolation cutover
 
-This document began as an implementation plan and now preserves the design
-rationale. The current tree contains one Qwen x TensorRT Edge-LLM
-implementation descriptor and three exact Qwen3/A100 SM80/FP16 profiles marked
-`qualified`.
-
-Current selection truth comes from the family-owned `IMPLEMENTATION.toml`,
-profile TOMLs, and their semantic-source digests. Source publishes no A100
-producer descriptor or target-hardware runner. See
-[Model Support](../models-recipes/overview.md). Prose retained from the
-planning phase is not fresh qualification evidence.
+This document preserves rationale for a provider/profile/capsule design that is
+not present after PR #1093. Current platform specialization is implemented by
+complete-network family offload, without an optimized-runtime provider
+registry. Do not treat the profiles, paths, or qualification claims below as
+current evidence. See [Platform Runtime Extensions](../extend/add-optimized-runtime.md).
 
 The current builder also evaluates a family-owned `default_build_route` before
 provider probing. Eligible dense Qwen3 and Llama checkpoints now take that

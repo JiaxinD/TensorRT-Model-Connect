@@ -1,13 +1,12 @@
 # Config Registry — Implementation Status
 
-:::info Historical implementation log — 2026-04-20
+:::caution Archived before the family-isolation cutover
 
 This page preserves the decisions, intermediate commands, and evidence from
-the config-registry implementation loop. It is not a current contributor
-guide, and “next tick” text describes the state at that point in the log.
-Current config behavior is defined by `src/runtime/config/`, model-owned
-runtime schemas, and the CLI parser. Historical paths are identified as such
-where their files were later retired.
+the 2026-04-20 config-registry implementation loop. PR #1093 removed that
+registry and its runtime schemas. It is not a current contributor guide, and
+none of its paths or commands should be copied into new work. See
+[Configuration Boundaries](../extend/add-config-schema.md).
 
 :::
 

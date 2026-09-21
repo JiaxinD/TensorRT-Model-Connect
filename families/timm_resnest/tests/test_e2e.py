@@ -1,0 +1,244 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Direct build, native runtime, and timm reference proof for ResNeSt."""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import subprocess
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from tensorrt_model_connect import BuildRequest, build
+from tools.e2e_evidence import evidence_stage, record_evidence
+
+
+FAMILY = "timm_resnest"
+TEST_ROOT = Path(__file__).resolve().parent
+MANIFEST_ROOT = TEST_ROOT / "manifests"
+
+
+def _cases() -> dict[str, tuple[dict, dict]]:
+    result = {}
+    for path in sorted(MANIFEST_ROOT.glob("*.json")):
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        assert manifest["family"] == FAMILY
+        assert manifest["task"] == "image_to_class_scores"
+        for case in manifest["testcases"]:
+            name = str(case["name"])
+            assert name not in result
+            result[name] = (manifest, case)
+    assert result
+    return result
+
+
+CASES = _cases()
+
+
+def _selection(config) -> set[str]:
+    selected = set()
+    for option in ("--e2e-model", "--e2e-testcase"):
+        for raw in config.getoption(option, default=[]) or []:
+            selected.update(value.strip() for value in str(raw).split(",") if value.strip())
+    models_file = config.getoption("--e2e-models-file", default=None)
+    if models_file:
+        selected.update(
+            line.strip()
+            for line in Path(models_file).read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+    return selected
+
+
+def pytest_generate_tests(metafunc) -> None:
+    if "case_name" not in metafunc.fixturenames:
+        return
+    selected = _selection(metafunc.config)
+    names = [
+        name
+        for name, (manifest, _) in CASES.items()
+        if not selected or selected & {FAMILY, name, manifest["name"]}
+    ]
+    if not selected:
+        names = [
+            pytest.param(
+                name,
+                marks=pytest.mark.skip(reason="real ResNeSt E2E requires explicit selection"),
+                id=name,
+            )
+            for name in names
+        ]
+    metafunc.parametrize("case_name", names)
+
+
+def _required_path(value: str | None, label: str) -> Path:
+    assert value, f"selected ResNeSt E2E requires {label}"
+    path = Path(value)
+    assert path.exists(), f"selected ResNeSt E2E {label} does not exist: {path}"
+    return path
+
+
+def _model_dir(manifest: dict) -> Path:
+    explicit = os.environ.get("TRTMC_TIMM_TIMM_RESNEST_MODEL_DIR")
+    if explicit:
+        return _required_path(explicit, "TRTMC_TIMM_TIMM_RESNEST_MODEL_DIR")
+    from huggingface_hub import snapshot_download
+
+    return Path(
+        snapshot_download(
+            repo_id=manifest["hf_id"],
+            revision=manifest["hf_revision"],
+            local_files_only=True,
+        )
+    )
+
+
+def _asset(case: dict) -> Path:
+    path = TEST_ROOT / str(case["test_image"])
+    assert path.is_file(), f"selected ResNeSt E2E image is missing: {path}"
+    record_evidence("inputs", {"asset": path})
+    return path
+
+
+def _assert_class_metadata(actual: dict, config: dict) -> None:
+    assert actual["score_kind"] == "logit"
+    assert actual["scores"] == actual["logits"]
+    assert len(actual["scores"]) == int(config["num_classes"])
+    assert all(math.isfinite(value) for value in actual["scores"])
+    assert actual["top_class"] == int(np.argmax(actual["scores"]))
+    assert actual["top_score"] == max(actual["scores"])
+    assert actual["vocabulary_id"] == config.get("vocabulary_id", "")
+    assert actual["labels"] == config.get("label_names", [])
+
+
+def _assert_sdk_consumers(
+    runtime_root: Path, bundle: Path, case: dict, model_config: dict, expected: int, tmp_path: Path
+) -> None:
+    import numpy as np
+    from PIL import Image
+
+    native_build = _required_path(os.environ.get("TRTMC_NATIVE_BUILD_DIR"), "TRTMC_NATIVE_BUILD_DIR")
+    image = np.asarray(Image.open(_asset(case)).convert("RGB"), dtype=np.float32)
+    image /= np.float32(255.0)
+    raw_image = tmp_path / "sdk-input.rgb.f32"
+    image.tofile(raw_image)
+    outputs = []
+    env = os.environ.copy()
+    env["LD_LIBRARY_PATH"] = ":".join(
+        value for value in (str(runtime_root), env.get("LD_LIBRARY_PATH", "")) if value
+    )
+    for language in ("c", "cpp"):
+        consumer = native_build / f"test_timm_resnest_sdk_{language}"
+        assert consumer.is_file(), f"build the family-owned SDK consumer: {consumer.name}"
+        completed = subprocess.run(
+            [
+                str(consumer),
+                str(bundle),
+                str(runtime_root),
+                str(raw_image),
+                str(image.shape[0]),
+                str(image.shape[1]),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=int(case.get("runtime_timeout_s", 3600)),
+        )
+        payloads = [json.loads(line) for line in completed.stdout.splitlines() if line.startswith("{")]
+        assert len(payloads) == 1, f"SDK {language} consumer must return one result"
+        actual = payloads[0]
+        record_evidence(f"sdk_{language}", actual)
+        assert actual["task"] == "image_to_class_scores"
+        assert actual["kind"] == "logit" and actual["score_kind"] == 1
+        assert actual["score_count"] == len(actual["scores"]) == int(model_config["num_classes"])
+        assert all(math.isfinite(value) for value in actual["scores"])
+        assert actual["top_class"] == expected
+        assert actual["top_score"] == max(actual["scores"])
+        assert actual["vocabulary_id"] == model_config.get("vocabulary_id", "")
+        assert actual["labels"] == model_config.get("label_names", [])
+        outputs.append(actual)
+    # Both SDKs receive identical pixels. The original CLI test above keeps
+    # its JPEG decoder and the unchanged top-1 timm oracle.
+    assert outputs[0] == outputs[1]
+
+
+def test_official_checkpoint_e2e(case_name: str, tmp_path: Path) -> None:
+    manifest, case = CASES[case_name]
+    record_evidence("inputs", {"manifest": manifest, "case": case})
+    record_evidence("thresholds", {"top1_match": True})
+    binary = _required_path(os.environ.get("TRTMC_BINARY"), "TRTMC_BINARY")
+    runtime_root = _required_path(os.environ.get("TRTMC_RUNTIME_ROOT"), "TRTMC_RUNTIME_ROOT")
+    assert (runtime_root / "libtrtmc_backend_trt.so").is_file()
+    assert (runtime_root / f"libtrtmc_model_{FAMILY}.so").is_file()
+    model_dir = _model_dir(manifest)
+    record_evidence(
+        "checkpoint",
+        {"model_dir": str(model_dir), "hf_id": manifest["hf_id"], "hf_revision": manifest["hf_revision"]},
+    )
+    bundle = tmp_path / manifest["bundle"]
+    with evidence_stage("build"):
+        build(
+            BuildRequest(
+                model_dir=model_dir,
+                output_path=bundle,
+                family=FAMILY,
+                task=manifest["task"],
+                precision=manifest["precision"],
+                max_sequence_length=int(manifest["max_sequence_length"]),
+                tensor_parallel_size=int(manifest["tensor_parallel_size"]),
+            )
+        )
+    with evidence_stage("native"):
+        completed = subprocess.run(
+            [
+                str(binary),
+                "classify",
+                str(bundle),
+                "--runtime-root",
+                str(runtime_root),
+                "--image",
+                str(_asset(case)),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        record_evidence(
+            "native_process",
+            {"argv": completed.args, "stdout": completed.stdout, "stderr": completed.stderr},
+        )
+        actual = json.loads(completed.stdout)
+    record_evidence("native", actual)
+
+    with evidence_stage("reference"):
+        import timm
+        import torch
+        from PIL import Image
+        from timm.data import create_transform, resolve_model_data_config
+
+        config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+        reference = timm.create_model(
+            config["architecture"],
+            pretrained=False,
+            pretrained_cfg=config["pretrained_cfg"],
+            num_classes=int(config["num_classes"]),
+            checkpoint_path=str(model_dir / "model.safetensors"),
+        )
+        reference = reference.to("cuda").eval()
+        transform = create_transform(**resolve_model_data_config(reference), is_training=False)
+        pixels = transform(Image.open(_asset(case)).convert("RGB")).unsqueeze(0).to("cuda")
+        with torch.no_grad():
+            expected = reference(pixels).float().cpu().numpy()
+    record_evidence("reference", {"top_class": int(np.argmax(expected)), "logits": expected})
+    with evidence_stage("compare"):
+        assert int(actual["top_class"]) == int(np.argmax(expected))
+        _assert_class_metadata(actual, config)
+    with evidence_stage("sdk"):
+        _assert_sdk_consumers(runtime_root, bundle, case, config, int(np.argmax(expected)), tmp_path)

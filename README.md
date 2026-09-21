@@ -4,7 +4,7 @@
 
 <p><strong>Deploy supported Hugging Face models for end-to-end TensorRT inference in just two commands.</strong></p>
 
-[Documentation](https://nvidia.github.io/TensorRT-Model-Connect/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Quick Start](https://nvidia.github.io/TensorRT-Model-Connect/getting-started/quick-start)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Model Support](https://nvidia.github.io/TensorRT-Model-Connect/models-recipes/overview)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[API Reference](https://nvidia.github.io/TensorRT-Model-Connect/api/overview)
+[Documentation](https://nvidia.github.io/TensorRT-Model-Connect/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Quick Start](https://nvidia.github.io/TensorRT-Model-Connect/getting-started/quick-start)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Model Support](https://nvidia.github.io/TensorRT-Model-Connect/models-recipes/overview)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[API Reference](https://nvidia.github.io/TensorRT-Model-Connect/api/python-builder)
 
 </div>
 
@@ -28,8 +28,14 @@
 ## 💻 Example Code
 
 ```bash
-trtmc build Qwen/Qwen3-0.6B --max-cache-length 16384 --output qwen3-0.6b.bundle
-trtmc run ./qwen3-0.6b.bundle --prompt "What is the capital of France? Answer in one word." --chat-template --no-thinking
+python -m tensorrt_model_connect build Qwen/Qwen3-0.6B \
+  --max-sequence-length 16384 \
+  --output qwen3-0.6b.bundle
+trtmc run ./qwen3-0.6b.bundle \
+  --runtime-root /opt/trtmc/lib \
+  --prompt "What is the capital of France? Answer in one word." \
+  --use-chat-template true \
+  --enable-thinking false
 # Generated text: Paris
 ```
 
@@ -37,8 +43,16 @@ The same bundle works from
 [C++](https://nvidia.github.io/TensorRT-Model-Connect/api/cpp-api):
 
 ```cpp
-auto pipeline = trtmc::load("./qwen3-0.6b.bundle");
-std::cout << pipeline->generate("What is the capital of France? Answer in one word.").text << '\n';
+#include <iostream>
+#include <stdexcept>
+
+#include <trtmc/runtime/family_loader.h>
+#include <trtmc/task.h>
+
+auto task = trtmc::load_task("./qwen3-0.6b.bundle", "/opt/trtmc/lib");
+auto* text = dynamic_cast<trtmc::ITextGeneration*>(task.get());
+if (text == nullptr) throw std::runtime_error("unexpected task");
+std::cout << text->generate("What is the capital of France? Answer in one word.").text << '\n';
 ```
 
 <a id="get-started-and-stay-tuned"></a>
@@ -90,10 +104,10 @@ welcome through the [issue chooser](https://github.com/NVIDIA/TensorRT-Model-Con
 - Use model-family-owned builders, runtime pipelines, helper kernels, and
   validation contracts as concrete blueprints for modification and
   customization.
-- Keep native TensorRT execution and exactly qualified optimized-runtime
-  dispatch behind the same task-oriented application boundary.
+- Keep native TensorRT and optional TensorRT-RTX execution behind the same
+  task-oriented application boundary.
 
-Read the [Project Overview](https://nvidia.github.io/TensorRT-Model-Connect/getting-started/project-overview)
+Read the [Architecture Overview](https://nvidia.github.io/TensorRT-Model-Connect/architecture/ai-native-horizontal-scaling)
 for the architecture boundary, intended users, and comparison with other
 TensorRT integration paths.
 
@@ -130,15 +144,15 @@ Want to know more? See the
 | Goal | Start here |
 | --- | --- |
 | Complete the first Qwen inference | [Quick Start](https://nvidia.github.io/TensorRT-Model-Connect/getting-started/quick-start) |
-| Select and install an environment | [Get Started](https://nvidia.github.io/TensorRT-Model-Connect/getting-started/overview) |
+| Select and install an environment | [Quick Start](https://nvidia.github.io/TensorRT-Model-Connect/getting-started/quick-start) |
 | Compile the CLI, backends, and model DSOs | [Build from Source](https://nvidia.github.io/TensorRT-Model-Connect/getting-started/source-build) |
 | Find an exact checkpoint or model recipe | [Models & Recipes](https://nvidia.github.io/TensorRT-Model-Connect/models-recipes/overview) |
-| Look up task and feature workflows | [User Guides](https://nvidia.github.io/TensorRT-Model-Connect/user-guides/overview) |
-| Learn through progressive labs and self-checks | [Tutorials](https://nvidia.github.io/TensorRT-Model-Connect/learning-path) |
-| Look up CLI, Python, C++, bundle, and config contracts | [Reference](https://nvidia.github.io/TensorRT-Model-Connect/api/overview) |
-| Understand architecture or extend the repository | [Developer Guide](https://nvidia.github.io/TensorRT-Model-Connect/developer-guide/overview) |
-| Review compatibility, limitations, and lifecycle policy | [Release & Support](https://nvidia.github.io/TensorRT-Model-Connect/release-support/overview) |
-| Give a coding agent repository-specific guidance | [AI & Agent Guide](https://nvidia.github.io/TensorRT-Model-Connect/agent-guide) |
+| Look up task and runtime contracts | [C++ Task API](https://nvidia.github.io/TensorRT-Model-Connect/api/cpp-api) |
+| Understand the bundle contract | [Bundle Format](https://nvidia.github.io/TensorRT-Model-Connect/architecture/bundle-format) |
+| Understand the source layout | [Source Layout](https://nvidia.github.io/TensorRT-Model-Connect/reference/source-layout) |
+| Add an isolated model family | [Add a Model Family](https://nvidia.github.io/TensorRT-Model-Connect/extend/add-model-family) |
+| Understand the dependency boundaries | [Architecture](https://nvidia.github.io/TensorRT-Model-Connect/architecture/ai-native-horizontal-scaling) |
+| Contribute to the project | [Contributing](https://nvidia.github.io/TensorRT-Model-Connect/extend/contributing) |
 
 <a id="supported-models"></a>
 
@@ -146,17 +160,15 @@ Want to know more? See the
 
 The [Supported Models](https://nvidia.github.io/TensorRT-Model-Connect/models-recipes/overview)
 page is the single source of truth for exact checkpoints, Hugging Face
-architectures, TRTMC profiles, precision, quantization, optimized-runtime
-dispatch, configuration, and qualification evidence.
+architectures, family-owned tasks, precision, quantization, topology, and
+validation evidence.
 
 <a id="get-help-and-file-an-issue"></a>
 
 ## 🛟 Get help and file an issue
 
-Start with [Get Help and File an Issue](https://nvidia.github.io/TensorRT-Model-Connect/release-support/get-help)
-to choose the right support route and collect the model, environment, command,
-and log details maintainers need. Use the
-[issue chooser](https://github.com/NVIDIA/TensorRT-Model-Connect/issues/new/choose)
+Collect the model, environment, command, and log details maintainers need, then
+use the [issue chooser](https://github.com/NVIDIA/TensorRT-Model-Connect/issues/new/choose)
 for usage questions, reproducible bugs, feature or model requests, and
 documentation corrections.
 

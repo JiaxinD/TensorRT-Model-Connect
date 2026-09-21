@@ -1,0 +1,215 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include "families/bark/runtime/sampler.h"
+
+#include "families/bark/runtime/sparse_multinomial_kernel.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cuda_runtime.h>
+#include <numeric>
+#include <stdexcept>
+#include <vector>
+
+namespace trtmc {
+
+namespace {
+
+struct FilteredDistribution {
+    std::vector<int32_t> indices;
+    std::vector<float> probabilities;
+    int32_t rows{0};
+    int32_t vocab_size{0};
+    int32_t keep{0};
+};
+
+FilteredDistribution build_filtered_distributions(const float* logits, int32_t rows,
+                                                  int32_t row_stride, int32_t vocab_size,
+                                                  float temperature, int32_t top_k) {
+    const int32_t keep = std::max(1, std::min(top_k, vocab_size));
+    FilteredDistribution distribution;
+    distribution.rows = rows;
+    distribution.vocab_size = vocab_size;
+    distribution.keep = keep;
+    distribution.indices.resize(static_cast<std::size_t>(rows) * keep);
+    distribution.probabilities.resize(static_cast<std::size_t>(rows) * keep);
+    const float safe_temperature = std::max(temperature, 1e-6F);
+    std::vector<int32_t> row_indices(static_cast<std::size_t>(vocab_size));
+    for (int32_t row = 0; row < rows; ++row) {
+        const float* row_logits = logits + static_cast<std::size_t>(row) * row_stride;
+        std::iota(row_indices.begin(), row_indices.end(), 0);
+        if (keep < vocab_size) {
+            std::partial_sort(row_indices.begin(), row_indices.begin() + keep, row_indices.end(),
+                              [row_logits](int32_t lhs, int32_t rhs) {
+                                  return row_logits[lhs] > row_logits[rhs];
+                              });
+        }
+
+        const int32_t max_token = *std::max_element(
+            row_indices.begin(), row_indices.begin() + keep,
+            [row_logits](int32_t lhs, int32_t rhs) { return row_logits[lhs] < row_logits[rhs]; });
+        const float normalizer_logit = row_logits[max_token];
+        const std::size_t output_offset = static_cast<std::size_t>(row) * keep;
+        float normalizer = 0.0F;
+        for (int32_t index = 0; index < keep; ++index) {
+            const int32_t token_id = row_indices[static_cast<std::size_t>(index)];
+            const float probability =
+                std::exp((row_logits[token_id] - normalizer_logit) / safe_temperature);
+            distribution.indices[output_offset + index] = token_id;
+            distribution.probabilities[output_offset + index] = probability;
+            normalizer += probability;
+        }
+        for (int32_t index = 0; index < keep; ++index) {
+            distribution.probabilities[output_offset + index] /= normalizer;
+        }
+    }
+    return distribution;
+}
+
+template <typename T>
+class DeviceBuffer {
+  public:
+    DeviceBuffer() = default;
+    ~DeviceBuffer() { cudaFree(ptr_); }
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+
+    T* get() const { return ptr_; }
+
+    void reset(T* pointer) {
+        cudaFree(ptr_);
+        ptr_ = pointer;
+    }
+
+  private:
+    T* ptr_{nullptr};
+};
+
+} // namespace
+
+class BarkSampler::Impl {
+  public:
+    explicit Impl(void* stream) : stream_(static_cast<cudaStream_t>(stream)) {
+        ensure_device_buffers(1, 1);
+    }
+
+    void reset(int64_t seed) {
+        if (seed < 0) {
+            return;
+        }
+        seed_ = static_cast<uint64_t>(seed);
+        current_offset_ = 0;
+    }
+
+    int32_t sample(const float* logits, int32_t vocab_size, float temperature, int32_t top_k) {
+        const std::vector<int32_t> tokens =
+            sample_rows(logits, 1, vocab_size, vocab_size, temperature, top_k);
+        return tokens.empty() ? 0 : tokens.front();
+    }
+
+    std::vector<int32_t> sample_rows(const float* logits, int32_t rows, int32_t row_stride,
+                                     int32_t vocab_size, float temperature, int32_t top_k) {
+        if (logits == nullptr || rows <= 0 || row_stride < vocab_size || vocab_size <= 0) {
+            return {};
+        }
+        const FilteredDistribution distribution =
+            build_filtered_distributions(logits, rows, row_stride, vocab_size, temperature, top_k);
+        std::vector<int32_t> selected_tokens(static_cast<std::size_t>(rows));
+
+        const int32_t numel = rows * vocab_size;
+        ensure_execution_policy(numel);
+        ensure_device_buffers(static_cast<int32_t>(distribution.indices.size()), rows);
+        const std::size_t index_bytes = distribution.indices.size() * sizeof(int32_t);
+        const std::size_t probability_bytes = distribution.probabilities.size() * sizeof(float);
+        cudaMemcpyAsync(device_indices_.get(), distribution.indices.data(), index_bytes,
+                        cudaMemcpyHostToDevice, stream_);
+        cudaMemcpyAsync(device_probabilities_.get(), distribution.probabilities.data(),
+                        probability_bytes, cudaMemcpyHostToDevice, stream_);
+        bark_gpu_sparse_torch_multinomial_exact(device_indices_.get(), device_probabilities_.get(),
+                                                distribution.rows, distribution.vocab_size,
+                                                distribution.keep, seed_, current_offset_,
+                                                total_threads_, device_token_ids_.get(), stream_);
+        cudaMemcpyAsync(selected_tokens.data(), device_token_ids_.get(),
+                        selected_tokens.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, stream_);
+        cudaStreamSynchronize(stream_);
+        current_offset_ += counter_offset_;
+        return selected_tokens;
+    }
+
+  private:
+    void ensure_device_buffers(int32_t entries, int32_t rows) {
+        if (entries > entry_capacity_) {
+            int32_t* new_indices = nullptr;
+            cudaError_t error =
+                cudaMalloc(&new_indices, static_cast<std::size_t>(entries) * sizeof(int32_t));
+            if (error != cudaSuccess)
+                throw std::runtime_error("Unable to allocate bark sampler index buffer");
+            float* new_probabilities = nullptr;
+            error =
+                cudaMalloc(&new_probabilities, static_cast<std::size_t>(entries) * sizeof(float));
+            if (error != cudaSuccess) {
+                cudaFree(new_indices);
+                throw std::runtime_error("Unable to allocate bark sampler probability buffer");
+            }
+            device_indices_.reset(new_indices);
+            device_probabilities_.reset(new_probabilities);
+            entry_capacity_ = entries;
+        }
+        if (rows > row_capacity_) {
+            int32_t* new_token_ids = nullptr;
+            const cudaError_t error =
+                cudaMalloc(&new_token_ids, static_cast<std::size_t>(rows) * sizeof(int32_t));
+            if (error != cudaSuccess)
+                throw std::runtime_error("Unable to allocate bark sampler token id buffer");
+            device_token_ids_.reset(new_token_ids);
+            row_capacity_ = rows;
+        }
+    }
+
+    void ensure_execution_policy(int32_t numel) {
+        if (numel == cached_numel_) {
+            return;
+        }
+        const BarkTorchMultinomialExecutionPolicy policy =
+            bark_compute_torch_multinomial_execution_policy(numel);
+        cached_numel_ = numel;
+        total_threads_ = policy.total_threads;
+        counter_offset_ = policy.counter_offset;
+    }
+
+    uint64_t seed_{0};
+    uint64_t current_offset_{0};
+    cudaStream_t stream_{nullptr};
+    DeviceBuffer<int32_t> device_indices_;
+    DeviceBuffer<float> device_probabilities_;
+    DeviceBuffer<int32_t> device_token_ids_;
+    int32_t entry_capacity_{0};
+    int32_t row_capacity_{0};
+    int32_t cached_numel_{-1};
+    int32_t total_threads_{0};
+    uint64_t counter_offset_{0};
+};
+
+BarkSampler::BarkSampler(void* stream) : impl_(std::make_unique<Impl>(stream)) {}
+
+BarkSampler::~BarkSampler() = default;
+
+void BarkSampler::reset(int64_t seed) {
+    impl_->reset(seed);
+}
+
+int32_t BarkSampler::sample(const float* logits, int32_t vocab_size, float temperature,
+                            int32_t top_k) {
+    return impl_->sample(logits, vocab_size, temperature, top_k);
+}
+
+std::vector<int32_t> BarkSampler::sample_rows(const float* logits, int32_t rows, int32_t row_stride,
+                                              int32_t vocab_size, float temperature,
+                                              int32_t top_k) {
+    return impl_->sample_rows(logits, rows, row_stride, vocab_size, temperature, top_k);
+}
+
+} // namespace trtmc

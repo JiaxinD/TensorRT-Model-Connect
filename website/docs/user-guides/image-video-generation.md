@@ -1,56 +1,52 @@
 ---
-title: Image & Video Generation
-description: Configure diffusion, classification, segmentation, and monocular-geometry task execution.
+title: Image & Video
+description: Build and run diffusion, classification, segmentation, and geometry tasks.
 ---
 
-## Image and video diffusion
+## Image and video generation
 
-Build-time flags define the compiled shape and denoising profile. Runtime flags
-select request values within the bundle's contract.
+Build-time dimensions and frame count shape the TensorRT plans. Request-time
+options must remain within the owning family's contract.
 
 ```bash
-trtmc build MODEL_ID \
+python -m tensorrt_model_connect build MODEL_ID \
   --image-height 1024 \
   --image-width 1024 \
-  --num-inference-steps 28 \
-  -o diffusion.bundle
+  --video-num-frames 49 \
+  --output media.bundle
 
-trtmc generate-video diffusion.bundle \
+trtmc generate-video media.bundle \
+  --runtime-root /opt/trtmc/lib \
   --prompt "A sunrise over a mountain lake" \
   --output frames \
-  --num-steps 28
+  --num-steps 28 \
+  --seed 7
 ```
 
-Video models can additionally compile height, width, and frame count with
-`--video-height`, `--video-width`, and `--video-num-frames`. A runtime request
-must remain within the profiles packaged by the exact family build.
+Use `generate-image` for one image and `generate-image-batch` with a prompt
+file plus comma-separated seeds for a family that declares the batch Task.
 
-## Classification and segmentation
+## Perception
 
 ```bash
-trtmc classify classifier.bundle --image input.jpg
-trtmc segment segmenter.bundle --image input.jpg --output mask.png
+trtmc classify classifier.bundle \
+  --runtime-root /opt/trtmc/lib --image input.jpg
+
+trtmc segment segmenter.bundle \
+  --runtime-root /opt/trtmc/lib --image input.jpg
+
 trtmc segment-prompted prompted.bundle \
-  --image input.jpg --output masks --point-x 0.5 --point-y 0.5
+  --runtime-root /opt/trtmc/lib \
+  --image input.jpg --point-x 0.5 --point-y 0.5 --foreground true
+
+trtmc geometry moge.bundle \
+  --runtime-root /opt/trtmc/lib \
+  --image input.jpg --output geometry-output
 ```
 
-## Monocular geometry
+Other current Task commands include `extract-features`, stereo `disparity`,
+and `video-segment`. Exact input shape, fixed profile, output representation,
+and supported checkpoint remain family-owned.
 
-MoGe consumes one RGB image and writes a directory containing row-major
-`points.f32`, `depth.f32`, `mask.u8`, and normalized `intrinsics.json`:
-
-```bash
-trtmc geometry moge-2-vitl.bundle --image input.jpg --output geometry-output
-```
-
-The MoGe-2 profile uses FP32 and a fixed 1800-token build contract.
-
-The public CLI also reserves `detect`, but an API command alone is not a
-supported-model claim. Confirm an exact model-owned strategy and E2E manifest
-in [Model Recipes](../models-recipes/model-recipes.md), organized by the exact
-Hugging Face image or video task.
-
-For the denoising-loop and task-result mental model, follow the
-[Diffusion, Vision, and Time-Series Tutorial](../tutorials/intermediate/diffusion-and-time-series.md).
-
-{/* Collaborative review anchor: batch 2. */}
+Continue with the
+[Diffusion and Time-Series Tutorial](../tutorials/intermediate/diffusion-and-time-series.md).

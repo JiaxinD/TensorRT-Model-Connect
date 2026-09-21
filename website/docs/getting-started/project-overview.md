@@ -12,8 +12,8 @@ C++ APIs.
 The implementations support straightforward deployment, but they are also
 intended as blueprints that developers can inspect, modify, extend, and
 customize. Model behavior remains visible in family-owned builders, native
-runtime pipelines, helper kernels, configuration schemas, and validation
-contracts instead of being hidden behind a single generic integration.
+runtime pipelines, explicit typed inputs, and validation contracts instead of
+being hidden behind a single generic integration.
 
 ## The build and runtime boundary
 
@@ -31,9 +31,9 @@ Hugging Face or local checkpoint
   -> native C++ task API
 ```
 
-Native bundles resolve their matching model and TensorRT backend DSOs at
-runtime. Exactly qualified optimized-runtime bundles can carry their own
-implementation DSO. Both forms still require a compatible NVIDIA driver,
+Native bundles resolve their matching family and TensorRT backend DSOs from an
+explicit runtime root. Complete-network platform offload is implemented within
+the owning family. Both forms still require a compatible NVIDIA driver,
 CUDA/TensorRT cohort, dynamic loader, and system libraries.
 
 There is no intermediate ONNX export step. Applications load a bundle and call
@@ -96,7 +96,7 @@ TRTMC reduces that path to a family-owned build and a task-oriented runtime:
 | Repeated model-specific application integration | Applications load a bundle and use a task-oriented runtime API. |
 | Validation across several conversion artifacts | Build, runtime, and E2E manifests identify one bundle contract and its evidence. |
 | Python framework dependencies in native inference paths | Native profiles execute model inference in C++; manifests explicitly flag hybrid profiles that require helper Python. |
-| Opaque deployment artifacts | `trtmc inspect` exposes bundle kind, model family, precision, runtime identity, and engines. |
+| Opaque deployment artifacts | `trtmc inspect` exposes bundle header metadata and its complete section inventory. |
 
 ## Model coverage and ownership
 
@@ -105,8 +105,8 @@ encoder/embedding/reranking models, translation, vision-language and OCR,
 speech recognition and synthesis, diffusion image and video generation,
 segmentation, time-series forecasting, and neural operators.
 
-Each model-family implementation keeps its knowledge in family-owned builder,
-runtime, and E2E descriptors. The repository also includes agent instructions
+Each model-family implementation keeps its knowledge in a family-owned builder,
+runtime, and E2E test tree. The repository also includes agent instructions
 and model-local validation contracts so contributors can extend one family
 without editing a hand-written global registry.
 

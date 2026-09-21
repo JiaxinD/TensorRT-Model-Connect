@@ -81,7 +81,7 @@ digraph BuildRouteSelection {
   native_bundle [
     fillcolor="#fffbeb",
     color="#b45309",
-    label=<<B>Native .bundle</B><BR/><FONT POINT-SIZE="16">runtime_strategy + plans + assets</FONT>>
+    label=<<B>Native .bundle</B><BR/><FONT POINT-SIZE="16">family + task + backend + plans + assets</FONT>>
   ];
   optimized_bundle [
     fillcolor="#fffbeb",

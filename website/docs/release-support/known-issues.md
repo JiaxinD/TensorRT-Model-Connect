@@ -11,16 +11,16 @@ description: Current boundaries that users must account for when interpreting fe
   producing reproducible support or performance evidence.
 - A parser option is not proof that every family implements or qualifies that
   option.
-- Native and platform-specialized runtime paths have different artifact,
+- Native and complete-network platform offload have different artifact,
   dependency, configuration, and qualification boundaries.
-- Native bundles depend on compatible installed model/backend DSOs and host
+- Native bundles depend on compatible installed core/backend/family DSOs and host
   libraries; they are not complete operating-system images.
-- `trtmc inspect --list-engines` recognizes native plan naming and can report no
-  engines for a valid provider-owned optimized artifact layout.
+- `trtmc inspect` prints header metadata and a section inventory, but it does
+  not decode every family-specific section and has no engine-listing mode.
 - Multi-device execution is currently model-owned and topology-fixed; generic
   TP/CP flags do not establish blanket support.
-- The public detection API does not establish a supported detector without a
-  model-owned runtime strategy and E2E manifest.
+- A public task interface does not establish support without a family-owned
+  implementation, manifest, and E2E evidence.
 
 Use the current source, exact manifest, and test evidence when this page and a
 newer implementation differ.

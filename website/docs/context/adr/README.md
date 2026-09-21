@@ -4,6 +4,14 @@ No numbered ADRs are currently tracked in this directory. The empty table is
 intentional; it is not evidence that the project has made no architectural
 decisions.
 
+:::caution Historical index
+
+This restored index predates PR #1093. Current decisions are reflected by
+`AGENTS.md`, the maintained architecture pages, family-local source and tests,
+and Git history.
+
+:::
+
 | Number | Title | Status | Date |
 |--------|-------|--------|------|
 
@@ -13,9 +21,9 @@ Until a decision is captured as an ADR, use the implementation and its tests as
 the source of truth. The maintained
 [architecture overview](../../architecture/overview.md) describes system
 boundaries, and [Units and Ownership](../../architecture/units-and-ownership.md)
-links them to component-level contracts. Family-owned `MODEL.toml` descriptors,
-runtime registrations, E2E manifests, and the Git history provide the
-authoritative details for a particular model path. Status-labeled documents in
+links them to component-level contracts. Family-local implementation, E2E
+manifests, and Git history provide the authoritative details for a particular
+model path. Status-labeled documents in
 `website/docs/context/` may explain active plans or investigations, but they
 are not accepted ADRs.
 

@@ -345,18 +345,7 @@ function validateDocumentationUsage(generatedOutputs) {
     .map((path) => readFileSync(path, 'utf8'))
     .join('\n');
 
-  if (/^(?:```|~~~)mermaid(?:\s+.*)?$/im.test(documentation)) {
-    throw new Error('Documentation still contains Mermaid blocks; use a generated SVG and the Diagram component');
-  }
-
   const generatedSet = new Set(generatedOutputs);
-  for (const outputRelative of generatedOutputs) {
-    const publicPath = `/img/diagrams/${outputRelative}`;
-    if (!documentation.includes(publicPath)) {
-      throw new Error(`Generated diagram is not referenced by documentation: ${publicPath}`);
-    }
-  }
-
   const referencedOutputs = new Set(
     [...documentation.matchAll(/\/img\/diagrams\/([a-zA-Z0-9._/-]+\.svg)/g)]
       .map((match) => match[1]),

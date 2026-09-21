@@ -30,7 +30,7 @@ digraph BenchmarkOrchestration {
   edge [color="#64748b", penwidth="2.2", arrowsize="0.8", fontname="Arial", fontsize="16", fontcolor="#334155"];
 
   cli [fillcolor="#eff6ff", color="#2563eb", label=<<FONT POINT-SIZE="19"><B>trtmc-bench run</B></FONT>>];
-  catalog [label=<<B>MODEL.toml</B><BR/><FONT POINT-SIZE="16">and E2E manifest</FONT>>];
+  catalog [label=<<B>Family catalog</B><BR/><FONT POINT-SIZE="16">E2E manifests</FONT>>];
   adapter [label=<<B>Task adapter</B>>];
   request [fillcolor="#f5f3ff", color="#7c3aed", label=<<B>Resolved operation</B><BR/><FONT POINT-SIZE="16">and concrete request</FONT>>];
   { rank=same; cli; catalog; adapter; }

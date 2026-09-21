@@ -25,20 +25,20 @@ you need the historical boundary or record behind one feature.
 | Worklog | Debugging history, experiments, and lessons learned. | Current defaults or support claims. |
 | Retired workflow | Understanding preserved tooling or an old process. | Operating the current project. |
 
-Implementation, descriptors, tests, and exact-revision evidence remain the
+Implementation, family metadata, tests, and exact-revision evidence remain the
 source of truth when historical prose disagrees with current code.
 
 ## Categories
 
 ### Model and runtime integration
 
-Use these pages to understand family ownership, native runtime strategies,
-delegated optimized implementations, and the migrations that created those
-boundaries.
+Use these pages to understand family ownership, exact family-DSO selection,
+platform-specific runtime boundaries, and the migrations that created the
+current structure.
 
 - [Model Support](../models-recipes/overview.md)
 - [Model Families](model-families.md)
-- [Runtime Strategies](runtime-strategies.md)
+- [Family Runtime Selection](runtime-strategies.md)
 - [Optimized-runtime family adapter record](../context/optimized-runtime-family-adapter-plan.md)
 - [Model-plugin encapsulation record](../context/model-plugin-encapsulation-plan.md)
 
@@ -54,8 +54,9 @@ behavior, and the evidence behind runtime optimizations.
 
 ### Build, quantization, and configuration
 
-Use these pages for precision and quantization contracts, schema-driven
-configuration, backend loading, and the design history of the config registry.
+Use these pages for family-owned precision and quantization, explicit typed
+configuration, backend loading, and the design history of the retired config
+registry.
 
 - [Quantization](quantization.md)
 - [Configuration and Backends](config-and-backends.md)
@@ -85,7 +86,7 @@ design research. They are intentionally last in the navigation.
 An API, parser option, source file, or manifest proves only that a surface is
 declared. A support claim needs the evidence appropriate to its level:
 
-1. implementation and ownership descriptors;
+1. implementation and physical family ownership;
 2. focused unit and contract tests;
 3. exact-model task comparison;
 4. target-hardware execution; and
