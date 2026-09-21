@@ -838,6 +838,29 @@ def test_e2e(case_name: str, request, tmp_path: Path) -> None:
         _assert_correctness(payload, case, thresholds, *reference[:-1])
 
 
+def _embedding_consumer_binary() -> Path:
+    value = os.environ.get("TRTMC_NATIVE_BUILD_DIR")
+    assert value, "selected embedding E2E requires TRTMC_NATIVE_BUILD_DIR"
+    build_dir = Path(value)
+    assert build_dir.is_dir(), "selected embedding E2E requires a configured native build"
+    subprocess.run(
+        [
+            "cmake",
+            "--build",
+            str(build_dir),
+            "--parallel",
+            "8",
+            "--target",
+            "qwen_embedding_consumer",
+        ],
+        check=True,
+        timeout=600,
+    )
+    binary = build_dir / "families" / _FAMILY / "qwen_embedding_consumer"
+    assert binary.is_file(), "native build did not produce qwen_embedding_consumer"
+    return binary
+
+
 def _embedding_e2e(manifest, case, model_dir, runtime_root, torch, tmp_path):
     from transformers import AutoModel, AutoTokenizer
 
@@ -854,8 +877,7 @@ def _embedding_e2e(manifest, case, model_dir, runtime_root, torch, tmp_path):
                 max_sequence_length=manifest["max_sequence_length"],
             )
         )
-    consumer = runtime_root / "qwen_embedding_consumer"
-    assert consumer.is_file(), "build the public SDK qwen_embedding_consumer target"
+    consumer = _embedding_consumer_binary()
     with evidence_stage("native"):
         completed = subprocess.run(
             [str(consumer), str(bundle), str(runtime_root), prompt],
