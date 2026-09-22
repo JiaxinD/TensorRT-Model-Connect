@@ -46,3 +46,28 @@ def test_embedding_consumer_requires_native_build(monkeypatch):
     monkeypatch.delenv("TRTMC_NATIVE_BUILD_DIR", raising=False)
     with pytest.raises(AssertionError, match="TRTMC_NATIVE_BUILD_DIR"):
         test_e2e._embedding_consumer_binary()
+
+
+@pytest.mark.parametrize("cached", [True, False])
+def test_checkpoint_uses_only_the_staged_revision(tmp_path, monkeypatch, cached):
+    import httpx
+    from huggingface_hub import constants
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    revision = "a" * 40
+    snapshot = tmp_path / "models--Qwen--offline-probe" / "snapshots" / revision
+    if cached:
+        snapshot.mkdir(parents=True)
+        (snapshot / "config.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(constants, "HF_HUB_CACHE", str(tmp_path))
+
+    def reject_network(*args, **kwargs):
+        raise AssertionError("checkpoint lookup attempted network access")
+
+    monkeypatch.setattr(httpx.Client, "send", reject_network)
+    manifest = {"hf_id": "Qwen/offline-probe", "hf_revision": revision}
+    if cached:
+        assert test_e2e._checkpoint(manifest) == snapshot
+    else:
+        with pytest.raises(LocalEntryNotFoundError):
+            test_e2e._checkpoint(manifest)
