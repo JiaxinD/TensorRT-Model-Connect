@@ -31,7 +31,7 @@ class StreamOptions(StrictRequest):
 class GenerationRequest(StrictRequest):
     model: str
     max_tokens: int | None = Field(default=None, ge=1)
-    temperature: float | None = Field(default=None, ge=0)
+    temperature: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     top_p: float | None = Field(default=None, ge=0, le=1)
     min_p: float | None = Field(default=None, ge=0, le=1)
     top_k: int | None = Field(default=None, ge=0)
