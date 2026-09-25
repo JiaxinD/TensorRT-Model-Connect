@@ -110,11 +110,13 @@ def _model_dir(manifest: dict) -> Path:
     return Path(snapshot)
 
 
-def _audio(case):
+def _audio(case, generated_root):
     path = TEST_ROOT / case["test_input_audio"]
     if not path.is_file():
         from families.parakeet_tdt.tests.data.asr_probes.generate_asr_probe_inputs import main
-        main()
+        path = generated_root / path.name
+        if not path.is_file():
+            main(generated_root)
     with wave.open(str(path), "rb") as source:
         assert source.getsampwidth() == 2, "Parakeet fixtures must use PCM16"
         rate, channels = source.getframerate(), source.getnchannels()
@@ -178,7 +180,7 @@ def test_official_checkpoint_e2e(case_name, tmp_path):
         build(BuildRequest(model_dir=model_dir, output_path=bundle, family=FAMILY,
                            task=manifest["task"], precision=manifest["precision"],
                            tensor_parallel_size=int(manifest["tensor_parallel_size"])))
-    audio, rate, channels = _audio(case)
+    audio, rate, channels = _audio(case, tmp_path / "audio-probes")
     pcm = tmp_path / "input.f32"
     audio.astype("<f4").tofile(pcm)
     env = os.environ.copy()
@@ -207,9 +209,9 @@ def test_exact_transcript_contract():
             _assert_parity({"text": actual}, {"text": expected})
 
 
-def test_all_audio_cases_have_valid_pcm():
+def test_all_audio_cases_have_valid_pcm(tmp_path):
     for _, _, case in CASES.values():
-        audio, rate, channels = _audio(case)
+        audio, rate, channels = _audio(case, tmp_path / "audio-probes")
         assert audio.size and audio.size % channels == 0
         assert np.isfinite(audio).all()
         assert audio.size / channels / rate <= 30
@@ -259,3 +261,19 @@ def test_reference_uses_tdt_generation_contract(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(AutoModelForTDT=Model, AutoProcessor=Processor))
     monkeypatch.setitem(sys.modules, "scipy.signal", SimpleNamespace(resample_poly=None))
     assert _reference(tmp_path, np.zeros(8, dtype=np.float32), 16000, 2, 50) == {"text": "test transcript"}
+
+
+def test_missing_probes_are_generated_outside_source_tree(monkeypatch, tmp_path):
+    from families.parakeet_tdt.tests.data.asr_probes import generate_asr_probe_inputs as probes
+
+    source_root = tmp_path / "read-only-source"
+    source_root.mkdir()
+    monkeypatch.setattr(probes, "ROOT", source_root)
+    monkeypatch.setitem(globals(), "TEST_ROOT", source_root)
+    output = tmp_path / "generated"
+    for _, _, case in CASES.values():
+        if "asr_probes" in case["test_input_audio"]:
+            audio, rate, channels = _audio(case, output)
+            assert audio.size > 0 and rate > 0 and channels > 0
+    assert list(source_root.iterdir()) == []
+    assert len(list(output.glob("*.wav"))) == 7

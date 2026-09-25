@@ -82,7 +82,9 @@ def add_white_noise(audio: np.ndarray, snr_db: float, seed: int = 20260611) -> n
     return np.clip(audio + noise, -1.0, 1.0)
 
 
-def main() -> None:
+def main(output_dir: Path | None = None) -> None:
+    output_dir = ROOT if output_dir is None else output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
     sample_rate, original = read_wav(SOURCE)
     mono_48k = mono(original)
     mono_16k = resample_linear(mono_48k, sample_rate, 16000)
@@ -100,7 +102,7 @@ def main() -> None:
         notes: str,
     ) -> None:
         file_name = f"{name}.wav"
-        write_wav(ROOT / file_name, sample_rate_hz, audio)
+        write_wav(output_dir / file_name, sample_rate_hz, audio)
         channels = 1 if audio.ndim == 1 else audio.shape[1]
         duration_s = round(float(audio.shape[0]) / sample_rate_hz, 3)
         cases.append(
@@ -121,7 +123,7 @@ def main() -> None:
             }
         )
 
-    shutil.copyfile(SOURCE, ROOT / "probe_01_clean_48k_stereo_baseline.wav")
+    shutil.copyfile(SOURCE, output_dir / "probe_01_clean_48k_stereo_baseline.wav")
     cases.append(
         {
             "id": "probe_01_clean_48k_stereo_baseline",
@@ -222,7 +224,7 @@ def main() -> None:
         ],
         "cases": cases,
     }
-    (ROOT / "manifest.json").write_text(
+    (output_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n",
         encoding="utf-8",
     )
