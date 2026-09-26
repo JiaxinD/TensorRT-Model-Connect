@@ -315,3 +315,34 @@ def test_nonfinite_temperature_is_rejected_before_worker_acquisition(route: str,
         valid = client.post(route, json={**payload, "temperature": 0.0})
         assert valid.status_code == 200
         assert registry.requests[-1][1]["config"]["temperature"] == 0.0
+
+
+@pytest.mark.parametrize("surrogate", ["\ud800", "\udfff"])
+@pytest.mark.parametrize("location", ["prompt", "user", "system", "text_part"])
+def test_surrogate_input_is_rejected_before_worker_acquisition(surrogate, location):
+    registry = FakeRegistry()
+    registry.saturated = True
+    payload = {"model": "test/model"}
+    route = "/v1/completions" if location == "prompt" else "/v1/chat/completions"
+    if location == "prompt":
+        payload["prompt"] = surrogate
+    else:
+        content = [{"type": "text", "text": surrogate}] if location == "text_part" else surrogate
+        payload["messages"] = [{"role": "user", "content": content}]
+        if location == "system":
+            payload["messages"] = [
+                {"role": "system", "content": surrogate},
+                {"role": "user", "content": "Capital?"},
+            ]
+    with make_client(registry) as client:
+        invalid = client.post(route, content=json.dumps(payload),
+                              headers={"content-type": "application/json"})
+        assert invalid.status_code == 400
+        assert invalid.json()["error"]["type"] == "invalid_request_error"
+        assert registry.requests == []
+        registry.saturated = False
+        valid = client.post("/v1/completions", content=json.dumps({
+            "model": "test/model", "prompt": "\U0001f600",
+        }), headers={"content-type": "application/json"})
+        assert valid.status_code == 200
+        assert registry.requests[-1][1]["prompt"] == "\U0001f600"
