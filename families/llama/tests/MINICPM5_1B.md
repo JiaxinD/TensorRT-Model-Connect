@@ -48,3 +48,16 @@ tokens in the pinned tokenizer. The initial PR runtime instead produced
 `[5645, 12740, 1877, 1609]`. The dependency fixes that discrepancy. Until #1423
 is integrated, the newly declared case exposes a known tokenizer compatibility
 gap; this PR remains a draft and does not copy the dependency's implementation.
+
+## Staged checkpoint prerequisite
+
+The Llama E2E lookup consumes a pre-populated Hugging Face snapshot cache and
+never refreshes Hub metadata during the test. Community GPU CI stages that cache
+before entering its offline test container. For a manual run, populate the cache
+with the pinned checkpoint first; an absent revision or missing `config.json`
+still fails rather than selecting another checkpoint.
+
+This avoids a Hub 1.32 repository-tree lookup that otherwise raises
+`OfflineModeIsEnabled` even when the pinned snapshot is already cached. The
+regression tests use temporary local snapshots without any tree index or model
+weights. No manifest revisions, comparisons or acceptance thresholds are changed.
