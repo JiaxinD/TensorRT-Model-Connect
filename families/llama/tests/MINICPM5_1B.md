@@ -18,10 +18,11 @@ Validation remaining: build the pinned checkpoint on authorized GPU hardware
 and run `families/llama/tests/test_e2e.py` with `--e2e-model minicpm5-1b`, using
 the normal family E2E runtime environment. No large weights were downloaded locally.
 
-The existing Llama tokenizer's Sequence/Split classification issue is tracked
-in upstream PR #1423. This checkpoint coverage must not be treated as complete
-runtime qualification until tokenizer compatibility and target-GPU parity are
-verified. This change does not duplicate that tokenizer implementation.
+The Llama tokenizer's Sequence/Split classification fix is owned by upstream
+PR #1423. Its original commit is included as a dependency for combined testing;
+maintainers should review and integrate #1423 first. This checkpoint coverage
+must not be treated as complete runtime qualification until target-GPU parity
+is verified.
 
 ## Tokenizer-sensitive premerge coverage
 
@@ -45,9 +46,10 @@ post-processor. These are tokenizer-only CPU results, not model inference proof.
 
 For example, `1234567890` encodes as `[5645, 12740, 17371, 37]` without special
 tokens in the pinned tokenizer. The initial PR runtime instead produced
-`[5645, 12740, 1877, 1609]`. The dependency fixes that discrepancy. Until #1423
-is integrated, the newly declared case exposes a known tokenizer compatibility
-gap; this PR remains a draft and does not copy the dependency's implementation.
+`[5645, 12740, 1877, 1609]`. The dependency fixes that discrepancy. The branch now includes the original #1423 commit as a history-preserving
+dependency merge. The tokenizer implementation retains its original author and
+commit; this change does not reimplement it. The combined branch still requires
+target-GPU validation before the checkpoint is qualified.
 
 ## Staged checkpoint prerequisite
 
