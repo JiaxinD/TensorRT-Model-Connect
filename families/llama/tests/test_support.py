@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""CPU coverage of serialized-plan lifetime and atomic bundle publication."""
+"""CPU coverage of build memory lifetime and bundle publication."""
 
 import gc
 import importlib.util
@@ -10,11 +10,17 @@ from pathlib import Path
 import struct
 import sys
 import types
+import weakref
 
+import numpy as np
 import pytest
+from safetensors.numpy import save_file
 
 from tensorrt_model_connect import BuildRequest
 from tensorrt_model_connect.bundle_writer import BundleWriter
+
+from .. import checkpoint_mapper
+from ..config import ModelConfig
 
 @pytest.fixture
 def request_and_writer(tmp_path, monkeypatch):
@@ -97,3 +103,58 @@ def test_decode_failure_preserves_published_bundle(request_and_writer, monkeypat
     writer.abort()
     assert request.output_path.read_bytes() == b"previous bundle"
     assert not list(request.output_path.parent.glob(".model.bundle.sections.*"))
+
+
+@pytest.mark.parametrize("precision,fp32_layers", [("fp16", ()), ("fp32", ()), ("fp16", (1,))])
+def test_projection_scratch_is_released_without_changing_weights(
+    tmp_path, monkeypatch, precision, fp32_layers
+):
+    config = ModelConfig(
+        model_type="llama", hidden_size=4, vocab_size=8, num_hidden_layers=2,
+        num_attention_heads=2, num_key_value_heads=1, intermediate_size=6,
+    )
+    tensors = {"model.embed_tokens.weight": np.arange(32, dtype=np.float16).reshape(8, 4)}
+    shapes = {
+        "self_attn.q_proj": (4, 4), "self_attn.k_proj": (2, 4),
+        "self_attn.v_proj": (2, 4), "self_attn.o_proj": (4, 4),
+        "mlp.gate_proj": (6, 4), "mlp.up_proj": (6, 4), "mlp.down_proj": (4, 6),
+    }
+    output_names = ("w_q", "w_k", "w_v", "w_o", "w_gate", "w_up", "w_down")
+    expected = {}
+    for index in range(2):
+        for projection_index, (source, output) in enumerate(zip(shapes, output_names)):
+            shape = shapes[source]
+            values = (
+                np.arange(np.prod(shape), dtype=np.float32).reshape(shape) / 7
+                + index * 3 + projection_index / 9 - 2
+            ).astype(np.float16)
+            tensors[f"model.layers.{index}.{source}.weight"] = values
+            dtype = np.float32 if precision == "fp32" or index in fp32_layers else np.float16
+            expected[f"layer.{index}.{output}"] = values.astype(np.float32).T.astype(dtype)
+        for name in ("input_layernorm", "post_attention_layernorm"):
+            tensors[f"model.layers.{index}.{name}.weight"] = np.ones(4, dtype=np.float16)
+    save_file(tensors, tmp_path / "model.safetensors")
+    load_tensor = checkpoint_mapper._load_tensor
+    previous = {}
+
+    def tracked_load(readers, name):
+        if ".layers." in name and name.endswith("_proj.weight"):
+            layer = name.split(".")[2]
+            if layer in previous:
+                assert previous[layer]() is None, "previous projection scratch is still live"
+            value = load_tensor(readers, name)
+            previous[layer] = weakref.ref(value)
+            return value
+        return load_tensor(readers, name)
+
+    monkeypatch.setattr(checkpoint_mapper, "_load_tensor", tracked_load)
+    weights = checkpoint_mapper.load_standard_weights(
+        tmp_path, config, precision=precision, fp32_layers=fp32_layers
+    )
+    for name, values in expected.items():
+        np.testing.assert_array_equal(weights[name], values)
+        assert weights[name].dtype == values.dtype
+        assert weights[name].flags.c_contiguous
+    assert weights["_attention_size"] == 4
+    assert weights["_kv_attention_size"] == 2
+    assert weights["_mlp_size"] == 6
