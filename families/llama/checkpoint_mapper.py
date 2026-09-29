@@ -111,6 +111,8 @@ def load_standard_weights(
         f"Embedding shape {embedding.shape} != ({vocab}, {hidden})"
     )
     weights["embedding"] = embedding.astype(target_dtype)
+    # Jiaxin Deng: keep only the stored embedding while loading decoder layers.
+    del embedding
 
     def _load_layer(layer_idx: int) -> tuple[int, WeightDict, int, int]:
         prefix = f"layer.{layer_idx}"
@@ -209,7 +211,9 @@ def load_standard_weights(
         )
     else:
         # Tied embeddings
-        weights["w_out"] = _transpose_2d(embedding.copy(), "embedding_tied", precision=precision)
+        weights["w_out"] = _transpose_2d(
+            weights["embedding"].copy(), "embedding_tied", precision=precision
+        )
 
     weights["_attention_size"] = attention_size  # type: ignore[assignment]
     weights["_kv_attention_size"] = kv_attention_size  # type: ignore[assignment]

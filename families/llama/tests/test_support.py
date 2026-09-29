@@ -106,14 +106,18 @@ def test_decode_failure_preserves_published_bundle(request_and_writer, monkeypat
 
 
 @pytest.mark.parametrize("precision,fp32_layers", [("fp16", ()), ("fp32", ()), ("fp16", (1,))])
+@pytest.mark.parametrize("tied", [False, True])
 def test_projection_scratch_is_released_without_changing_weights(
-    tmp_path, monkeypatch, precision, fp32_layers
+    tmp_path, monkeypatch, precision, fp32_layers, tied
 ):
     config = ModelConfig(
         model_type="llama", hidden_size=4, vocab_size=8, num_hidden_layers=2,
         num_attention_heads=2, num_key_value_heads=1, intermediate_size=6,
     )
-    tensors = {"model.embed_tokens.weight": np.arange(32, dtype=np.float16).reshape(8, 4)}
+    embedding = np.arange(32, dtype=np.float32).reshape(8, 4) / 7 - 2
+    tensors = {"model.embed_tokens.weight": embedding}
+    if not tied:
+        tensors["lm_head.weight"] = embedding + 3
     shapes = {
         "self_attn.q_proj": (4, 4), "self_attn.k_proj": (2, 4),
         "self_attn.v_proj": (2, 4), "self_attn.o_proj": (4, 4),
@@ -136,8 +140,15 @@ def test_projection_scratch_is_released_without_changing_weights(
     save_file(tensors, tmp_path / "model.safetensors")
     load_tensor = checkpoint_mapper._load_tensor
     previous = {}
+    embedding_source = None
 
     def tracked_load(readers, name):
+        nonlocal embedding_source
+        if name == "model.embed_tokens.weight":
+            value = load_tensor(readers, name)
+            embedding_source = weakref.ref(value)
+            return value
+        assert embedding_source() is None, "embedding scratch is still live"
         if ".layers." in name and name.endswith("_proj.weight"):
             layer = name.split(".")[2]
             if layer in previous:
@@ -151,6 +162,12 @@ def test_projection_scratch_is_released_without_changing_weights(
     weights = checkpoint_mapper.load_standard_weights(
         tmp_path, config, precision=precision, fp32_layers=fp32_layers
     )
+    dtype = np.float32 if precision == "fp32" else np.float16
+    np.testing.assert_array_equal(weights["embedding"], embedding.astype(dtype))
+    output = embedding if tied else tensors["lm_head.weight"]
+    np.testing.assert_array_equal(weights["w_out"], output.T.astype(dtype))
+    assert weights["w_out"].dtype == dtype
+    assert weights["w_out"].flags.c_contiguous
     for name, values in expected.items():
         np.testing.assert_array_equal(weights[name], values)
         assert weights[name].dtype == values.dtype
