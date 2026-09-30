@@ -23,6 +23,12 @@ excluded_profiles:
       The family-local migration has no release-performance workload or receipt
       yet. Target-GPU engine conversion and exact-transcript E2E parity remain
       unverified; no performance qualification is claimed.
+  - model: yolos-small
+    reason: >-
+      Functional and Hugging Face reference-parity qualification is present, but
+      this change adds no release-performance workload or receipt. The family
+      builds the checkpoint's native resolution only, so a benchmark workload
+      would need to state that fixed input size.
   - model: moge-2-vitl
     reason: >-
       Family-owned accuracy and internal performance qualification are present,
@@ -101,6 +107,8 @@ excluded_profiles:
     reason: *gemma3_performance_exclusion
   - model: gemma-3-12b
     reason: *gemma3_performance_exclusion
+  - model: gemma-3-27b
+    reason: *gemma3_performance_exclusion
   - model: gemma-3-1b
     reason: >-
       Functional and Hugging Face reference-parity qualification is present,
@@ -142,6 +150,11 @@ excluded_profiles:
       nano width, which is the only one whose class-attention norm covers a
       single token, but the release-performance workload and receipt were
       collected only for xcit_tiny_12_p16_224.
+  - model: qwen3-vl-8b
+    reason: >-
+      Functional and Hugging Face reference-parity qualification is present,
+      but the release-performance workload and receipt were collected only for
+      qwen3-vl-2b, which exercises the same builder and runtime path.
 
 entries:
   - id: detr.detect
