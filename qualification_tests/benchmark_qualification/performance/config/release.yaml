@@ -23,6 +23,11 @@ excluded_profiles:
       The family-local migration has no release-performance workload or receipt
       yet. Target-GPU engine conversion and exact-transcript E2E parity remain
       unverified; no performance qualification is claimed.
+  - model: qwen3-embedding-0.6b
+    reason: >-
+      The migrated embedding task has no release-performance workload or receipt
+      yet. Correctness evidence does not establish release-performance
+      qualification; no performance qualification is claimed.
   - model: yolos-small
     reason: >-
       Functional and Hugging Face reference-parity qualification is present, but
