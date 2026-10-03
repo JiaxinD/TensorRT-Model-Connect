@@ -53,10 +53,10 @@ target-GPU validation before the checkpoint is qualified.
 
 ## Staged checkpoint prerequisite
 
-The Llama E2E lookup consumes a pre-populated Hugging Face snapshot cache and
-never refreshes Hub metadata during the test. Community GPU CI stages that cache
+In offline mode, the Llama E2E lookup consumes a pre-populated Hugging Face
+snapshot cache without refreshing Hub metadata. Community GPU CI stages that cache
 before entering its offline test container. For a manual run, populate the cache
-with the pinned checkpoint first; an absent revision or missing `config.json`
+with the pinned checkpoint first and set `HF_HUB_OFFLINE=1`; an absent revision or missing `config.json`
 still fails rather than selecting another checkpoint.
 
 This avoids a Hub 1.32 repository-tree lookup that otherwise raises
