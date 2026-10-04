@@ -23,6 +23,12 @@
       "premerge": true
     },
     {
+      "name": "nomic-v1.5-latin-extended",
+      "reference_precision": "fp32",
+      "prompt": "İstanbul, Dvořák, ČESKÝ KRUMLOV and Łódź.",
+      "premerge": true
+    },
+    {
       "name": "nomic-v1.5-empty",
       "reference_precision": "fp32",
       "prompt": "",

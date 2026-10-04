@@ -36,7 +36,9 @@ int main() {
           "[PAD]": 0, "[UNK]": 1, "[CLS]": 2, "[SEP]": 3, "[MASK]": 4,
           "hello": 5, "world": 6, "[": 7, "]": 8, "mask": 9,
           "cls": 10, "sep": 11, "pad": 12, "unk": 13, ".": 14,
-          ",": 15, "cafe": 16, "play": 17, "##ing": 18
+          ",": 15, "cafe": 16, "play": 17, "##ing": 18,
+          "istanbul": 19, "dvorak": 20, "cesky": 21, "łodz": 22,
+          "skoda": 23, "i̇": 24, "hēllō": 25, "HELLO": 26, "I": 27
         }
       },
       "normalizer": {"type": "BertNormalizer", "clean_text": true,
@@ -75,6 +77,9 @@ int main() {
         check("[MASK], [MASK].", {4, 15, 4, 14}, "punctuation around special tokens");
         check("[mask]", {7, 9, 8}, "special token matching is case sensitive");
         check("HELLO, world.", {5, 15, 6, 14}, "ordinary normalization and punctuation");
+        check("HĒLLŌ", {5}, "Latin Extended-A uppercase accents");
+        check("he\xcc\x84llo\xcc\x84", {5}, "decomposed Latin Extended-A accents");
+        check("İstanbul Dvořák ČESKÝ Łódź ŠKODA", {19, 20, 21, 22, 23}, "Latin Extended-A names");
         check("CAF\xc3\x89 [MASK] playing", {16, 4, 17, 18}, "normalization on both sides");
         check("playing", {17, 18}, "ordinary wordpieces");
         for (const std::string& control :
@@ -103,6 +108,25 @@ int main() {
     auto unclean = trtmc::nomic_bert::CreateWordPieceTokenizer(unclean_json.data(),
                                                                unclean_json.size(), false);
     check_ids(unclean->encode("hel\xc2\xadlo"), {1}, "clean_text false preserves soft hyphen");
+
+    std::string accented_json = tokenizer_json;
+    const auto accent_flag = accented_json.find("\"strip_accents\": null");
+    accented_json.replace(accent_flag, std::string("\"strip_accents\": null").size(),
+                          "\"strip_accents\": false");
+    auto accented = trtmc::nomic_bert::CreateWordPieceTokenizer(accented_json.data(),
+                                                                accented_json.size(), false);
+    check_ids(accented->encode("İ HĒLLŌ"), {24, 25},
+              "lowercase preserves accents when stripping is disabled");
+
+    std::string cased_json = tokenizer_json;
+    cased_json.replace(cased_json.find("\"lowercase\": true"),
+                       std::string("\"lowercase\": true").size(), "\"lowercase\": false");
+    cased_json.replace(cased_json.find("\"strip_accents\": null"),
+                       std::string("\"strip_accents\": null").size(), "\"strip_accents\": true");
+    auto cased =
+        trtmc::nomic_bert::CreateWordPieceTokenizer(cased_json.data(), cased_json.size(), false);
+    check_ids(cased->encode("HĒLLŌ İ"), {26, 27},
+              "accent stripping preserves case when lowercasing is disabled");
 
     return failures == 0 ? 0 : 1;
 }
