@@ -38,7 +38,10 @@ int main() {
           "cls": 10, "sep": 11, "pad": 12, "unk": 13, ".": 14,
           ",": 15, "cafe": 16, "play": 17, "##ing": 18,
           "istanbul": 19, "dvorak": 20, "cesky": 21, "łodz": 22,
-          "skoda": 23, "i̇": 24, "hēllō": 25, "HELLO": 26, "I": 27
+          "skoda": 23, "i̇": 24, "hēllō": 25, "HELLO": 26, "I": 27,
+          "αθηνα": 28, "москва": 29, "иога": 30, "елка": 31,
+          "αθήνα": 32, "йога": 33, "ёлка": 34, "ΑΘΗΝΑ": 35,
+          "МОСКВА": 36, "ИОГА": 37, "ЕЛКА": 38, "ι": 39, "υ": 40, "ΐ": 41, "ΰ": 42, "ʹ": 43, "ʹ": 44
         }
       },
       "normalizer": {"type": "BertNormalizer", "clean_text": true,
@@ -80,6 +83,13 @@ int main() {
         check("HĒLLŌ", {5}, "Latin Extended-A uppercase accents");
         check("he\xcc\x84llo\xcc\x84", {5}, "decomposed Latin Extended-A accents");
         check("İstanbul Dvořák ČESKÝ Łódź ŠKODA", {19, 20, 21, 22, 23}, "Latin Extended-A names");
+        check("ΑΘΉΝΑ ΜΟΣΧΑ МОСКВА ЙОГА ЁЛКА", {28, 1, 29, 30, 31},
+              "Greek and Cyrillic case and canonical accents");
+        check("Αθήνα йога ёлка", {28, 30, 31}, "decomposed Greek and Cyrillic accents");
+        check("[MASK]Αθήνα[MASK]Москва", {4, 28, 4, 29},
+              "Greek and Cyrillic around preserved special tokens");
+        check("ΐ ΰ", {39, 40}, "recursive Greek canonical decomposition");
+        check("ʹ", {43}, "Greek singleton canonical decomposition");
         check("CAF\xc3\x89 [MASK] playing", {16, 4, 17, 18}, "normalization on both sides");
         check("playing", {17, 18}, "ordinary wordpieces");
         // Expected token IDs were checked with Hugging Face tokenizers 0.22.2.
@@ -118,6 +128,14 @@ int main() {
     check_ids(accented->encode("İ HĒLLŌ"), {24, 25},
               "lowercase preserves accents when stripping is disabled");
 
+    check_ids(accented->encode("ΑΘΉΝΑ МОСКВА ЙОГА ЁЛКА"), {32, 29, 33, 34},
+              "Greek and Cyrillic accents remain when stripping is disabled");
+
+    check_ids(accented->encode("ΐ ΰ"), {41, 42},
+              "recursive Greek accents remain when stripping is disabled");
+
+    check_ids(accented->encode("ʹ"), {44}, "Greek singleton remains without NFD stripping");
+
     std::string cased_json = tokenizer_json;
     cased_json.replace(cased_json.find("\"lowercase\": true"),
                        std::string("\"lowercase\": true").size(), "\"lowercase\": false");
@@ -126,6 +144,9 @@ int main() {
     auto cased = trtmc::CreateWordPieceTokenizer(cased_json.data(), cased_json.size(), false);
     check_ids(cased->encode("HĒLLŌ İ"), {26, 27},
               "accent stripping preserves case when lowercasing is disabled");
+
+    check_ids(cased->encode("ΑΘΉΝΑ МОСКВА ЙОГА ЁЛКА"), {35, 36, 37, 38},
+              "Greek and Cyrillic accent stripping preserves uppercase");
 
     return failures == 0 ? 0 : 1;
 }
