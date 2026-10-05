@@ -15,7 +15,9 @@ from families.nomic_bert.cli import BuildRequest, build_bundle
 from tools.e2e_evidence import evidence_stage, record_evidence
 
 
-MANIFEST = json.loads((Path(__file__).parent / "manifests/nomic-embed-text-v1.5.json").read_text())
+MANIFEST = json.loads(
+    (Path(__file__).parent / "manifests/nomic-embed-text-v1.5.json").read_text(encoding="utf-8")
+)
 CASES = {case["name"]: case for case in MANIFEST["testcases"]}
 
 

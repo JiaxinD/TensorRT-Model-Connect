@@ -29,6 +29,12 @@
       "premerge": true
     },
     {
+      "name": "nomic-v1.5-greek-cyrillic",
+      "reference_precision": "fp32",
+      "prompt": "ΑΘΉΝΑ, Москва, ЙОГА and ЁЛКА.",
+      "premerge": true
+    },
+    {
       "name": "nomic-v1.5-empty",
       "reference_precision": "fp32",
       "prompt": "",
