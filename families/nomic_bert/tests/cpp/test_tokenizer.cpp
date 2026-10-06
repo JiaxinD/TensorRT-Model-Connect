@@ -41,7 +41,12 @@ int main() {
           "skoda": 23, "i̇": 24, "hēllō": 25, "HELLO": 26, "I": 27,
           "αθηνα": 28, "москва": 29, "иога": 30, "елка": 31,
           "αθήνα": 32, "йога": 33, "ёлка": 34, "ΑΘΗΝΑ": 35,
-          "МОСКВА": 36, "ИОГА": 37, "ЕЛКА": 38, "ι": 39, "υ": 40, "ΐ": 41, "ΰ": 42, "ʹ": 43, "ʹ": 44
+          "МОСКВА": 36, "ИОГА": 37, "ЕЛКА": 38, "ι": 39, "υ": 40, "ΐ": 41, "ΰ": 42, "ʹ": 43, "ʹ": 44,
+          "¡": 45, "،": 46, "।": 47, "‿": 48, "hello⁒world": 49, "※": 50,
+          "〃": 51, "｡": 52, "hello〆world": 53, "hello々world": 54,
+          "hello﹢world": 55, "hello＋world": 56, "hello＄world": 57,
+          "hello｀world": 58, "hello〱world": 59, "hello⁄world": 60,
+          "hello〿world": 61
         }
       },
       "normalizer": {"type": "BertNormalizer", "clean_text": true,
@@ -92,6 +97,24 @@ int main() {
         check("ʹ", {43}, "Greek singleton canonical decomposition");
         check("CAF\xc3\x89 [MASK] playing", {16, 4, 17, 18}, "normalization on both sides");
         check("playing", {17, 18}, "ordinary wordpieces");
+        check("hello¡world", {5, 45, 6}, "Latin punctuation splits words");
+        check("hello،world", {5, 46, 6}, "Arabic punctuation splits words");
+        check("hello।world", {5, 47, 6}, "Devanagari punctuation splits words");
+        check("hello‿world", {5, 48, 6}, "connector punctuation splits words");
+        check("hello⁒world", {49}, "commercial minus symbol remains inside a word");
+        check("hello※world", {5, 50, 6}, "reference mark punctuation splits words");
+        check("hello〃world", {5, 51, 6}, "CJK punctuation splits words");
+        check("hello｡world", {5, 52, 6}, "halfwidth punctuation splits words");
+        check("hello〆world", {53}, "CJK letter remains inside a word");
+        check("hello々world", {54}, "CJK iteration modifier remains inside a word");
+        check("hello﹢world", {55}, "small mathematical symbol remains inside a word");
+        check("hello＋world", {56}, "fullwidth mathematical symbol remains inside a word");
+        check("hello＄world", {57}, "fullwidth currency symbol remains inside a word");
+        check("hello｀world", {58}, "fullwidth modifier remains inside a word");
+        check("hello〱world", {59}, "vertical iteration modifier remains inside a word");
+        check("hello⁄world", {60}, "fraction slash symbol remains inside a word");
+        check("hello〿world", {61}, "CJK symbol remains inside a word");
+        check("hello$world", {5, 1, 6}, "ASCII currency retains reference punctuation behavior");
         for (const std::string& control :
              {std::string("\xc2\xad"), std::string("\xd8\x80"), std::string("\xe2\x80\x8b"),
               std::string("\xe2\x80\x8e"), std::string("\xe2\x80\xae"), std::string("\xe2\x81\xa0"),
