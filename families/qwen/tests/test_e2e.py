@@ -941,6 +941,7 @@ def _embedding_e2e(manifest, case, model_dir, runtime_root, torch, tmp_path):
         inputs = {key: value.to("cuda") for key, value in inputs.items()}
         with torch.inference_mode():
             hidden = model(**inputs).last_hidden_state
+            hidden_size = model.config.hidden_size
             expected = (
                 torch.nn.functional.normalize(hidden[:, -1, :], p=2, dim=-1)[0]
                 .float()
@@ -958,7 +959,7 @@ def _embedding_e2e(manifest, case, model_dir, runtime_root, torch, tmp_path):
         {"cosine_similarity": 0.99, "l2_distance": 0.1, "embedding_norm_tolerance": 0.001},
     )
     with evidence_stage("compare"):
-        assert actual.shape == expected.shape == (1024,)
+        assert actual.shape == expected.shape == (hidden_size,)
         assert np.isfinite(actual).all() and np.isfinite(expected).all()
         assert abs(float(np.linalg.norm(actual)) - 1) <= 0.001
         assert abs(float(np.linalg.norm(expected)) - 1) <= 0.001
