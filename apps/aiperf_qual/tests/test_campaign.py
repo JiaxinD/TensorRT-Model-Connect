@@ -230,7 +230,7 @@ def test_summary_merges_result_roots(tmp_path):
     (first / "report.json").write_text(json.dumps({
         "task": "text_generation", "verdict": {"category": "pass"},
         "accuracy": [{"suite": "mmlu", "passed": 10, "samples": 10, "required_passes": 9}],
-        "performance_l1": [{"reference_mode": "eager", "light": "green", "speedup": 2.5,
+        "performance": [{"reference_mode": "eager", "light": "green", "speedup": 2.5,
                             "candidate": {"p50_ms": 4.0}, "reference": {"p50_ms": 10.0}}]}))
     failed = tmp_path / "gb300-2/b"
     failed.mkdir(parents=True)
@@ -358,17 +358,17 @@ def test_rejudge_can_take_todays_judging_settings(monkeypatch):
 
     recorded = {"catalog_profile": "bark-small", "absolute": [{"suite": "s", "gate": {"margin": 1.0}}],
                 "supplementary": [{"check": "replay_parity"}],
-                "performance": {"l1": {"output_grader": "parity_audio", "reference_modes": ["eager"]}}}
+                "performance": {"output_grader": "parity_audio", "reference_modes": ["eager"]}}
     today = {"absolute": [{"suite": "s", "gate": {"margin": 2.0}}], "accuracy_source": "absolute",
              "supplementary": [{"check": "replay_parity", "informational": True}],
-             "performance": {"l1": {"output_grader": "parity_audio", "output_grader_params": {"max_rms_ratio": 9.0},
-                                    "reference_modes": ["eager", "compile"]}}}
+             "performance": {"output_grader": "parity_audio", "output_grader_params": {"max_rms_ratio": 9.0},
+                                    "reference_modes": ["eager", "compile"]}}
     monkeypatch.setattr(models, "resolve_model", lambda profile, environment: today)
     current = cli.current_settings(recorded, Environment({}))
     assert current["absolute"] == [{"suite": "s", "gate": {"margin": 2.0}}]
     assert current["supplementary"][0]["informational"]
-    assert current["performance"]["l1"]["output_grader_params"] == {"max_rms_ratio": 9.0}
-    assert current["performance"]["l1"]["reference_modes"] == ["eager"]  # what was measured stays
+    assert current["performance"]["output_grader_params"] == {"max_rms_ratio": 9.0}
+    assert current["performance"]["reference_modes"] == ["eager"]  # what was measured stays
 
 
 def test_summary_keeps_the_latest_result_of_a_profile_run_on_several_roots(tmp_path):
@@ -403,7 +403,7 @@ def test_summary_notes_trtmc_regressions_against_a_baseline(tmp_path):
         (tmp_path / root / "m").mkdir(parents=True)
         (tmp_path / root / "m/report.json").write_text(json.dumps({
             "task": "t", "started": 1.0, "verdict": {"category": "pass"},
-            "performance_l1": [{"reference_mode": "eager", "light": "green", "candidate": {"p50_ms": p50}}]}))
+            "performance": [{"reference_mode": "eager", "light": "green", "candidate": {"p50_ms": p50}}]}))
     text, _ = campaign.summary([tmp_path / "now"], [tmp_path / "before"])
     assert "regression: TRTMC eager p50 +10.0% vs baseline" in text
 
@@ -669,10 +669,10 @@ def test_media_sweep_steps_decomposition_and_light(tmp_path):
     partial = sweep.compare_media(rejected, reference, 5)
     assert partial["light"] == "green" and partial["notes"] == ["candidate failed at 2 steps"]
     assert sweep.decompose(rejected) == {}
-    l2 = {"kind": "media", "endpoint": "image_generation", "prompts": 3, "requests": 3, "candidate": candidate,
+    service_metrics = {"kind": "media", "endpoint": "image_generation", "prompts": 3, "requests": 3, "candidate": candidate,
           "reference": reference, "decomposition": {"candidate": sweep.decompose(candidate), "reference": {}},
           **compared}
-    write_report(tmp_path, {"model": "m", "provenance": {}, "performance_l2": l2})
+    write_report(tmp_path, {"model": "m", "provenance": {}, "service_metrics": service_metrics})
     text = (tmp_path / "report.md").read_text()
     assert "AIPerf image_generation" in text and "100.0 ms per denoising step + 100.0 ms fixed" in text
     assert "| TRTMC | 4 | 500.000 |" in text
@@ -791,3 +791,28 @@ def test_results_follow_the_owners_four_colours_on_the_catalog_request():
     shown = campaign.reported_perf(row("pass", {"catalog": "green", "catalog-near-capacity": "red"}))
     assert [campaign.request_label("m", item) for item in shown] == ["catalog"]
     assert campaign.signal_reason("m", row("perf-issue", {"catalog": "yellow"})) == "catalog: TRTMC about equal to native"
+
+
+def test_quality_dataset_timings_are_the_main_report_and_keep_their_benchmark_label(tmp_path):
+    from trtmc_aiperf_qual import cli, report, report_html
+
+    out = tmp_path / "qwen"
+    out.mkdir()
+    item = {"request": "mmlu-0shot", "reference_mode": "eager", "kind": "natural_dataset", "gate": False,
+            "complete": True, "comparable": True, "light": "informational", "pairs": 2, "matched_pairs": 2,
+            "reference": {"p50_ms": 123.0, "precision": "fp16"},
+            "candidate": {"p50_ms": 45.0, "precision": "fp16"}}
+    result = {"model": "qwen", "task": "text_generation", "performance_source": "quality", "provenance": {},
+              "accuracy_source": "absolute", "accuracy": [{"suite": "mmlu-0shot", "source": "absolute", "status": "pass"}],
+              "performance": [item], "verdict": {"acc": "pass", "perf": "measured", "category": "measured"}}
+    model = {"absolute": [{"suite": "mmlu-0shot"}], "accuracy_source": "absolute", "performance": {}}
+    (out / "model.json").write_text(json.dumps(model))
+    report.write_report(out, result)
+    rows, counts, rank = campaign.collect([tmp_path])
+    assert campaign.reported_perf(rows["qwen"]) == [item]
+    page = report_html.render(rows, counts, rank, tmp_path / "summary.html").read_text()
+    assert "mmlu-0shot" in page and "123 ms" in page and "45.0 ms" in page
+    assert "p50 of the catalog" not in page and "Speedup" not in page
+    cli.rejudge_reports([out])
+    saved = json.loads((out / "report.json").read_text())
+    assert saved["verdict"]["perf"] == "measured" and saved["performance"] == [item]

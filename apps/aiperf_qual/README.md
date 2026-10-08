@@ -17,7 +17,7 @@ It does not use `qualification_tests/benchmark_qualification`.
 
 | Layer | What | Model-specific? |
 |---|---|---|
-| Execution | Two HTTP servers speaking the same `/v1/tasks/{operation}` protocol: TRTMC (`trtmc-perf-serve --backend trtmc`, later `trtmc-server`) and the native reference (`--backend reference`: the generic adapter of the operation, or a family's own pipeline, `families/<family>/reference/adapter.py`). AIPerf sends every request. | No (adapters: per family) |
+| Execution | One workload recorder, with native and TRTMC servers running separately and speaking the same `/v1/tasks/{operation}` protocol: TRTMC (`trtmc-perf-serve --backend trtmc`, later `trtmc-server`) and the native reference (`--backend reference`: the generic adapter of the operation, or a family's own pipeline, `families/<family>/reference/adapter.py`). AIPerf sends every request. | No (adapters: per family) |
 | Task | `config/tasks.yaml`: per catalog Task, its benchmarks (`absolute`) and checks (`supplementary`), and Perf settings. | No |
 | Model | Derived from the catalog entry and its Task. `config/models/<profile>.yaml` holds only exceptions. | Only exceptions |
 
@@ -64,27 +64,80 @@ A suite with `base: catalog` overrides the profile's catalog request with its da
   missing, an `error`, as does a problem the native model did not answer.
 - A parity benchmark against a native model that ran at another precision than TRTMC (the candidate's failed
   natively) uses its `mismatched_precision_gate`.
-- Native copies that run out of GPU memory answer again as half as many copies, down to one.
+- Both sides run separately with one server and concurrency 1. Legacy Acc replica, MPS, and overlap settings
+  are ignored by qualification; their contended timings cannot serve as speed evidence.
 - Every AIPerf run has a deadline: three times the profile's seconds in the run's ledger (`run-all --ledger`, at
   least ten minutes), else 12 hours; a GPU phase that fails before producing its result runs once more.
 - `summary` reports one result per model, worst first: White (no verdict: an error or a failed build; or no valid
   comparison: the native model below a benchmark's floor, a Task without an Acc check, timings that cannot be
   compared), Red (Acc or Perf worse than native beyond its margin), Yellow (Perf about equal to native, which counts
-  as a pass, or an Acc difference not shown either way), Green (a pass). Perf is reported on the catalog request.
+  as a pass, or an Acc difference not shown either way), Green (quality passes with valid comparable timings). Perf is reported on the quality dataset.
 
 ### Performance
 
-**L1** times each timed request on both servers (warmup, then N requests, R runs): the catalog testcase
-(its greedy variant when it samples text; the first gold problem when the testcase is no workload) and, for
-text generation, a near-capacity request filling the bundle. The statistic is the server-side model-call
-p50 per run; the speedup interval is Welch's t interval of the log ratio. A request faster than the settle's
-pace gets enough requests per run to last `min_run_s` (1 s); a sampling speech model's timings compare per second of
-generated audio (`per_audio_second`), as its outputs differ in length. A comparison is white when the
-work or outputs differ (checked on every timed response: tokens or text, media geometry, audio length), a
-side's runs spread more than 5%, the native model ran at another precision than the candidate, or the GPU was
-busy. Timing phases hold the host GPU lock
-(`gpu_lock`), which bundle builds on the same host also take. `torch.compile` (`reference_modes`) and the
-**L2** serving sweeps (`performance.l2`) are opt-in reports outside the verdict.
+One executor sends every workload through AIPerf and writes one `execution.jsonl` evidence stream.
+Workloads have a role: `quality`, `performance`, `both`, or optional `service`. Both consumers reuse
+profiling responses and artifact references; image and video quality scoring does not regenerate outputs
+just to obtain their task-call timings. Warmup is excluded, both backends run separately at concurrency 1,
+and GPU scorers run after their generation servers stop. This costs more wall time than the former
+multi-replica, overlapping Acc schedule.
+
+The report answers two independent questions: the task quality scores on each side and their difference;
+and the native/TRTMC task-call times, precision, and work comparability. Markdown and HTML omit speedup
+ratios; JSON retains them and their intervals for qualification and diagnostics. Quality uses
+its existing task metric and non-inferiority gate. Parity is labelled parity, random-weight models have
+absolute quality N/A, and an unavailable native reference cannot provide a speedup. CLIP-T and video
+validity do not establish temporal, motion, or action correctness; world-model checks establish coarse
+conversion parity only. The family's checks keep their documented coverage and thresholds.
+
+Natural evaluation workloads (`both`) provide timings from the **same outputs used for quality**. Their
+paired geometric speedup and total-time ratio are descriptive; the 90% interval is across dataset units,
+with seeds clustered by problem, not a repeated-run stability interval. Every requested response must be
+present, valid, paired, warmed, and at matching effective precision and declared task-call boundaries.
+Actual work is compared per sample, so different samples may have different lengths. An unmatched
+workload reports its natural-task time ratio and the reason equal-work acceleration is unavailable;
+matched subsets never hide failures or shorter outputs. `max_tokens` alone is not work evidence. No
+mandatory second, forced-length suite is added for variable-output families.
+
+Models with quality benchmarks run **only their required quality workloads**. For example, Qwen uses
+`mmlu-0shot`, and image/video models use their configured quality datasets. Catalog, near-capacity,
+and informational replay checks are not extra default workloads. Each side answers each selected
+problem once, with excluded warmup. The same profiling responses supply Acc, Native/TRTMC task-call
+p50, and AIPerf client metrics. Multiple required benchmarks remain separate, labelled datasets.
+Dataset timing completeness and work comparability are checked; timing results are measurements,
+not repeated-run performance acceptance gates. Quality thresholds remain unchanged. Failed or
+unpaired responses remain visible in each side's timing coverage rather than disappearing into a
+matched subset. Models explicitly lacking a quality benchmark retain one configured performance
+workload and conversion-parity evidence. The explicit `order-check` diagnostic and historical
+fixed-workload reports keep their original statistics. Timing and generation phases hold `gpu_lock`.
+
+Configuration now uses a flat `performance` policy and opt-in `service_metrics`; reports use `performance`
+and `service_metrics` under schema `trtmc.qualification/v2`. Earlier tiered configurations and reports
+are normalized on read, including rejudge, without maintaining another execution path. Rejudge never
+promotes descriptive dataset results to an acceptance gate. `torch.compile` remains an optional labelled
+reference. Service metrics (client latency, throughput, load sweeps) are opt-in and do not affect the
+verdict; the prototype's single execution lane and buffered SSE do not measure token TTFT/ITL.
+
+Every recorded workload also includes AIPerf's native client statistics in `aiperf_metrics`: request
+latency p50/p99, request throughput, output-token throughput when available, and request error rate.
+JSON retains every run's exported statistics and units. Markdown and HTML show one Native/TRTMC table
+per workload, with separate precision, run-count, and total-request columns. Repeated runs use the median
+of each exported statistic; displayed latency p50/p99 are medians of run percentiles, not pooled request
+percentiles. Hovering a metric in HTML shows the range across runs. Different workloads, modes, precisions,
+and concurrency levels are never averaged together. The main Native row uses the declared timing precision
+when available; additional native settings (such as fp32 quality references or compiled modes) appear in
+a separate collapsed section. Precision mismatches remain explicit. Output-token throughput appears only
+where exported; missing metrics stay unavailable and partial statistics show available/total runs.
+HTML shows these tables directly below the model summary, with links from each model and the same
+search/result filters. Summaries reuse existing exports without extra inference or load sweeps and never
+affect acceptance gates or the model verdict.
+
+```yaml
+performance:
+  measurement: {settle_s: 10, warmup: 3, requests: 12, runs: 5, min_run_s: 1.0}
+# Optional for a service workload, e.g. LLM/VLM:
+service_metrics: {isl: 96, osl: 32, concurrency: [1, 4], requests: 32}
+```
 
 ### Reference environments
 
