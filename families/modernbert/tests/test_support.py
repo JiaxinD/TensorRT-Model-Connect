@@ -38,8 +38,7 @@ class Writer:
 
 @pytest.fixture
 def builder(tmp_path, monkeypatch):
-    if importlib.util.find_spec("tensorrt") is None:
-        monkeypatch.setitem(sys.modules, "tensorrt", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "tensorrt", SimpleNamespace())
     model = importlib.import_module("families.modernbert.model")
     config = dict(
         model_type="modernbert",
