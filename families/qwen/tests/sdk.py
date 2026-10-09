@@ -23,7 +23,6 @@ def check_consumers(bundle: Path, runtime_root: Path, prompt: str, case: dict,
                  "use_chat_template", "enable_thinking"):
         if name in case:
             controls[name] = case[name]
-    arguments = [f"{name}={str(value).lower()}" for name, value in controls.items()]
     environment = dict(os.environ)
     environment["LD_LIBRARY_PATH"] = ":".join(
         value for value in (str(runtime_root), environment.get("LD_LIBRARY_PATH", "")) if value
@@ -37,6 +36,11 @@ def check_consumers(bundle: Path, runtime_root: Path, prompt: str, case: dict,
     token_file.write_bytes(struct.pack(f"<{len(ids)}i", *ids))
 
     for mode, source in (("text", prompt), ("tokens", str(token_file))):
+        arguments = [
+            f"{name}={str(value).lower()}"
+            for name, value in controls.items()
+            if mode == "text" or name not in {"use_chat_template", "enable_thinking"}
+        ]
         outputs = []
         for language in ("c", "cpp"):
             executable = build / f"test_qwen_sdk_{language}"
