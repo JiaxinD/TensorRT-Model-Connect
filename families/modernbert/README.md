@@ -18,8 +18,9 @@ Each bundle advertises only its selected Task, plus the document-list Task for
 relevance. Runtime Config is empty. Default/query/document embedding roles use
 the same input processing; no checkpoint-specific prefixes are inferred.
 The pooled-feature Task accepts UTF-8 text or token IDs. Inputs must be nonempty
-after tokenization, within the built sequence profile and vocabulary. The dynamic
-encoder receives exactly the actual input length.
+after tokenization, within the built sequence profile and vocabulary. The TP1
+dynamic encoder receives exactly the actual input length. Fixed TP plans receive
+zero-padded IDs and a fresh validity mask; pooling excludes padding rows.
 
 The existing FP32 TP1 and TP4 E2E cases retain their official CLS reference and
 cosine thresholds. They execute the CLI and public C/C++ consumers against the

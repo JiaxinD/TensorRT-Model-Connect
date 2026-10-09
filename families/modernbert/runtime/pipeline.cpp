@@ -5,6 +5,7 @@
 
 #include "families/modernbert/runtime/pipeline.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -26,11 +27,16 @@ EncoderPipeline::EncoderPipeline(std::unique_ptr<ITrtModule> encoder, std::strin
         throw internal::UnsupportedTask("ModernBERT unsupported task: " + task_);
     if (vocab_size_ <= 0 || max_sequence_length_ <= 0)
         throw std::invalid_argument("ModernBERT requires positive vocabulary and sequence bounds");
-    const auto capacity = encoder_->input_profile_shape("input_ids", encoder_->profile_idx(),
-                                                        ProfileShapeSelector::kMax);
-    if (!encoder_->input_is_dynamic("input_ids") || capacity.size() != 1 ||
-        capacity[0] < max_sequence_length_ || encoder_->tensor_dtype("input_ids") != DType::kInt32)
-        throw std::invalid_argument("ModernBERT requires a compatible dynamic input_ids profile");
+    const bool dynamic = encoder_->input_is_dynamic("input_ids");
+    const auto capacity = dynamic
+                              ? encoder_->input_profile_shape("input_ids", encoder_->profile_idx(),
+                                                              ProfileShapeSelector::kMax)
+                              : encoder_->tensor_shape("input_ids");
+    if (capacity.size() != 1 || capacity[0] < max_sequence_length_ ||
+        encoder_->tensor_dtype("input_ids") != DType::kInt32)
+        throw std::invalid_argument("ModernBERT requires a compatible input_ids profile");
+    if (!dynamic)
+        fixed_sequence_length_ = static_cast<std::size_t>(capacity[0]);
     mask_dtype_ = encoder_->tensor_dtype("attention_mask");
     if (mask_dtype_ != DType::kInt32 && mask_dtype_ != DType::kFloat32)
         throw std::invalid_argument("ModernBERT attention_mask must be int32 or float32");
@@ -74,17 +80,22 @@ std::vector<float> EncoderPipeline::forward(const std::vector<std::int32_t>& ids
         if (id < 0 || id >= vocab_size_)
             throw std::invalid_argument("ModernBERT token ID is outside the vocabulary");
     auto ids_copy = ids;
-    const auto length = static_cast<std::int64_t>(ids.size());
+    const auto input_size = fixed_sequence_length_ ? fixed_sequence_length_ : ids.size();
+    const auto length = static_cast<std::int64_t>(input_size);
+    // Note (Jiaxin Deng): Fixed TP plans need a fresh zeroed tail on every request.
+    ids_copy.resize(input_size, 0);
     std::vector<std::int32_t> mask_i32;
     std::vector<float> mask_f32;
     Tensor mask;
     mask.shape = {length};
     mask.dtype = mask_dtype_;
     if (mask_dtype_ == DType::kInt32) {
-        mask_i32.assign(ids.size(), 1);
+        mask_i32.assign(input_size, 0);
+        std::fill_n(mask_i32.begin(), ids.size(), 1);
         mask.data = mask_i32.data();
     } else {
-        mask_f32.assign(ids.size(), 1.0f);
+        mask_f32.assign(input_size, 0.0f);
+        std::fill_n(mask_f32.begin(), ids.size(), 1.0f);
         mask.data = mask_f32.data();
     }
     const auto outputs = encoder_->forward(

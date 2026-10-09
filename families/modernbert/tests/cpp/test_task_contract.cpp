@@ -54,6 +54,8 @@ class Engine final : public ITrtModule {
     bool dynamic{true};
     std::vector<float> states;
     std::vector<std::int64_t> lengths;
+    std::vector<std::vector<std::int32_t>> input_ids;
+    std::vector<std::vector<float>> masks;
     TensorMap forward(const TensorMap& input) override {
         ++calls;
         if (fault == 1)
@@ -62,13 +64,20 @@ class Engine final : public ITrtModule {
         const auto& mask = input.at("attention_mask");
         check(ids.dtype == DType::kInt32 && ids.shape == mask.shape && mask.dtype == mask_dtype);
         lengths.push_back(ids.shape.at(0));
+        input_ids.emplace_back(static_cast<std::int32_t*>(ids.data),
+                               static_cast<std::int32_t*>(ids.data) + ids.numel());
+        masks.emplace_back();
         states.clear();
         for (std::size_t i = 0; i < ids.numel(); ++i) {
-            check(mask_dtype == DType::kInt32 ? static_cast<std::int32_t*>(mask.data)[i] == 1
-                                              : static_cast<float*>(mask.data)[i] == 1.0f);
+            const auto valid = mask_dtype == DType::kInt32
+                                   ? static_cast<float>(static_cast<std::int32_t*>(mask.data)[i])
+                                   : static_cast<float*>(mask.data)[i];
+            check(valid == 0.0f || valid == 1.0f);
+            masks.back().push_back(valid);
             const auto value = static_cast<float>(static_cast<std::int32_t*>(ids.data)[i]);
-            states.push_back(value);
-            states.push_back(value * 2.0f);
+            check(valid != 0.0f || value == 0.0f);
+            states.push_back(valid == 0.0f ? 1000.0f : value);
+            states.push_back(valid == 0.0f ? 500.0f : value * 2.0f);
         }
         if (fault == 2)
             return {};
@@ -104,8 +113,9 @@ class Engine final : public ITrtModule {
                                           : DType::kFloat32;
     }
     std::vector<std::int64_t> tensor_shape(const std::string& name) const override {
-        return name == "hidden_states" ? std::vector<std::int64_t>{-1, 2}
-                                       : std::vector<std::int64_t>{-1};
+        const std::int64_t length = dynamic ? -1 : 4;
+        return name == "hidden_states" ? std::vector<std::int64_t>{length, 2}
+                                       : std::vector<std::int64_t>{length};
     }
     std::vector<std::int64_t> input_profile_shape(const std::string&, std::int32_t,
                                                   ProfileShapeSelector) const override {
@@ -123,10 +133,11 @@ class Engine final : public ITrtModule {
     void keep_alive(std::shared_ptr<void>) override {}
 };
 
-void pooled_contract(DType mask_dtype) {
+void pooled_contract(DType mask_dtype, bool dynamic) {
     auto engine = std::make_unique<Engine>();
     auto* observed = engine.get();
     observed->mask_dtype = mask_dtype;
+    observed->dynamic = dynamic;
     auto tokenizer = std::make_shared<Tokenizer>();
     modernbert::EncoderPipeline model(std::move(engine), "text_to_pooled_features", tokenizer, 100,
                                       4);
@@ -138,7 +149,14 @@ void pooled_contract(DType mask_dtype) {
     check(first.values == std::vector<float>({1, 2}) && first.pooling == "cls" &&
           first.normalization == "none");
     check(second.values == std::vector<float>({3, 6}));
-    check(observed->lengths == std::vector<std::int64_t>({2, 1}));
+    check(observed->lengths ==
+          (dynamic ? std::vector<std::int64_t>{2, 1} : std::vector<std::int64_t>{4, 4}));
+    if (!dynamic) {
+        check(observed->input_ids[0] == std::vector<std::int32_t>({1, 2, 0, 0}));
+        check(observed->input_ids[1] == std::vector<std::int32_t>({3, 0, 0, 0}));
+        check(observed->masks[0] == std::vector<float>({1, 1, 0, 0}));
+        check(observed->masks[1] == std::vector<float>({1, 0, 0, 0}));
+    }
     std::vector<std::int32_t> ids{7, 8};
     check(task->run({Span<const std::int32_t>(ids.data(), ids.size())}, {}).values ==
           std::vector<float>({7, 14}));
@@ -162,8 +180,9 @@ void pooled_contract(DType mask_dtype) {
     }
 }
 
-void embedding_contract() {
+void embedding_contract(bool dynamic) {
     auto engine = std::make_unique<Engine>();
+    engine->dynamic = dynamic;
     modernbert::EncoderPipeline model(std::move(engine), "text_to_embedding",
                                       std::make_shared<Tokenizer>(), 100, 4);
     const auto bindings = model.task_bindings();
@@ -209,18 +228,14 @@ void relevance_contract() {
 
 int main() {
     try {
-        pooled_contract(trtmc::DType::kInt32);
-        pooled_contract(trtmc::DType::kFloat32);
-        embedding_contract();
+        for (const bool dynamic : {true, false}) {
+            pooled_contract(trtmc::DType::kInt32, dynamic);
+            pooled_contract(trtmc::DType::kFloat32, dynamic);
+            embedding_contract(dynamic);
+        }
         relevance_contract();
         rejects<trtmc::internal::UnsupportedTask>([] {
             trtmc::modernbert::EncoderPipeline model(std::make_unique<Engine>(), "encoding",
-                                                     std::make_shared<Tokenizer>(), 100, 4);
-        });
-        rejects<std::invalid_argument>([] {
-            auto engine = std::make_unique<Engine>();
-            engine->dynamic = false;
-            trtmc::modernbert::EncoderPipeline model(std::move(engine), "text_to_pooled_features",
                                                      std::make_shared<Tokenizer>(), 100, 4);
         });
         std::cout << "ModernBERT native task contracts passed\n";

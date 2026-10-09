@@ -47,6 +47,7 @@ class EncoderPipeline final : public internal::IModel,
     std::shared_ptr<ITokenizer> tokenizer_;
     std::int64_t vocab_size_;
     std::int64_t max_sequence_length_;
+    std::size_t fixed_sequence_length_{0};
     DType mask_dtype_;
     std::size_t hidden_size_;
 };
