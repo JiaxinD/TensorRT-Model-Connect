@@ -3,6 +3,8 @@
 This family implements `IModel` and `ITextContinuation` with its own binding
 and Config declaration. The existing shared C ABI and header-only C++
 `TextContinuation` wrapper discover that binding. No sibling family is imported.
+Single-process bundles also retain the upstream streaming Task, cancellation and
+exclusive generation lease. Tensor-parallel bundles do not advertise streaming.
 
 The input is UTF-8 text or checkpoint token IDs. Text uses the existing family
 tokenizer and optional chat template. Token IDs are passed directly to the
@@ -28,6 +30,8 @@ stop-check interval 16. An explicit token limit of zero returns an empty
 continuation. Unknown or mistyped options are errors, not silently ignored.
 `repetition_penalty` accepts only the neutral value 1: the existing sampler does
 not implement a non-neutral penalty. No new sampling algorithm is added.
+`system_prompt` retains the upstream ChatML behavior and requires
+`use_chat_template=true`.
 
 ## Validation
 
@@ -47,7 +51,7 @@ build/test_qwen_sdk_c model.bundle build text "Hello" max_new_tokens=20
 build/test_qwen_sdk_cpp model.bundle build text "Hello" max_new_tokens=20
 ```
 
-The Config CTest target also builds both SDK consumers. Existing E2Es use
+The family and Config CTest targets also build both SDK consumers. Existing E2Es use
 `TRTMC_NATIVE_BUILD_DIR` to locate them. The server consumer must support semantic
 Tasks before serving a migrated family; legacy-interface inheritance is not kept
 in this family to work around an unmigrated application.

@@ -43,6 +43,8 @@ inline Span<const internal::ConfigField> text_config_fields() {
          "Apply the checkpoint chat template to text inputs"},
         {"enable_thinking", ConfigKind::Bool, ConfigValue{true},
          "Enable thinking when the checkpoint template supports it"},
+        {"system_prompt", ConfigKind::String, ConfigValue{std::string_view{}},
+         "Chat template system message"},
         {"stop_on_boxed_answer", ConfigKind::Bool, ConfigValue{false},
          "Stop at a completed boxed or final answer"},
         {"stop_check_interval", ConfigKind::I64, ConfigValue{std::int64_t{16}},
@@ -88,6 +90,9 @@ inline TextGenerationConfig parse_text_config(internal::ConfigView supplied) {
         config_get<std::string_view>(supplied, fields, "generation_mode").value();
     config.use_chat_template = config_get<bool>(supplied, fields, "use_chat_template").value();
     config.enable_thinking = config_get<bool>(supplied, fields, "enable_thinking").value();
+    config.system_prompt = config_get<std::string_view>(supplied, fields, "system_prompt").value();
+    if (!config.use_chat_template && !config.system_prompt.empty())
+        throw ConfigError("system_prompt requires use_chat_template");
     config.stop_on_boxed_answer =
         config_get<bool>(supplied, fields, "stop_on_boxed_answer").value();
     config.stop_check_interval = integer("stop_check_interval");

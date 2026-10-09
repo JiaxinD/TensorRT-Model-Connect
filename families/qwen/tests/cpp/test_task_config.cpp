@@ -57,7 +57,8 @@ int main() {
                 defaults.seed == -1 && defaults.eos_token_id == -1 &&
                 defaults.text_generation_mode == "auto" && !defaults.use_chat_template &&
                 defaults.enable_thinking && !defaults.stop_on_boxed_answer &&
-                defaults.stop_check_interval == 16 && defaults.repetition_penalty == 1);
+                defaults.stop_check_interval == 16 && defaults.repetition_penalty == 1 &&
+                defaults.system_prompt.empty());
         const ConfigEntry supplied[] = {
             {"max_new_tokens", std::int64_t{0}},
             {"temperature", 0.5},
@@ -68,6 +69,7 @@ int main() {
             {"eos_token_id", std::int64_t{2}},
             {"generation_mode", std::string_view{"ar"}},
             {"use_chat_template", true},
+            {"system_prompt", std::string_view{"system"}},
             {"enable_thinking", false},
             {"stop_on_boxed_answer", true},
             {"stop_check_interval", std::int64_t{3}},
@@ -79,7 +81,7 @@ int main() {
                 configured.seed == 7 && configured.eos_token_id == 2 &&
                 configured.text_generation_mode == "ar" && configured.use_chat_template &&
                 !configured.enable_thinking && configured.stop_on_boxed_answer &&
-                configured.stop_check_interval == 3);
+                configured.stop_check_interval == 3 && configured.system_prompt == "system");
         const ConfigEntry boundaries[] = {{"temperature", 0.0},
                                           {"top_k", std::int64_t{0}},
                                           {"top_p", 0.0},
@@ -103,6 +105,7 @@ int main() {
                  ConfigEntry{"min_p", -0.1},
                  ConfigEntry{"min_p", 1.1},
                  ConfigEntry{"repetition_penalty", 1.2},
+                 ConfigEntry{"system_prompt", std::string_view{"system"}},
              })
             rejects([&] { parse_text_config({&bad, 1}); });
         return 0;
