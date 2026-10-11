@@ -20,7 +20,7 @@ def build_engine(config, weights, capacity, precision, verbose=False):
     settings.clear_flag(trt.BuilderFlag.TF32)
     profile = builder.create_optimization_profile()
     for name in ("token_id", "position_id"):
-        profile.set_shape(name, (1,), (min(128, capacity),), (capacity,))
+        profile.set_shape(name, (2,), (min(128, capacity),), (capacity,))
     settings.add_optimization_profile(profile)
     tokens = network.add_input("token_id", trt.int32, (-1,))
     positions = network.add_input("position_id", trt.int32, (-1,))
@@ -66,9 +66,9 @@ def build(request, writer):
         if request.max_sequence_length is not None
         else min(8192, config.max_position_embeddings)
     )
-    if type(capacity) is not int or not 1 <= capacity <= min(8192, config.max_position_embeddings):
+    if type(capacity) is not int or not 2 <= capacity <= min(8192, config.max_position_embeddings):
         raise ValueError(
-            "EmbeddingGemma2 sequence capacity must be within checkpoint capacity and 8192"
+            "EmbeddingGemma2 sequence capacity must cover BOS/EOS and be within checkpoint capacity and 8192"
         )
     tokenizer = (directory / "tokenizer.json").read_bytes()
     weights = load_weights(directory, config)

@@ -69,7 +69,7 @@ def test_bundle_contract_and_capacity_are_family_owned(tmp_path, monkeypatch):
     assert sections["runtime.json"]["pooling"] == "mean"
     assert sections["runtime.json"]["embedding_dimension"] == 6
     assert sections["runtime.json"]["unsupported_token_ids"] == [14]
-    for invalid in (0, 33, True):
+    for invalid in (0, 1, 33, True):
         with pytest.raises(ValueError):
             request = replace(request, max_sequence_length=invalid)
             model.build(request, writer)

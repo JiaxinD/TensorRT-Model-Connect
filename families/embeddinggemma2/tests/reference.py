@@ -4,7 +4,6 @@
 """Official reference entry point for a separately pinned Transformers environment."""
 
 import argparse
-import hashlib
 import importlib.metadata
 import json
 from pathlib import Path
@@ -17,11 +16,15 @@ def main():
         EmbeddingGemma2Config,
     )
     from transformers.models.embedding_gemma2.modeling_embedding_gemma2 import EmbeddingGemma2Model
-    import transformers.models.embedding_gemma2.modeling_embedding_gemma2 as source
 
-    expected = "f0376b13fb5230b349ce269c4fb40906931744a84df57c1d208f46032941eda7"
-    actual = hashlib.sha256(Path(source.__file__).read_bytes()).hexdigest()
-    if actual != expected:
+    revision = "536ecc007387a50e77603bb5d92100e9b07514cc"
+    installation = json.loads(
+        importlib.metadata.distribution("transformers").read_text("direct_url.json") or "{}"
+    )
+    if (
+        installation.get("url")
+        != f"https://github.com/huggingface/transformers/archive/{revision}.zip"
+    ):
         raise RuntimeError(
             "EmbeddingGemma2 reference requires the documented pinned official source"
         )
@@ -64,7 +67,7 @@ def main():
             {
                 "embedding": embedding.cpu().tolist(),
                 "token_ids": ids,
-                "modeling_sha256": actual,
+                "transformers_source_revision": revision,
                 "transformers_version": importlib.metadata.version("transformers"),
             }
         )

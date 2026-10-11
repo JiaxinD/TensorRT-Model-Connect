@@ -21,7 +21,7 @@ EmbeddingGemma2Pipeline::EmbeddingGemma2Pipeline(std::unique_ptr<ITrtModule> enc
       vocab_size_(vocab_size), capacity_(capacity), unsupported_ids_(std::move(unsupported_ids)),
       model_id_(std::move(model_id)) {
     if (!encoder_ || !encoder_->ok() || !tokenizer_ || dimension_ < 1 || vocab_size_ < 1 ||
-        capacity_ < 1 || capacity_ > 8192 || model_id_.empty())
+        capacity_ < 2 || capacity_ > 8192 || model_id_.empty())
         throw std::invalid_argument("EmbeddingGemma2 invalid bundle runtime contract");
     for (const auto& name : {"token_id", "position_id"}) {
         const auto maximum = encoder_->input_profile_shape(name, encoder_->profile_idx(),

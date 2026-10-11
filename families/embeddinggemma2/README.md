@@ -9,7 +9,7 @@ default input receives no prefix. BOS/EOS come from `tokenizer.json`, including
 for empty text. Inputs exceeding engine capacity fail without truncation.
 
 The scoped implementation supports unpadded single inputs, TP1/CP1, FP32 and
-BF16, and up to 8192 tokens including prefixes and special tokens. FP16 is
+BF16, and a capacity of 2 to 8192 tokens including prefixes and special tokens. FP16 is
 rejected, as documented by the publisher. It does not implement image, audio,
 video, batching, quantization, or retrieval indexing. Modality placeholder
 tokens are rejected by the text runtime. No compatible multimodal Task is
