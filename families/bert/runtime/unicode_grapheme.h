@@ -1,10 +1,12 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0 AND Unicode-3.0
- * Unicode property data: Copyright (c) 1991-2024 Unicode, Inc.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
+
+// Unicode property data: Copyright (c) 1991-2024 Unicode, Inc.
+// Distributed under Unicode-3.0, see UNICODE-LICENSE.txt.
 
 #include <algorithm>
 #include <cstdint>
