@@ -44,7 +44,7 @@ class ModelRegistry:
         request_timeout: float,
     ) -> None:
         if not specs:
-            raise ValueError("at least one text model is required")
+            raise ValueError("at least one model is required")
         if len({spec.name for spec in specs}) != len(specs):
             raise ValueError("model names must be unique")
         self._specs = {spec.name: spec for spec in specs}
@@ -125,6 +125,19 @@ class ModelRegistry:
             value = 128
         return min(value, hard_cap)
 
+    def supports_streaming(self, model: str) -> bool:
+        metadata = self._metadata.get(model)
+        if metadata is None:
+            raise ModelNotFoundError(f"model {model!r} is not registered")
+        return (metadata.get("protocol_version") == 2 and
+                "streaming_text_continuation" in metadata.get("capabilities", []))
+
+    def supports(self, model: str, capability: str) -> bool:
+        metadata = self._metadata.get(model)
+        if metadata is None:
+            raise ModelNotFoundError(f"model {model!r} is not registered")
+        return capability in metadata.get("capabilities", [])
+
     def models(self) -> list[dict[str, Any]]:
         return [
             {
@@ -132,6 +145,10 @@ class ModelRegistry:
                 "object": "model",
                 "created": self._started_at,
                 "owned_by": "tensorrt-model-connect",
+                "trtmc": {"streaming": ("incremental" if self.supports_streaming(name) else
+                                         "buffered" if self.supports(name, "text_generation") else "none"),
+                          "capabilities": self._metadata.get(name, {}).get("capabilities", []),
+                          "protocol_version": self._metadata.get(name, {}).get("protocol_version")},
             }
             for name in self._order
         ]
@@ -151,8 +168,10 @@ class ModelRegistry:
 
     @staticmethod
     def _validate_ready(metadata: dict[str, Any]) -> None:
-        if metadata.get("event") != "ready" or metadata.get("protocol_version") != 1:
+        if metadata.get("event") != "ready" or type(metadata.get("protocol_version")) is not int or metadata.get("protocol_version") not in (1, 2):
             raise WorkerProtocolError("worker uses an unsupported ready protocol")
         capabilities = metadata.get("capabilities")
-        if not isinstance(capabilities, list) or "text_generation" not in capabilities:
-            raise WorkerProtocolError("worker does not advertise text_generation")
+        if (not isinstance(capabilities, list) or not capabilities or
+                not all(isinstance(value, str) for value in capabilities) or
+                not {"text_generation", "embeddings", "reranking"}.intersection(capabilities)):
+            raise WorkerProtocolError("worker does not advertise a supported capability")

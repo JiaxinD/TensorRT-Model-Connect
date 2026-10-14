@@ -35,7 +35,8 @@
           ],
           "type": "string",
           "choices": [
-            "text_generation"
+            "text_generation",
+            "vision_language_generation"
           ],
           "default": "text_generation"
         },
@@ -112,7 +113,8 @@
           "choices": [
             "none",
             "nvfp4",
-            "fp8"
+            "fp8",
+            "int4_awq"
           ]
         },
         {
@@ -122,9 +124,11 @@
           ],
           "type": "string",
           "choices": [
-            "dspark"
+            "dspark",
+            "dflash",
+            "mtp"
           ],
-          "help": "Explicit paired execution mode; no automatic draft discovery"
+          "help": "Explicit execution mode; MTP uses an embedded draft, external companions are explicit"
         },
         {
           "name": "companion",

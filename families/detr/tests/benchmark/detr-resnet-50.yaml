@@ -23,7 +23,7 @@ accuracy:
     benchmark: coco2017_object_detection
     samples: 100
     label_space: coco-category-id
-    request: &detection-request
+    request:
       score_threshold: 0.5
     reference:
       command: reference.py
@@ -37,7 +37,7 @@ performance:
     benchmark: object_detection_performance
     operation: detect
     request:
-      <<: *detection-request
+      score_threshold: 0.5
       image_path: ../data/test_img.jpeg
     measurement:
       warmup: 5

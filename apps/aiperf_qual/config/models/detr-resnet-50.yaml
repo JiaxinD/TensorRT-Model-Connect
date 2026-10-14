@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# DETR numbers classes by COCO category id and keeps detections scoring 0.5 or more (its model card).
+# The dynamic engine's height/width limits cover both portrait and landscape
+# COCO images. Each request runs at its actual DETR resize shape, like native.
+candidate:
+  build: {name: detr-resnet-50-coco, image_height: 1333, image_width: 1333}
+absolute: [{name: coco, metric_params: {label_space: coco-category-id}, request: {score_threshold: 0.5}}]
+
+reference:
+  requirements: families/detr/requirements.txt  # the family's dependencies, layered on the serving interpreter

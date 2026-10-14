@@ -22,6 +22,11 @@ excluded_profiles:
     reason: >-
       Checkpoint E2E coverage is declared, but target-GPU parity and a release
       performance workload/receipt remain unverified.
+  - model: parakeet-tdt-0.6b-v3
+    reason: >-
+      The family-local migration has no release-performance workload or receipt
+      yet. Target-GPU engine conversion and exact-transcript E2E parity remain
+      unverified; no performance qualification is claimed.
   - model: qwen3-embedding-0.6b
     reason: >-
       The migrated embedding task has no release-performance workload or receipt
@@ -39,7 +44,7 @@ excluded_profiles:
       but no user-facing release-performance workload or receipt has been added.
   - model: s1-mini-fp16
     reason: >-
-      families/s1_mini has no release-performance workload or receipt yet;
+      The Qwen-owned S1 Mini profile has no release-performance workload or receipt yet;
       E2E parity has not been established on this head. Excluded pending a
       defined workload and a verified receipt.
   - model: lfm2-1.2b
@@ -903,6 +908,45 @@ entries:
         # Match the Accuracy/TRTMC component contract: FP32 T5 encoder,
         # FP16 DiT inputs, and FP32 DiT outputs/scheduler bindings.
         component_precision_contract: pixart_fp16_dit_fp32_t5
+  - id: stable_diffusion.generate_image
+    family: stable_diffusion
+    operation: generate_image
+    model: stable-diffusion-v1-5
+    workload:
+      testcase: stable-diffusion-v1-5
+    baseline:
+      runner: task-reference
+      adapter: hf-diffusers
+      mode: hf-eager
+      reference_backend: hf_diffusers
+      timing_scope: task-pipeline-call-wall
+      output_contract: media-shape
+  - id: rt_detr_v2.detect
+    family: rt_detr_v2
+    operation: detect
+    model: rtdetr-v2-r18
+    workload:
+      testcase: rtdetr-v2-r18
+    baseline:
+      runner: task-reference
+      script: tests/benchmark/reference.py
+      mode: hf-eager
+      reference_backend: hf_transformers
+      timing_scope: task-model-call-wall
+      input_preparation_included: false
+  - id: birefnet.segment
+    family: birefnet
+    operation: segment
+    model: birefnet-lite
+    workload:
+      testcase: birefnet-lite
+    baseline:
+      runner: task-reference
+      script: tests/benchmark/reference.py
+      mode: hf-eager
+      reference_backend: hf_transformers
+      timing_scope: task-model-call-wall
+      input_preparation_included: false
   - id: qwen.generate
     family: qwen
     operation: generate

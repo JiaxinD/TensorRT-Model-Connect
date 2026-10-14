@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from typing import Any
 
@@ -47,12 +48,52 @@ def extract_result(result: Any) -> tuple[str, int, dict[str, float]]:
     if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
         raise WorkerProtocolError("worker generate result has invalid completion_tokens")
     timings: dict[str, float] = {}
-    for name in ("setup_ms", "prefill_ms", "decode_ms"):
+    for name in ("setup_ms", "prefill_ms", "decode_ms", "model_call_ms"):
+        if name == "model_call_ms" and name not in result:
+            continue
         value = result.get(name, 0.0)
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             raise WorkerProtocolError(f"worker generate result has invalid {name}")
         timings[name] = float(value)
     return str(result["text"]), tokens, timings
+
+
+def _finite_number(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def extract_embedding(result: Any) -> tuple[list[float], dict[str, float]]:
+    if not isinstance(result, Mapping):
+        raise WorkerProtocolError("worker embedding result must be an object")
+    values = result.get("values")
+    if (not isinstance(values, list) or not values or
+            type(result.get("dim")) is not int or result["dim"] != len(values) or
+            any(not _finite_number(value) for value in values)):
+        raise WorkerProtocolError("worker embedding result must contain a complete finite vector")
+    return values, extract_task_timing(result)
+
+
+def extract_ranking(result: Any, expected_count: int) -> tuple[list[float], dict[str, float]]:
+    if not isinstance(result, Mapping):
+        raise WorkerProtocolError("worker ranking result must be an object")
+    scores = result.get("scores")
+    if (not isinstance(scores, list) or len(scores) != expected_count or
+            any(not _finite_number(value) for value in scores)):
+        raise WorkerProtocolError("worker ranking result must contain one finite score per passage")
+    return scores, extract_task_timing(result)
+
+
+def extract_task_timing(result: Mapping[str, Any]) -> dict[str, float]:
+    wall = result.get("model_call_ms")
+    if (not _finite_number(wall) or wall < 0 or
+            result.get("timing_scope") != "public_task_call_wall"):
+        raise WorkerProtocolError("worker result has invalid public Task timing")
+    return {"model_call_ms": float(wall)}
 
 
 def public_worker_error(error: Exception) -> str:

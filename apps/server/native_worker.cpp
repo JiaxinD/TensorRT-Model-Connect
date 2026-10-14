@@ -8,16 +8,21 @@
 #include "config.h"
 #include "task_runtime.h"
 #include "trtmc/control.hpp"
+#include "trtmc/features.hpp"
 #include "trtmc/runtime/family_loader.h"
+#include "trtmc/stream.hpp"
 #include "trtmc/task.h"
 #include "trtmc/text.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
@@ -174,14 +179,13 @@ std::int64_t default_token_limit(const std::vector<ConfigField>& fields) {
     return 128;
 }
 
-template <class Generate>
-int run_protocol(std::int64_t default_tokens, Generate&& generate, std::istream& input,
-                 std::ostream& output) {
-    if (!write_json(output, {{"event", "ready"},
-                             {"protocol_version", 1},
-                             // This names the private protocol operation, not a Task ABI.
-                             {"capabilities", Json::array({"text_generation"})},
-                             {"default_max_new_tokens", default_tokens}}))
+using StreamGenerate =
+    std::function<Json(const std::string&, const Json&, const Json&, std::ostream&)>;
+using Operations = std::map<std::string, std::function<Json(const Json&)>>;
+
+int run_protocol(const Json& ready, const Operations& operations, std::istream& input,
+                 std::ostream& output, StreamGenerate stream_generate = {}) {
+    if (!write_json(output, ready))
         return 2;
 
     std::vector<char> buffer(kMaxLineBytes + 2U);
@@ -219,14 +223,31 @@ int run_protocol(std::int64_t default_tokens, Generate&& generate, std::istream&
             if (operation == "shutdown") {
                 response = {{"id", id}, {"ok", true}, {"result", {{"status", "shutting_down"}}}};
                 shutdown = true;
-            } else if (operation == "generate") {
+            } else if (operation == "generate_stream") {
+                if (!stream_generate)
+                    throw ProtocolError("incremental streaming is unsupported by this model");
                 const auto prompt = string_field(request, "prompt", true);
-                response = {{"id", id}, {"ok", true}, {"result", generate(prompt, request)}};
+                response = {{"id", id},
+                            {"ok", true},
+                            {"event", "complete"},
+                            {"result", stream_generate(prompt, request, id, output)}};
+            } else if (const auto handler = operations.find(operation);
+                       handler != operations.end()) {
+                response = {{"id", id}, {"ok", true}, {"result", handler->second(request)}};
             } else {
                 throw ProtocolError("unknown operation: " + operation);
             }
         } catch (const ProtocolError& error) {
             response = error_response(id, "invalid_request_error", error.what());
+        } catch (const Error& error) {
+            if (error.code() == TRTMC_INVALID_ARGUMENT || error.code() == TRTMC_INVALID_CONFIG) {
+                response = error_response(id, "invalid_request_error",
+                                          "request is invalid for this model");
+            } else {
+                std::cerr << "[trtmc.server.worker] " << error.what() << '\n';
+                response = error_response(id, "runtime_error", "native worker operation failed");
+                fatal = true;
+            }
         } catch (const std::exception& error) {
             std::cerr << "[trtmc.server.worker] " << error.what() << '\n';
             response = error_response(id, "runtime_error", "native worker operation failed");
@@ -246,21 +267,232 @@ int run_protocol(std::int64_t default_tokens, Generate&& generate, std::istream&
     return input.bad() ? 2 : 0;
 }
 
+template <class Generate>
+int run_text_protocol(std::int64_t default_tokens, Generate&& generate, std::istream& input,
+                      std::ostream& output, StreamGenerate streaming = {}) {
+    Json capabilities = Json::array({"text_generation"});
+    if (streaming)
+        capabilities.push_back("streaming_text_continuation");
+    const Json ready{{"event", "ready"},
+                     {"protocol_version", 2},
+                     {"capabilities", capabilities},
+                     {"default_max_new_tokens", default_tokens}};
+    return run_protocol(ready,
+                        {{"generate",
+                          [&](const Json& request) {
+                              return generate(string_field(request, "prompt", true), request);
+                          }}},
+                        input, output, std::move(streaming));
+}
+
+const std::vector<float>& checked_embedding_values(const EmbeddingResult& result) {
+    if (result.dim <= 0 || static_cast<std::size_t>(result.dim) != result.data.size())
+        throw std::runtime_error("embedding Task returned inconsistent dimensions");
+    return result.data;
+}
+
+template <class Invoke, class Values>
+int run_embedding_protocol(Invoke&& invoke, Values&& extract_values, std::istream& input,
+                           std::ostream& output) {
+    const Json ready{
+        {"event", "ready"}, {"protocol_version", 2}, {"capabilities", Json::array({"embeddings"})}};
+    return run_protocol(
+        ready,
+        {{"embed",
+          [&](const Json& request) {
+              const auto text = string_field(request, "input");
+              const auto started = std::chrono::steady_clock::now();
+              auto result = invoke(text);
+              const auto wall_ms = std::chrono::duration<double, std::milli>(
+                                       std::chrono::steady_clock::now() - started)
+                                       .count();
+              const auto values = extract_values(result);
+              if (values.empty() || !std::all_of(values.begin(), values.end(),
+                                                 [](float v) { return std::isfinite(v); }))
+                  throw std::runtime_error("embedding Task returned invalid values");
+              return Json{{"values", values},
+                          {"dim", values.size()},
+                          {"model_call_ms", wall_ms},
+                          {"timing_scope", "public_task_call_wall"}};
+          }}},
+        input, output);
+}
+
+template <class Invoke, class Scores>
+int run_ranking_protocol(Invoke&& invoke, Scores&& extract_scores, std::istream& input,
+                         std::ostream& output) {
+    const Json ready{
+        {"event", "ready"}, {"protocol_version", 2}, {"capabilities", Json::array({"reranking"})}};
+    return run_protocol(
+        ready,
+        {{"rerank",
+          [&](const Json& request) {
+              const auto query = string_field(request, "query");
+              const auto found = request.find("documents");
+              if (found == request.end() || !found->is_array() || found->empty() ||
+                  !std::all_of(found->begin(), found->end(), [](const Json& value) {
+                      return value.is_string() && !value.get_ref<const std::string&>().empty();
+                  }))
+                  throw ProtocolError("documents must be a non-empty list of non-empty strings");
+              const auto documents = found->get<std::vector<std::string>>();
+              const auto started = std::chrono::steady_clock::now();
+              auto result = invoke(query, documents);
+              const auto wall_ms = std::chrono::duration<double, std::milli>(
+                                       std::chrono::steady_clock::now() - started)
+                                       .count();
+              const auto scores = extract_scores(result);
+              if (scores.size() != documents.size() ||
+                  !std::all_of(scores.begin(), scores.end(),
+                               [](float score) { return std::isfinite(score); }))
+                  throw std::runtime_error("ranking Task returned invalid scores");
+              return Json{{"scores", scores},
+                          {"model_call_ms", wall_ms},
+                          {"timing_scope", "public_task_call_wall"}};
+          }}},
+        input, output);
+}
+
+int run_existing_worker(ITask& task, std::istream& input, std::ostream& output) {
+    // Legacy bundle modes select the declared public Task before invocation.
+    // Several families implement more C++ interfaces than a given bundle enables.
+    if (std::string_view(task.task()) == IEncoding::kTask) {
+        auto* encoder = dynamic_cast<IEncoding*>(&task);
+        if (!encoder)
+            throw std::invalid_argument("bundle does not implement encoding");
+        return run_embedding_protocol(
+            [&](const std::string& text) { return encoder->encode(text); },
+            checked_embedding_values, input, output);
+    }
+    if (std::string_view(task.task()) == IEmbedding::kTask) {
+        auto* embedding = dynamic_cast<IEmbedding*>(&task);
+        if (!embedding)
+            throw std::invalid_argument("bundle does not implement embedding");
+        return run_embedding_protocol(
+            [&](const std::string& text) { return embedding->embed(text); },
+            checked_embedding_values, input, output);
+    }
+
+    if (std::string_view(task.task()) == IReranking::kTask) {
+        auto* ranking = dynamic_cast<IReranking*>(&task);
+        if (!ranking)
+            throw std::invalid_argument("bundle does not implement reranking");
+        return run_ranking_protocol(
+            [&](const std::string& query, const std::vector<std::string>& documents) {
+                return ranking->rerank_batch(query, documents);
+            },
+            [](const std::vector<float>& scores) { return scores; }, input, output);
+    }
+    return run_text_worker(task, input, output);
+}
+
+int run_model_worker(const Model& model, std::istream& input, std::ostream& output) {
+    if (model.supports<TextToEmbedding>()) {
+        const auto task = model.task<TextToEmbedding>();
+        return run_embedding_protocol([&](const std::string& text) { return task.run({text}); },
+                                      [](const SemanticEmbeddingResult& result) {
+                                          return std::vector<float>(result.values().begin(),
+                                                                    result.values().end());
+                                      },
+                                      input, output);
+    }
+    if (model.supports<TextToPooledFeatures>()) {
+        const auto task = model.task<TextToPooledFeatures>();
+        return run_embedding_protocol([&](const std::string& text) { return task.run({text}); },
+                                      [](const PooledFeaturesResult& result) {
+                                          return std::vector<float>(result.values().begin(),
+                                                                    result.values().end());
+                                      },
+                                      input, output);
+    }
+
+    if (model.supports<TextQueryDocumentsToRelevance>()) {
+        const auto task = model.task<TextQueryDocumentsToRelevance>();
+        return run_ranking_protocol(
+            [&](const std::string& query, const std::vector<std::string>& documents) {
+                return task.run({query, documents});
+            },
+            [](const DocumentRelevanceResult& result) {
+                if (result.kind() != TRTMC_SCORE_LOGIT)
+                    throw std::runtime_error("NIM ranking requires raw logit scores");
+                return std::vector<float>(result.scores().begin(), result.scores().end());
+            },
+            input, output);
+    }
+    return run_text_worker(model, input, output);
+}
+
 template <class Task, class Request>
 int run_sdk_worker(const Task& task, Request&& make_request, std::istream& input,
-                   std::ostream& output) {
+                   std::ostream& output, const Model* model = nullptr) {
     const auto fields = task.config_fields();
-    return run_protocol(
+    StreamGenerate streaming;
+    if (model != nullptr && model->supports<StreamingTextContinuation>()) {
+        const auto stream_task = model->task<StreamingTextContinuation>();
+        const auto stream_fields = stream_task.config_fields();
+        streaming = [stream_task, stream_fields](const std::string& prompt, const Json& request,
+                                                 const Json& id, std::ostream& out) {
+            const auto config = parse_sdk_config(request, stream_fields);
+            try {
+                const TextContinuationRequest input{prompt};
+                const auto started = std::chrono::steady_clock::now();
+                auto stream = stream_task.start(input, config);
+                while (auto event = stream.next()) {
+                    if (event->kind() == StreamEventKind::Delta) {
+                        if (!write_json(out, {{"id", id},
+                                              {"ok", true},
+                                              {"event", "delta"},
+                                              {"result",
+                                               {{"text_delta", std::string(event->text_delta())},
+                                                {"token_count", event->token_ids().size()}}}})) {
+                            stream.cancel();
+                            throw std::runtime_error("stream output pipe closed");
+                        }
+                    } else if (event->kind() == StreamEventKind::Complete) {
+                        const auto wall_ms = std::chrono::duration<double, std::milli>(
+                                                 std::chrono::steady_clock::now() - started)
+                                                 .count();
+                        const auto final = event->final_result();
+                        if (!final)
+                            throw std::runtime_error("stream completion has no result");
+                        const auto result = *final;
+                        return Json{
+                            {"text", std::string(result.text)},
+                            {"completion_tokens", result.token_ids.size()},
+                            {"setup_ms", result.setup_ms},
+                            {"prefill_ms", result.prefill_ms},
+                            {"decode_ms", result.decode_ms},
+                            {"model_call_ms", wall_ms},
+                            {"timing_scope", "public_task_stream_wall_including_backpressure"}};
+                    } else {
+                        throw std::runtime_error("native stream was cancelled");
+                    }
+                }
+                throw std::runtime_error("native stream ended without a terminal result");
+            } catch (const Error& error) {
+                if (error.code() == TRTMC_INVALID_ARGUMENT || error.code() == TRTMC_INVALID_CONFIG)
+                    throw ProtocolError("generation request is invalid for this model");
+                throw;
+            }
+        };
+    }
+    return run_text_protocol(
         default_token_limit(fields),
         [&](const std::string& prompt, const Json& request) {
             const auto config = parse_sdk_config(request, fields);
             try {
-                const auto result = task.run(make_request(prompt), config);
+                const auto input = make_request(prompt);
+                const auto started = std::chrono::steady_clock::now();
+                const auto result = task.run(input, config);
+                const auto wall_ms = std::chrono::duration<double, std::milli>(
+                                         std::chrono::steady_clock::now() - started)
+                                         .count();
                 return Json{{"text", std::string(result.text())},
                             {"completion_tokens", result.token_ids().size()},
                             {"setup_ms", result.setup_ms()},
                             {"prefill_ms", result.prefill_ms()},
-                            {"decode_ms", result.decode_ms()}};
+                            {"decode_ms", result.decode_ms()},
+                            {"model_call_ms", wall_ms},
+                            {"timing_scope", "public_task_call_wall"}};
             } catch (const Error& error) {
                 if (error.code() == TRTMC_INVALID_ARGUMENT ||
                     error.code() == TRTMC_INVALID_CONFIG) {
@@ -271,25 +503,35 @@ int run_sdk_worker(const Task& task, Request&& make_request, std::istream& input
                 throw;
             }
         },
-        input, output);
+        input, output, std::move(streaming));
 }
 
 } // namespace
+
+int run_task_worker(ITask& task, std::istream& input, std::ostream& output) {
+    return run_existing_worker(task, input, output);
+}
 
 int run_text_worker(ITask& task, std::istream& input, std::ostream& output) {
     auto* text = dynamic_cast<ITextGeneration*>(&task);
     if (text == nullptr)
         throw std::invalid_argument("bundle task does not implement text generation");
-    return run_protocol(
+    return run_text_protocol(
         text->default_max_new_tokens(),
         [&](const std::string& prompt, const Json& request) {
-            const auto result =
-                text->generate(prompt, parse_config(request, text->default_max_new_tokens()));
+            const auto config = parse_config(request, text->default_max_new_tokens());
+            const auto started = std::chrono::steady_clock::now();
+            const auto result = text->generate(prompt, config);
+            const auto wall_ms = std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - started)
+                                     .count();
             return Json{{"text", result.text},
                         {"completion_tokens", result.token_ids.size()},
                         {"setup_ms", result.setup_ms},
                         {"prefill_ms", result.prefill_ms},
-                        {"decode_ms", result.decode_ms}};
+                        {"decode_ms", result.decode_ms},
+                        {"model_call_ms", wall_ms},
+                        {"timing_scope", "public_task_call_wall"}};
         },
         input, output);
 }
@@ -308,19 +550,32 @@ int run_text_worker(const Model& model, std::istream& input, std::ostream& outpu
             output);
     return run_sdk_worker(
         model.task<TextContinuation>(),
-        [](const std::string& prompt) { return TextContinuationRequest{prompt}; }, input, output);
+        [](const std::string& prompt) { return TextContinuationRequest{prompt}; }, input, output,
+        &model);
 }
 
 int run_bundle_worker(const std::string& bundle, const LoadOptions& options, std::istream& input,
                       std::ostream& output) {
     const auto primary = Bundle::open(bundle).info().task;
     if (app::uses_existing_task_runtime(primary)) {
+        try {
+            const auto model = Model::load(bundle, options);
+            return run_model_worker(model, input, output);
+        } catch (const Error& error) {
+            // Only pre-SDK families may take this compatibility path. Never
+            // retry a malformed SDK binding or a failed Task operation.
+            if (error.code() != TRTMC_UNSUPPORTED ||
+                std::string(error.what())
+                        .find("family has not implemented the Task SDK model interface") ==
+                    std::string::npos)
+                throw;
+        }
         auto task = load_task(bundle, options.runtime_root, options.kv_cache_size_bytes,
                               options.runtime_cache_path, options.cuda_graphs);
-        return run_text_worker(*task, input, output);
+        return run_existing_worker(*task, input, output);
     }
     const auto model = Model::load(bundle, options);
-    return run_text_worker(model, input, output);
+    return run_model_worker(model, input, output);
 }
 
 } // namespace trtmc::server
