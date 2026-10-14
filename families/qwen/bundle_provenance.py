@@ -39,7 +39,7 @@ def _read_provenance(bundle: Path) -> dict:
         header_bytes = source.read(size)
         assert len(header_bytes) == size, "truncated prebuilt bundle header"
         header = _json_object(header_bytes, "header")
-        assert header.get("family") == "qwen" and header.get("task") == "text_generation", (
+        assert header.get("family") == "qwen" and header.get("task") == "text_continuation", (
             "prebuilt bundle has the wrong family or task"
         )
         sections = header.get("sections")

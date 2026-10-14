@@ -45,11 +45,15 @@ def test_sdk_token_inputs_do_not_apply_text_preprocessing(monkeypatch, tmp_path,
                         1, command, stderr="Qwen token-ID input cannot apply a chat template"
                     )
                 assert "enable_thinking" not in controls
+                assert "system_prompt" not in controls
                 assert (tmp_path / "sdk-prefix.i32").read_bytes() == struct.pack("<2i", 7, 8)
                 output = {"text": "tokens", "token_ids": [12]}
             else:
                 assert controls["use_chat_template"] == str(chat_template).lower()
                 assert controls["enable_thinking"] == "false"
+                assert controls["system_prompt"] == (
+                    "Keep CASE and punctuation." if chat_template else ""
+                )
                 output = dict(native)
             output.update(setup_ms=0.0, prefill_ms=1.0, decode_ms=2.0)
         return SimpleNamespace(stdout=json.dumps(output))
@@ -66,6 +70,7 @@ def test_sdk_token_inputs_do_not_apply_text_preprocessing(monkeypatch, tmp_path,
             "top_k": 1,
             "use_chat_template": chat_template,
             "enable_thinking": False,
+            "system_prompt": "Keep CASE and punctuation." if chat_template else "",
         },
         native,
         tmp_path,

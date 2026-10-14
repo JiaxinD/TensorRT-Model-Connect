@@ -16,7 +16,7 @@ def _inputs(tmp_path, monkeypatch):
     model_dir.mkdir(parents=True)
     (model_dir / "config.json").write_text('{"model_type":"qwen"}')
     (model_dir / "model.safetensors").write_bytes(b"checkpoint weights")
-    manifest = {"name": "pilot", "task": "text_generation", "precision": "fp16",
+    manifest = {"name": "pilot", "task": "text_continuation", "precision": "fp16",
                 "max_sequence_length": 256, "tensor_parallel_size": 1, "hf_id": "example/model"}
     bundle = tmp_path / "served.bundle"
     monkeypatch.setenv("TRTMC_E2E_BUNDLE", str(bundle))
@@ -25,7 +25,7 @@ def _inputs(tmp_path, monkeypatch):
 
 def _write_bundle(bundle, manifest, checkpoint):
     writer = BundleWriter(bundle)
-    writer.set_header(family="qwen", task="text_generation", backend="trt")
+    writer.set_header(family="qwen", task="text_continuation", backend="trt")
     writer.add_bytes("engine.plan", b"fixture engine")
     writer.add_json("checkpoint_provenance.json", {
         "version": 1, "checkpoint": checkpoint,
@@ -80,7 +80,7 @@ def test_prebuilt_bundle_rejects_another_build_profile(tmp_path, monkeypatch, fi
 def test_prebuilt_bundle_requires_builder_provenance(tmp_path, monkeypatch):
     model_dir, manifest, bundle = _inputs(tmp_path, monkeypatch)
     writer = BundleWriter(bundle)
-    writer.set_header(family="qwen", task="text_generation", backend="trt")
+    writer.set_header(family="qwen", task="text_continuation", backend="trt")
     writer.add_bytes("engine.plan", b"fixture engine")
     writer.finish()
     monkeypatch.setenv("TRTMC_E2E_PROFILE", "pilot")
@@ -107,10 +107,10 @@ def test_builder_records_snapshot_revision(tmp_path):
 
 @pytest.mark.parametrize("header", [
     None, [], {},
-    {"family": "qwen", "task": "text_generation"},
-    {"family": "qwen", "task": "text_generation", "sections": []},
-    {"family": "qwen", "task": "text_generation", "sections": {"checkpoint_provenance.json": []}},
-    *[{"family": "qwen", "task": "text_generation", "sections": {
+    {"family": "qwen", "task": "text_continuation"},
+    {"family": "qwen", "task": "text_continuation", "sections": []},
+    {"family": "qwen", "task": "text_continuation", "sections": {"checkpoint_provenance.json": []}},
+    *[{"family": "qwen", "task": "text_continuation", "sections": {
         "checkpoint_provenance.json": section}}
       for section in ({}, {"offset": "0", "length": 2}, {"offset": True, "length": 2},
                       {"offset": 0, "length": "2"}, {"offset": 0, "length": False},
@@ -129,7 +129,7 @@ def test_prebuilt_reader_rejects_malformed_header_shapes(tmp_path, header):
 def test_prebuilt_reader_rejects_malformed_provenance(tmp_path, payload):
     bundle = tmp_path / "malformed.bundle"
     writer = BundleWriter(bundle)
-    writer.set_header(family="qwen", task="text_generation", backend="trt")
+    writer.set_header(family="qwen", task="text_continuation", backend="trt")
     writer.add_bytes("checkpoint_provenance.json", payload)
     writer.finish()
     with pytest.raises(AssertionError, match="invalid prebuilt provenance"):

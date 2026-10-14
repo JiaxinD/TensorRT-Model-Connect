@@ -20,7 +20,7 @@ def check_consumers(bundle: Path, runtime_root: Path, prompt: str, case: dict,
     build = Path(os.environ["TRTMC_NATIVE_BUILD_DIR"])
     controls = {"max_new_tokens": case["max_new_tokens"]}
     for name in ("temperature", "top_k", "top_p", "min_p", "seed", "repetition_penalty",
-                 "use_chat_template", "enable_thinking"):
+                 "use_chat_template", "enable_thinking", "system_prompt"):
         if name in case:
             controls[name] = case[name]
     environment = dict(os.environ)
@@ -37,9 +37,9 @@ def check_consumers(bundle: Path, runtime_root: Path, prompt: str, case: dict,
 
     for mode, source in (("text", prompt), ("tokens", str(token_file))):
         arguments = [
-            f"{name}={str(value).lower()}"
+            f"{name}={value if isinstance(value, str) else str(value).lower()}"
             for name, value in controls.items()
-            if mode == "text" or name not in {"use_chat_template", "enable_thinking"}
+            if mode == "text" or name not in {"use_chat_template", "enable_thinking", "system_prompt"}
         ]
         outputs = []
         for language in ("c", "cpp"):

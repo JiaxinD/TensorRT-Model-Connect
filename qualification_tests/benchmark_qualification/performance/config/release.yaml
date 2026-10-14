@@ -18,6 +18,11 @@ defaults:
     asset_loading_included: false
 
 excluded_profiles:
+  - model: parakeet-tdt-0.6b-v3
+    reason: >-
+      The family-local migration has no release-performance workload or receipt
+      yet. Target-GPU engine conversion and exact-transcript E2E parity remain
+      unverified; no performance qualification is claimed.
   - model: qwen3-embedding-0.6b
     reason: >-
       The migrated embedding task has no release-performance workload or receipt
@@ -35,7 +40,7 @@ excluded_profiles:
       but no user-facing release-performance workload or receipt has been added.
   - model: s1-mini-fp16
     reason: >-
-      families/s1_mini has no release-performance workload or receipt yet;
+      The Qwen-owned S1 Mini profile has no release-performance workload or receipt yet;
       E2E parity has not been established on this head. Excluded pending a
       defined workload and a verified receipt.
   - model: lfm2-1.2b

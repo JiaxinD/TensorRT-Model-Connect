@@ -383,6 +383,18 @@ set_target_properties(trtmc PROPERTIES
   INSTALL_RPATH "\$ORIGIN/../${CMAKE_INSTALL_LIBDIR}"
 )
 
+# Dev-only tool: loads one bundle ONCE and generates for many prompts in a
+# single process, to measure/compare decode behavior without re-paying the
+# ~60s per-process engine-deserialization cost of `trtmc run` for each
+# prompt. Not part of the installed/shipped CLI surface.
+add_executable(mtp_batch_runner apps/cli/batch_runner.cpp)
+target_link_libraries(mtp_batch_runner PRIVATE trtmc_runtime nlohmann_json::nlohmann_json)
+target_compile_options(mtp_batch_runner PRIVATE -Wall -Wextra -Wpedantic)
+set_target_properties(mtp_batch_runner PROPERTIES
+  BUILD_RPATH "\$ORIGIN"
+  INSTALL_RPATH "\$ORIGIN"
+)
+
 if(TRTMC_BUILD_SERVER)
   add_library(trtmc_server STATIC
     apps/server/native_worker.cpp
@@ -493,6 +505,7 @@ if(TRTMC_BUILD_TESTS)
   add_executable(test_cli apps/cli/tests/test_cli.cpp)
   target_include_directories(test_cli PRIVATE
     ${PROJECT_SOURCE_DIR}/core/runtime/include
+    ${PROJECT_SOURCE_DIR}/core
     ${PROJECT_SOURCE_DIR}/apps
   )
   target_link_libraries(test_cli PRIVATE trtmc_cli trtmc_c nlohmann_json::nlohmann_json)
@@ -508,6 +521,21 @@ if(TRTMC_BUILD_TESTS)
     target_link_libraries(test_server_worker PRIVATE trtmc_server nlohmann_json::nlohmann_json)
     target_compile_options(test_server_worker PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME server_worker COMMAND test_server_worker)
+
+    add_executable(test_server_embedding_worker apps/server/tests/test_embedding_worker.cpp)
+    target_include_directories(test_server_embedding_worker PRIVATE
+      ${PROJECT_SOURCE_DIR}/apps ${PROJECT_SOURCE_DIR}/core/runtime/include)
+    target_link_libraries(test_server_embedding_worker PRIVATE trtmc_server nlohmann_json::nlohmann_json)
+    target_compile_options(test_server_embedding_worker PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME server_embedding_worker COMMAND test_server_embedding_worker)
+    set_tests_properties(server_embedding_worker PROPERTIES LABELS cpu)
+    add_executable(test_server_ranking_worker apps/server/tests/test_ranking_worker.cpp)
+    target_include_directories(test_server_ranking_worker PRIVATE
+      ${PROJECT_SOURCE_DIR}/apps ${PROJECT_SOURCE_DIR}/core/runtime/include)
+    target_link_libraries(test_server_ranking_worker PRIVATE trtmc_server nlohmann_json::nlohmann_json)
+    target_compile_options(test_server_ranking_worker PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME server_ranking_worker COMMAND test_server_ranking_worker)
+    set_tests_properties(server_ranking_worker PROPERTIES LABELS cpu)
   endif()
 
   add_library(trtmc_test_cli_fixture SHARED apps/cli/tests/test_family_cli.cpp)
@@ -570,12 +598,7 @@ if(TRTMC_BUILD_TESTS)
   )
   target_link_libraries(test_family_loader PRIVATE trtmc_runtime)
   target_compile_options(test_family_loader PRIVATE -Wall -Wextra -Wpedantic)
-  add_dependencies(test_family_loader
-    trtmc_test_backend_fake
-    trtmc_test_backend_fake_rtx
-    trtmc_test_family_fake
-  )
-  add_custom_command(TARGET test_family_loader POST_BUILD
+  add_custom_target(trtmc_test_default_runtime_root
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
       $<TARGET_FILE:trtmc_test_backend_fake>
       $<TARGET_FILE_DIR:trtmc_runtime>
@@ -584,6 +607,17 @@ if(TRTMC_BUILD_TESTS)
       $<TARGET_FILE_DIR:trtmc_runtime>
     COMMENT "Copying fake runtime DSOs beside libtrtmc_runtime for automatic-root testing"
   )
+  add_dependencies(trtmc_test_default_runtime_root
+    trtmc_test_backend_fake
+    trtmc_test_family_fake
+  )
+  add_dependencies(test_family_loader
+    trtmc_test_backend_fake
+    trtmc_test_backend_fake_rtx
+    trtmc_test_family_fake
+    trtmc_test_default_runtime_root
+  )
+  add_dependencies(test_cli trtmc_test_default_runtime_root)
   add_test(NAME family_loader COMMAND test_family_loader "${_trtmc_test_runtime_root}")
 
   set(_trtmc_api_test_runtime_root "${CMAKE_BINARY_DIR}/tests/api-runtime")

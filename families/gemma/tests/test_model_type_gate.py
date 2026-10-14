@@ -204,15 +204,20 @@ def test_untyped_execution_fails_before_side_effects(tmp_path, monkeypatch):
 
 
 
-@pytest.mark.parametrize("variant", ["mtp", "dspark"])
+@pytest.mark.parametrize("model_type", ["gemma4", "gemma4_unified"])
+@pytest.mark.parametrize("variant", [None, "mtp", "dspark", "eagle3", "dflash"])
 @pytest.mark.parametrize("precision", [None, "fp16", "fp32", "bf16"])
 def test_edge_cli_routes_through_the_ordinary_family_entrypoint(
-    tmp_path, monkeypatch, variant, precision
+    tmp_path, monkeypatch, variant, precision, model_type
 ):
-    from families.gemma.edge_llm import builder as edge_builder
+    from families.gemma.edge_llm import builder as edge_builder, standalone
     from tensorrt_model_connect import family_cli as build_cli
 
-    source = _model_dir(tmp_path / "target", "gemma4_unified")
+    source = _model_dir(tmp_path / "target", model_type)
+    config = json.loads((source / "config.json").read_text())
+    config["text_config"] = {"model_type": model_type + "_text"}
+    config["vision_config"] = {}
+    (source / "config.json").write_text(json.dumps(config))
     draft = tmp_path / "draft"
     draft.mkdir()
     output = tmp_path / "pair.bundle"
@@ -221,19 +226,31 @@ def test_edge_cli_routes_through_the_ordinary_family_entrypoint(
     def paired(request, writer, execution):
         assert isinstance(request, GemmaBuildRequest)
         assert request.execution is execution
+        assert request.task == "text_generation"
         assert request.precision == ("fp16" if precision is None else precision)
         seen.append(execution)
         writer.set_header(family="gemma", task=request.task, backend=request.backend)
         writer.add_json("edge-test.json", {"variant": execution.variant})
 
+    def standalone_prepared(request, raw, target, staging, log_path):
+        assert request.task == "images_text_to_text"
+        assert request.precision == ("fp16" if precision is None else precision)
+        assert raw["model_type"] == model_type
+        seen.append("autoregressive")
+        return {}, {"execution_variant": "autoregressive"}
+
     monkeypatch.setattr(edge_builder, "build", paired)
+    monkeypatch.setattr(standalone, "local_target", lambda: {})
+    monkeypatch.setattr(standalone, "prepare", standalone_prepared)
     precision_args = [] if precision is None else ["--precision", precision]
-    assert build_cli.main(["gemma",
-        "build", str(source), *precision_args,
-        "-o", str(output), "--execution-variant", variant,
-        "--companion", f"draft={draft}",
-    ]) == 0
-    assert seen == [BuildExecutionInputs(variant, (NamedCheckpoint("draft", draft),))]
+    execution_args = [] if variant is None else [
+        "--execution-variant", variant, "--companion", f"draft={draft}",
+    ]
+    assert build_cli.main(["gemma", "build", str(source), *precision_args,
+                          "-o", str(output), *execution_args]) == 0
+    expected = ("autoregressive" if variant is None else
+                BuildExecutionInputs(variant, (NamedCheckpoint("draft", draft),)))
+    assert seen == [expected]
     assert output.is_file()
 
 
@@ -284,6 +301,20 @@ def test_edge_request_keeps_graph_callback_and_all_ordinary_fields(tmp_path):
     def callback(layer):
         return layer
     ordinary = replace(execution_request(tmp_path), graph_transform=callback, max_sequence_length=128)
+    # Standalone Edge must not silently discard ordinary build controls.
+    from families.gemma.edge_llm import standalone
+
+    for overrides in (
+        {"max_batch_size": 2}, {"quantization": "fp8"},
+        {"context_parallel_size": 2}, {"dynamic_kv_cache": True},
+        {"fp32_layers": [0]}, {"image_height": 448},
+        {"image_width": 448}, {"video_num_frames": 2},
+        {"graph_transform": callback},
+    ):
+        unsupported = replace(execution_request(tmp_path), **overrides)
+        with pytest.raises(ValueError, match="without build overrides"):
+            standalone.prepare(unsupported, {}, {}, tmp_path, tmp_path / "unused.log")
+
     extended = with_execution(ordinary, inputs(tmp_path))
     for field in fields(BuildRequest):
         assert getattr(extended, field.name) is getattr(ordinary, field.name)
@@ -361,3 +392,132 @@ assert "huggingface_hub" not in sys.modules
 """
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert "trtmc gemma build" in result.stdout
+
+
+@pytest.mark.parametrize("visual_key", ["visual_builder", "onnx_visual_builder"])
+def test_image_only_edge_package_does_not_require_audio_builder(tmp_path, monkeypatch, visual_key):
+    """Published CMake names and earlier media manifests resolve identically."""
+    from families.gemma.edge_llm import builder
+
+    target = {"arch": "x86_64", "sm": 120, "cuda_version": "13.3",
+              "tensorrt_version": "11.1.0.106"}
+    package = {"schema_version": 1, "revision": builder.EDGE_REVISION,
+               "version": "0.11.0", "architectures": [120],
+               "onnx": True, "all_native_kernels": True,
+               "python": "bin/python", "plugin": "lib/plugin.so",
+               "onnx_builder": "bin/llm_build", visual_key: "bin/visual_build",
+               **{key: value for key, value in target.items() if key != "sm"}}
+    manifest = tmp_path / "share/trtmc/edge-llm.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(json.dumps(package))
+    for name in ("python", "plugin", "onnx_builder", visual_key):
+        path = tmp_path / package[name]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"fixture")
+    monkeypatch.setattr(builder, "cmake_prefixes", lambda: [tmp_path])
+    resolved = builder.installed_package(target, vision=True, audio=False)
+    assert resolved["visual_builder"] == str(tmp_path / "bin/visual_build")
+    assert "audio_builder" not in resolved
+    # A checkpoint with an audio tower must still require its actual builder.
+    with pytest.raises(KeyError, match="audio_builder"):
+        builder.installed_package(target, vision=True, audio=True)
+
+
+def test_edge_package_rejects_escaping_media_executable(tmp_path, monkeypatch):
+    from families.gemma.edge_llm import builder
+
+    target = {"arch": "x86_64", "sm": 120, "cuda_version": "13.3",
+              "tensorrt_version": "11.1.0.106"}
+    package = {"schema_version": 1, "revision": builder.EDGE_REVISION,
+               "version": "0.11.0", "architectures": [120], "onnx": False,
+               "python": "bin/python", "plugin": "lib/plugin.so",
+               "onnx_visual_builder": "../outside",
+               **{key: value for key, value in target.items() if key != "sm"}}
+    manifest = tmp_path / "share/trtmc/edge-llm.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(json.dumps(package))
+    for name in ("python", "plugin"):
+        path = tmp_path / package[name]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"fixture")
+    monkeypatch.setattr(builder, "cmake_prefixes", lambda: [tmp_path])
+    with pytest.raises(ValueError, match="contained"):
+        builder.installed_package(target, vision=True)
+
+
+def _packed_gemma_fixture(source):
+    raw = {"model_type": "gemma4", "text_config": {
+        "model_type": "gemma4_text", "enable_moe_block": True,
+        "hidden_size": 2816, "num_hidden_layers": 30, "num_experts": 128,
+        "top_k_experts": 8, "max_position_embeddings": 2048},
+        "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4",
+                                "config_groups": {"group_0": {
+                                    "input_activations": {"dynamic": False, "num_bits": 4,
+                                                          "type": "float", "group_size": 16},
+                                    "weights": {"dynamic": False, "num_bits": 4,
+                                                "type": "float", "group_size": 16},
+                                    "targets": ["Linear"]}},
+                                "kv_cache_scheme": {"dynamic": False, "num_bits": 8, "type": "float"}}}
+    quant = {"quantization": {"quant_algo": "NVFP4", "group_size": 16,
+                              "kv_cache_quant_algo": "FP8"}}
+    (source / "config.json").write_text(json.dumps(raw))
+    (source / "hf_quant_config.json").write_text(json.dumps(quant))
+    return raw
+
+
+@pytest.mark.parametrize("unsupported", ["sm80", "dense", "int4", "packing",
+                                         "missing_sidecar", "legacy_sidecar"])
+def test_standalone_packed_admission_preserves_known_boundaries(tmp_path, unsupported):
+    from families.gemma.edge_llm import standalone
+
+    raw = _packed_gemma_fixture(tmp_path)
+    target = {"sm": 120}
+    if unsupported == "sm80":
+        target["sm"] = 80
+    elif unsupported == "dense":
+        raw["text_config"]["enable_moe_block"] = False
+    elif unsupported == "int4":
+        raw["quantization_config"]["quant_algo"] = "INT4_AWQ"
+    elif unsupported == "packing":
+        raw["quantization_config"]["config_groups"]["group_0"]["weights"]["group_size"] = 32
+    elif unsupported == "missing_sidecar":
+        (tmp_path / "hf_quant_config.json").unlink()
+    else:
+        (tmp_path / "quantize_config.json").write_text("{}")
+    with pytest.raises(ValueError):
+        standalone.checkpoint_quantization(raw, tmp_path, target)
+
+
+def test_standalone_packed_export_preserves_quantization_and_native_target(tmp_path, monkeypatch):
+    from families.gemma.edge_llm import standalone
+
+    source = tmp_path / "source"
+    source.mkdir()
+    raw = _packed_gemma_fixture(source)
+    before = {path.name: path.read_bytes() for path in source.iterdir()}
+    staging = tmp_path / "staging"
+    package = {"python": "/sdk/python", "onnx_builder": "/sdk/llm_build",
+               "plugin": "/sdk/plugin.so", "onnx": True, "all_native_kernels": True}
+    def installed(target, *, vision, audio):
+        assert target == {"sm": 120} and not vision and not audio
+        return package
+    monkeypatch.setattr(standalone, "installed_package", installed)
+    commands = []
+    def run(command, **kwargs):
+        assert kwargs["env"]["EDGELLM_NVFP4_MOE_TARGET"] == "sm12x"
+        assert kwargs["check"] is True
+        commands.append(command)
+        engine = staging / "edge_llm/engine"
+        engine.mkdir(parents=True, exist_ok=True)
+        for name in ("llm.engine", "config.json", "embedding.safetensors", "tokenizer.json",
+                     "tokenizer_config.json", "chat_template.jinja"):
+            (engine / name).write_bytes(b"fixture")
+    monkeypatch.setattr(standalone.subprocess, "run", run)
+    _, marker = standalone.prepare(execution_request(source), raw, {"sm": 120},
+                                    staging, tmp_path / "edge.log")
+    assert commands[0] == ["/sdk/python", "-I", "-m", "tensorrt_edgellm.scripts.export",
+                           str(source), str(staging / "onnx"), "--dtype", "float16"]
+    assert marker["checkpoint_quantization"] == "nvfp4"
+    assert marker["kv_cache_quantization"] == "fp8"
+    assert marker["precision"] == "fp16"
+    assert before == {path.name: path.read_bytes() for path in source.iterdir()}

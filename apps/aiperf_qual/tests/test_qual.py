@@ -264,6 +264,12 @@ def test_models_are_derived_from_the_catalog_and_task_defaults():
     random = resolve_model("qwen3-moe-tiny-random", environment)  # random weights: Perf only
     assert random["accuracy_source"] == "none" and not random["absolute"] and "random" in random["accuracy_note"]
     assert random["performance"]["suite"]["source"]["kind"] == "catalog_testcase"
+    tiny = resolve_model("deepseek-v2-tiny", environment)
+    assert tiny["accuracy_source"] == "absolute" and [item["suite"] for item in tiny["absolute"]] == ["mmlu-0shot"]
+    assert tiny["candidate"]["max_sequence_length"] == 512
+    fnet = resolve_model("fnet-base", environment)
+    assert fnet["reference"]["adapter"] == "families/fnet/reference/adapter.py"
+    assert fnet["reference"]["options"]["max_sequence_length"] == fnet["candidate"]["max_sequence_length"]
     world = resolve_model("sana-wm-bidirectional", environment)  # the family's own native adapter
     assert world["reference"]["backend"] == "reference" and world["reference"]["adapter"].startswith("families/sana_wm/")
     with tempfile.TemporaryDirectory() as directory:  # without it no generic adapter serves a world model
@@ -496,7 +502,30 @@ def test_quantized_candidates_get_the_benchmarks_quantization_gate():
     fp8 = resolve_model("qwen3-0.6b-fp8", _environment())
     assert fp8["candidate"]["quantization"] == "fp8"
     assert [(item["suite"], item["gate"]) for item in fp8["absolute"]] == [
-        ("mmlu-0shot", {"margin": 2.0, "min_native": 30.0})]
+        ("mmlu-0shot", {"margin": 2.0})]
+
+
+def test_stable_diffusion_uses_explicit_controls_on_its_actual_request(tmp_path):
+    import sys
+
+    from trtmc_aiperf_qual.config import Environment
+    from trtmc_aiperf_qual.models import resolve_model
+    from trtmc_aiperf_qual.suites import build_suite, unstated_defaults
+
+    environment = Environment({**_environment().values, "serve_python": sys.executable, "data_root": str(tmp_path)})
+    model = resolve_model("stable-diffusion-v1-5", environment)
+    suite = build_suite(model["performance"]["suite"], environment)
+    request = suite.samples[0]["request"]
+    assert request["num_steps"] == 10 and request["cfg_scale"] == request["guidance_scale"] == 7.5
+    assert not unstated_defaults(request)
+
+
+def test_rwkv_qualification_build_and_selection_use_the_same_capacity():
+    from trtmc_aiperf_qual.models import resolve_model
+
+    model = resolve_model("rwkv-169m", _environment())
+    assert model["candidate"]["build"]["max_sequence_length"] == model["candidate"]["max_sequence_length"] == 256
+    assert model["candidate"]["bundle"].startswith("rwkv-169m-qual/")
 
 
 def test_timing_reference_precision_can_differ_from_the_candidate_precision():
@@ -789,6 +818,21 @@ def test_sampled_speech_is_valid_by_its_median_duration_not_each_utterance():
     assert validity([], [], [])["status"] == "error"
 
 
+def test_silent_speech_failure_reports_the_paired_native_baseline():
+    from trtmc_aiperf_qual.intelligibility import validity
+
+    problem = [{"sample_id": "same-request"}]
+    quiet = {"finite": True, "dbfs": -56.58, "seconds": 6.69}
+    native = {"finite": True, "dbfs": -56.52, "seconds": 6.69}
+    result = validity(problem, [quiet], [native])
+    assert result["status"] == "fail" and result["passed"] == 0
+    assert "native also silent (-56.5 dBFS)" in result["failures"][0]["explanation"]
+    assert result["failures"][0]["native_audio"] == native
+    # Native validity is evidence, not an additional absolute-quality floor.
+    good = {"finite": True, "dbfs": -20.0, "seconds": 6.69}
+    assert validity(problem, [good], [native])["status"] == "pass"
+
+
 def test_reports_label_a_timing_normalized_per_audio_second(tmp_path):
     from trtmc_aiperf_qual import report_html
     from trtmc_aiperf_qual.report import write_report
@@ -799,3 +843,15 @@ def test_reports_label_a_timing_normalized_per_audio_second(tmp_path):
     write_report(tmp_path, {"model": "m", "provenance": {}, "performance": [item]})
     assert "| 40.000 per audio second |" in (tmp_path / "report.md").read_text()
     assert "40.000 per audio second</td><td>90.000 per audio second" in report_html._performance([item])
+
+
+def test_lance_qualification_has_a_native_path_and_sizes_the_multimodal_benchmark():
+    from trtmc_aiperf_qual.config import Environment
+    from trtmc_aiperf_qual.models import resolve_model
+
+    repository = Path(__file__).resolve().parents[3]
+    model = resolve_model("lance-3b-x2t-image", Environment({"repo": str(repository)}))
+    assert model["reference"]["backend"] == "reference" and "not_covered" not in model["reference"]
+    assert (repository / model["reference"]["adapter"]).is_file()
+    assert model["candidate"]["benchmark_sequence_length"]["extra_tokens"] == 288
+    assert model["candidate"]["tokenizer_subfolder"] == "Lance_3B"
