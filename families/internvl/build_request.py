@@ -38,10 +38,16 @@ class BuildRequest:
     quantization: ClassVar[str | None] = None
     fp32_layers: ClassVar[tuple[int, ...]] = ()
     dynamic_kv_cache: ClassVar[bool] = False
+    mtp_seq_len: ClassVar[int | None] = None
+    int4_gemm_plugin_version: int | None = None
     verbose: bool = False
     graph_transform: GraphTransform | None = None
 
     def __post_init__(self) -> None:
+        if self.int4_gemm_plugin_version is not None and (
+            type(self.int4_gemm_plugin_version) is not int or self.int4_gemm_plugin_version not in {1, 2}
+        ):
+            raise ValueError("int4_gemm_plugin_version must be 1 or 2")
         if not self.precision:
             raise ValueError("precision must be non-empty")
         _validate_id("family", self.family)
@@ -75,6 +81,7 @@ def coerce_request(request: object) -> BuildRequest:
     if isinstance(request, BuildRequest):
         return request
     unsupported = {
+        "mtp_seq_len": None,
         "image_height": None,
         "image_width": None,
         "video_num_frames": None,
@@ -95,4 +102,6 @@ def coerce_request(request: object) -> BuildRequest:
     names = {field.name for field in fields(BuildRequest)}
     if unknown := set(vars(request)) - names - set(unsupported):
         raise ValueError(f"unknown internvl build inputs: {sorted(unknown)}")
-    return BuildRequest(**{name: getattr(request, name) for name in names})
+    values = {name: getattr(request, name) for name in names - {"int4_gemm_plugin_version"}}
+    values["int4_gemm_plugin_version"] = getattr(request, "int4_gemm_plugin_version", None)
+    return BuildRequest(**values)

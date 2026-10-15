@@ -35,6 +35,8 @@ def build_engine(config, weights, capacity, precision, verbose=False):
 
 
 def build(request, writer):
+    if request.mtp_seq_len is not None:
+        raise NotImplementedError("embeddinggemma2 does not support MTP speculative decoding")
     if request.dynamic_kv_cache:
         raise NotImplementedError("embeddinggemma2 does not support dynamic_kv_cache")
     if request.task != "embedding":

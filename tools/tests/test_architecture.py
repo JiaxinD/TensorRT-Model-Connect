@@ -1139,9 +1139,11 @@ def test_dependency_declarations_are_thin_and_family_owned() -> None:
     optional = pyproject.split("[project.optional-dependencies]", 1)[1].split("\n[", 1)[0]
     assert set(re.findall(r"^([a-z][a-z0-9_-]*)\s*=", optional, re.MULTILINE)) == {
         "cutedsl",
+        "edgellm",
         "serve",
         "test",
     }
+    assert 'edgellm = ["tensorrt-edgellm==0.11.0"]' in optional
 
     requirements = sorted(FAMILIES.glob("*/requirements.txt"))
     assert requirements
@@ -2101,6 +2103,25 @@ def test_every_family_owns_at_least_one_explicit_premerge_case() -> None:
                     selected.append(str(case.get("name") or ""))
         if not selected or any(not name for name in selected):
             violations.append(f"{family.name}:premerge={selected}")
+    assert violations == []
+
+
+def test_remote_manifests_pin_one_exact_checkpoint_revision() -> None:
+    violations: list[str] = []
+    revisions: dict[str, set[str]] = {}
+    for path in sorted(FAMILIES.glob("*/tests/manifests/*.json")):
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        if "hf_id" not in manifest:
+            continue
+        revision = manifest.get("hf_revision")
+        if not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+            violations.append(f"{path.relative_to(REPO)}:hf_revision")
+            continue
+        revisions.setdefault(manifest["hf_id"], set()).add(revision)
+    # Variants of one checkpoint must validate the same immutable snapshot.
+    violations.extend(
+        f"{checkpoint}:{sorted(pins)}" for checkpoint, pins in revisions.items() if len(pins) > 1
+    )
     assert violations == []
 
 

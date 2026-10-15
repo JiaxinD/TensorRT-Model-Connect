@@ -24,6 +24,7 @@ from families.embeddinggemma2.tests.test_config import tiny_config
         ("video_num_frames", 1),
         ("quantization", "int8"),
         ("dynamic_kv_cache", True),
+        ("mtp_seq_len", 4),
         ("fp32_layers", (1,)),
     ],
 )
@@ -36,7 +37,9 @@ def test_unsupported_options_fail_before_checkpoint_or_gpu(tmp_path, option, val
         precision="bf16",
     )
     request = replace(request, **{option: value})
-    with pytest.raises(NotImplementedError if option == "dynamic_kv_cache" else ValueError):
+    with pytest.raises(
+        NotImplementedError if option in {"dynamic_kv_cache", "mtp_seq_len"} else ValueError
+    ):
         model.build(request, None)
 
 

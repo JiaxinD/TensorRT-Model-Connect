@@ -59,7 +59,10 @@ compare its output against the official model with unused towers disabled.
 Selected cases fail if CUDA, cached weights, native tools, or the reference
 environment are missing. The reference environment needs a CUDA-enabled PyTorch
 installation and the pinned official source. GPU engine/checkpoint correctness
-and performance remain unqualified until these cases actually run.
+is qualified only for the role, precision and capacity of cases that pass;
+performance requires separate measurements. Selected cases retain native and
+reference vectors, thresholds and source revision under
+`$TRTMC_E2E_ARTIFACT_DIR/evidence/embeddinggemma2/<case>/evidence.json`.
 
 The shape fixture records only text configuration and safetensors header shapes
 from the pinned publisher checkpoint. It contains no model weights or tokenizer
