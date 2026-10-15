@@ -59,7 +59,7 @@ def required(name):
     return path
 
 
-def test_text_embeddings(case_name, tmp_path):
+def test_embedding_e2e(case_name, tmp_path):
     manifest, case = CASES[case_name]
     import torch
 
