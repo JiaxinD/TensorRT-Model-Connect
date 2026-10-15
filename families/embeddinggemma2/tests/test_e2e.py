@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -64,7 +65,10 @@ def test_embedding_e2e(case_name, tmp_path):
     import torch
 
     assert torch.cuda.is_available(), "selected EmbeddingGemma2 E2E requires CUDA"
-    reference_python = required("TRTMC_EMBEDDINGGEMMA2_REFERENCE_PYTHON")
+    reference_python = Path(
+        os.environ.get("TRTMC_EMBEDDINGGEMMA2_REFERENCE_PYTHON", sys.executable)
+    )
+    assert reference_python.is_file(), f"reference interpreter does not exist: {reference_python}"
     runtime = required("TRTMC_RUNTIME_ROOT")
     native_build = required("TRTMC_NATIVE_BUILD_DIR")
     explicit = os.environ.get("TRTMC_EMBEDDINGGEMMA2_MODEL_DIR")

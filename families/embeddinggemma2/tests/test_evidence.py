@@ -8,10 +8,15 @@ import os
 from pathlib import Path
 import shutil
 
+import pytest
+
 pytest_plugins = ("pytester",)
 
 
-def test_selected_cases_retain_native_and_reference_evidence(pytester, monkeypatch):
+@pytest.mark.parametrize("explicit_reference", [False, True])
+def test_selected_cases_retain_native_and_reference_evidence(
+    pytester, monkeypatch, explicit_reference
+):
     source = Path(__file__).parent
     target = pytester.path / "families/embeddinggemma2/tests"
     target.mkdir(parents=True)
@@ -24,11 +29,18 @@ def test_selected_cases_retain_native_and_reference_evidence(pytester, monkeypat
     monkeypatch.setenv("TRTMC_E2E_ARTIFACT_DIR", str(pytester.path / "captured"))
     for name in (
         "TRTMC_RUNTIME_ROOT", "TRTMC_NATIVE_BUILD_DIR",
-        "TRTMC_EMBEDDINGGEMMA2_REFERENCE_PYTHON", "TRTMC_EMBEDDINGGEMMA2_MODEL_DIR",
+        "TRTMC_EMBEDDINGGEMMA2_MODEL_DIR",
     ):
         monkeypatch.setenv(name, str(pytester.path))
+    if explicit_reference:
+        interpreter = pytester.path / "reference-python"
+        interpreter.touch()
+        monkeypatch.setenv("TRTMC_EMBEDDINGGEMMA2_REFERENCE_PYTHON", str(interpreter))
+    else:
+        monkeypatch.delenv("TRTMC_EMBEDDINGGEMMA2_REFERENCE_PYTHON", raising=False)
     pytester.makeconftest('''
 import json
+import os
 import sys
 from types import SimpleNamespace
 import pytest
@@ -48,9 +60,12 @@ def native_and_reference_fixture(request, monkeypatch):
     monkeypatch.setattr(module, "build", lambda request: None)
     def run(command, **kwargs):
         vector = [1.0] + [0.0] * 767
-        payload = {"embedding": vector, "token_ids": [1, 2]} if (
-            len(command) > 1 and str(command[1]).endswith("reference.py")
-        ) else vector
+        if len(command) > 1 and str(command[1]).endswith("reference.py"):
+            assert str(command[0]) == os.environ.get(
+                "TRTMC_EMBEDDINGGEMMA2_REFERENCE_PYTHON", sys.executable)
+            payload = {"embedding": vector, "token_ids": [1, 2]}
+        else:
+            payload = vector
         return SimpleNamespace(stdout=json.dumps(payload))
     monkeypatch.setattr(module, "subprocess", SimpleNamespace(run=run))
 ''')

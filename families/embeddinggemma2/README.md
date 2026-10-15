@@ -33,13 +33,15 @@ operations on NumPy arrays; BF16 dtype metadata is tested, but BF16 rounding or
 TensorRT execution is not simulated. The optional tiny FP32 reference test uses
 the unmodified official Transformers text model.
 
-The project pins Transformers 5.2.0, which predates this model. Keep the newer
-reference in a separate environment rather than changing the project dependency:
+The project pins Transformers 5.2.0, which predates this model. The family declares
+its pinned official reference in `requirements.txt`; Community GPU CI installs it
+in the selected family's container before unit and E2E tests. For a manual run,
+install it in a separate environment:
 
 ```sh
 python -m venv --system-site-packages /tmp/embeddinggemma2-reference
 /tmp/embeddinggemma2-reference/bin/python -m pip install \
-  'https://github.com/huggingface/transformers/archive/536ecc007387a50e77603bb5d92100e9b07514cc.zip'
+  -r families/embeddinggemma2/requirements.txt
 export TRTMC_EMBEDDINGGEMMA2_REFERENCE_PYTHON=/tmp/embeddinggemma2-reference/bin/python
 ```
 
@@ -57,8 +59,10 @@ The three role cases build the bundle, execute the native C++ SDK consumer, and
 compare its output against the official model with unused towers disabled.
 `embeddinggemma2-text-fp32` provides the corresponding explicit FP32 cases.
 Selected cases fail if CUDA, cached weights, native tools, or the reference
-environment are missing. The reference environment needs a CUDA-enabled PyTorch
-installation and the pinned official source. GPU engine/checkpoint correctness
+environment are missing. The reference interpreter defaults to the current Python;
+the optional variable above selects a separate interpreter. Both require
+CUDA-enabled PyTorch and the pinned official source, checked before reference
+inference. GPU engine/checkpoint correctness
 is qualified only for the role, precision and capacity of cases that pass;
 performance requires separate measurements. Selected cases retain native and
 reference vectors, thresholds and source revision under
