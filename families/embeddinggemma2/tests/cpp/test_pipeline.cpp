@@ -16,7 +16,9 @@ class FixtureModule final : public trtmc::ITrtModule {
     bool bad_shape = false;
     bool bad_dtype = false;
     bool no_output = false;
+    int calls = 0;
     trtmc::TensorMap forward(const trtmc::TensorMap& inputs) override {
+        ++calls;
         if (inputs.at("token_id").shape != std::vector<int64_t>{2})
             throw std::runtime_error("EOS not appended");
         auto* ids = static_cast<const int32_t*>(inputs.at("token_id").data);
@@ -116,10 +118,12 @@ void test_pipeline() {
     (void)pipeline.embed("next");
     require(std::abs(result.values[0] - 0.6F) < 1e-6F);
     for (const auto& invalid :
-         {std::vector<int32_t>{}, std::vector<int32_t>{14}, std::vector<int32_t>{16},
-          std::vector<int32_t>{-1}, std::vector<int32_t>{2, 2, 2, 2, 1}}) {
+         {std::vector<int32_t>{}, std::vector<int32_t>{2, 14}, std::vector<int32_t>{2, 16},
+          std::vector<int32_t>{2, -1}, std::vector<int32_t>{2, 2, 2, 2, 1}}) {
         tokenizer->ids = invalid;
+        const auto calls = engine->calls;
         rejects([&] { (void)pipeline.embed("invalid"); });
+        require(engine->calls == calls);
     }
     tokenizer->ids = {2, 1};
     engine->hidden = {0, 0, 0, 0};
