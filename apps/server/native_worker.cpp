@@ -5,10 +5,13 @@
 
 #include "server/native_worker.h"
 
+#include "cli/io.h"
 #include "config.h"
 #include "task_runtime.h"
+#include "trtmc/audio.hpp"
 #include "trtmc/control.hpp"
 #include "trtmc/features.hpp"
+#include "trtmc/perception.hpp"
 #include "trtmc/runtime/family_loader.h"
 #include "trtmc/stream.hpp"
 #include "trtmc/task.h"
@@ -352,6 +355,98 @@ int run_ranking_protocol(Invoke&& invoke, Scores&& extract_scores, std::istream&
         input, output);
 }
 
+template <class Invoke, class Text>
+Json timed_transcription(Invoke&& invoke, Text&& extract_text) {
+    const auto started = std::chrono::steady_clock::now();
+    auto result = invoke();
+    const auto wall_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started)
+            .count();
+    return {{"text", extract_text(result)},
+            {"model_call_ms", wall_ms},
+            {"timing_scope", "public_task_call_wall"}};
+}
+
+template <class Invoke>
+int run_transcription_protocol(Invoke&& invoke, std::istream& input, std::ostream& output) {
+    return run_protocol(
+        {{"event", "ready"},
+         {"protocol_version", 1},
+         {"capabilities", Json::array({"audio_transcription"})}},
+        {{"transcribe",
+          [&](const Json& request) {
+              cli::io::LoadedAudio audio;
+              const auto path = string_field(request, "audio_path");
+              try {
+                  audio = cli::io::read_wav_interleaved(path);
+              } catch (const std::exception&) {
+                  throw ProtocolError("audio must be a readable WAV file");
+              }
+              if (audio.channels != 1 || audio.sample_rate <= 0 || audio.samples.empty() ||
+                  audio.samples.size() >
+                      static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) ||
+                  !std::all_of(audio.samples.begin(), audio.samples.end(),
+                               [](float value) { return std::isfinite(value); }))
+                  throw ProtocolError(
+                      "audio must contain finite mono PCM samples at a positive rate");
+              auto result = invoke(audio, request);
+              result["audio_sample_count"] = audio.samples.size();
+              result["audio_sample_rate"] = audio.sample_rate;
+              return result;
+          }}},
+        input, output);
+}
+
+template <class Box>
+Json detection_box(float x0, float y0, float x1, float y1, const Box& box, std::int32_t /*height*/,
+                   std::int32_t /*width*/) {
+    if (!std::isfinite(x0) || !std::isfinite(y0) || !std::isfinite(x1) || !std::isfinite(y1) ||
+        !std::isfinite(box.score) || box.score < 0 || box.score > 1 || box.class_id < 0 ||
+        x1 < x0 || y1 < y0)
+        throw std::runtime_error("detection Task returned invalid boxes");
+    return {{"x_min", x0},
+            {"y_min", y0},
+            {"x_max", x1},
+            {"y_max", y1},
+            {"confidence", box.score},
+            {"class_id", box.class_id}};
+}
+
+template <class Invoke, class Extract>
+int run_detection_protocol(Invoke&& invoke, Extract&& extract, std::istream& input,
+                           std::ostream& output) {
+    return run_protocol({{"event", "ready"},
+                         {"protocol_version", 1},
+                         {"capabilities", Json::array({"object_detection"})}},
+                        {{"detect",
+                          [&](const Json& request) {
+                              const auto config = request.value("config", Json::object());
+                              if (!config.is_object() || !config.empty())
+                                  throw ProtocolError("detection config must be empty");
+                              cli::io::LoadedImage image;
+                              const auto path = string_field(request, "image_path");
+                              try {
+                                  image = cli::io::read_image(path);
+                              } catch (const std::exception&) {
+                                  throw ProtocolError("image must be a readable image file");
+                              }
+                              if (image.height <= 0 || image.width <= 0 || image.pixels.empty())
+                                  throw ProtocolError("image must contain RGB pixels");
+                              const auto started = std::chrono::steady_clock::now();
+                              auto result = invoke(image);
+                              const auto wall_ms = std::chrono::duration<double, std::milli>(
+                                                       std::chrono::steady_clock::now() - started)
+                                                       .count();
+                              auto boxes = extract(result, image.height, image.width);
+                              return Json{{"boxes", std::move(boxes)},
+                                          {"image_height", image.height},
+                                          {"image_width", image.width},
+                                          {"model_call_ms", wall_ms},
+                                          {"timing_scope", "public_task_call_wall"}};
+                          }}},
+                        input, output);
+}
+
 int run_existing_worker(ITask& task, std::istream& input, std::ostream& output) {
     // Legacy bundle modes select the declared public Task before invocation.
     // Several families implement more C++ interfaces than a given bundle enables.
@@ -381,6 +476,50 @@ int run_existing_worker(ITask& task, std::istream& input, std::ostream& output) 
                 return ranking->rerank_batch(query, documents);
             },
             [](const std::vector<float>& scores) { return scores; }, input, output);
+    }
+    if (std::string_view(task.task()) == ITranscription::kTask) {
+        auto* transcription = dynamic_cast<ITranscription*>(&task);
+        if (!transcription)
+            throw std::invalid_argument("bundle does not implement transcription");
+        return run_transcription_protocol(
+            [&](const cli::io::LoadedAudio& audio, const Json& request) {
+                const auto value = request.value("config", Json::object());
+                if (!value.is_object())
+                    throw ProtocolError("config must be an object");
+                validate_fields(value, {"max_output_tokens"});
+                TranscriptionConfig config;
+                assign(value, "max_output_tokens", config.max_output_tokens);
+                if (config.max_output_tokens <= 0)
+                    throw ProtocolError("config.max_output_tokens must be positive");
+                config.input_sample_rate = audio.sample_rate;
+                return timed_transcription(
+                    [&] {
+                        return transcription->transcribe(
+                            audio.samples.data(), static_cast<std::int32_t>(audio.samples.size()),
+                            config);
+                    },
+                    [](const TextResult& result) { return result.text; });
+            },
+            input, output);
+    }
+    if (std::string_view(task.task()) == IObjectDetection::kTask) {
+        auto* detector = dynamic_cast<IObjectDetection*>(&task);
+        if (!detector)
+            throw std::invalid_argument("bundle does not implement object detection");
+        return run_detection_protocol(
+            [&](const cli::io::LoadedImage& image) {
+                return detector->detect(image.pixels.data(), image.height, image.width);
+            },
+            [](const ObjectDetectionResult& result, std::int32_t height, std::int32_t width) {
+                if (result.image_height != height || result.image_width != width)
+                    throw std::runtime_error("detection Task returned invalid image dimensions");
+                auto boxes = Json::array();
+                for (const auto& box : result.boxes)
+                    boxes.push_back(detection_box(box.x_min, box.y_min, box.x_max, box.y_max, box,
+                                                  height, width));
+                return boxes;
+            },
+            input, output);
     }
     return run_text_worker(task, input, output);
 }
@@ -415,6 +554,47 @@ int run_model_worker(const Model& model, std::istream& input, std::ostream& outp
                 if (result.kind() != TRTMC_SCORE_LOGIT)
                     throw std::runtime_error("NIM ranking requires raw logit scores");
                 return std::vector<float>(result.scores().begin(), result.scores().end());
+            },
+            input, output);
+    }
+    if (model.supports<SpeechTranscription>()) {
+        const auto task = model.task<SpeechTranscription>();
+        const auto fields = task.config_fields();
+        return run_transcription_protocol(
+            [&](const cli::io::LoadedAudio& audio, const Json& request) {
+                const auto config = parse_sdk_config(request, fields);
+                const SpeechTranscriptionRequest input{
+                    {{audio.samples.data(), audio.samples.size()},
+                     static_cast<std::uint32_t>(audio.sample_rate),
+                     1},
+                    {}};
+                return timed_transcription(
+                    [&] { return task.run(input, config); },
+                    [](const auto& result) { return std::string(result.text()); });
+            },
+            input, output);
+    }
+    if (model.supports<ImageToBoxes>()) {
+        const auto task = model.task<ImageToBoxes>();
+        return run_detection_protocol(
+            [&](const cli::io::LoadedImage& image) {
+                return task.run({ImageInput{{image.pixels.data(), image.pixels.size()},
+                                            static_cast<std::uint32_t>(image.height),
+                                            static_cast<std::uint32_t>(image.width)}});
+            },
+            [](const DetectedBoxesResult& result, std::int32_t height, std::int32_t width) {
+                const auto view = result.view();
+                if (view.image_height != static_cast<std::uint32_t>(height) ||
+                    view.image_width != static_cast<std::uint32_t>(width) ||
+                    (view.count && !view.boxes))
+                    throw std::runtime_error("detection Task returned invalid image metadata");
+                auto boxes = Json::array();
+                for (std::uint64_t i = 0; i < view.count; ++i) {
+                    const auto& box = view.boxes[i];
+                    boxes.push_back(detection_box(box.box.x_min, box.box.y_min, box.box.x_max,
+                                                  box.box.y_max, box, height, width));
+                }
+                return boxes;
             },
             input, output);
     }

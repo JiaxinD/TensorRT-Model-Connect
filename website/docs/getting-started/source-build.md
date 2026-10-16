@@ -77,6 +77,23 @@ Python dependencies remain in `families/<family>/requirements.txt`. See
 identity and receipts, managed toolchain catalogs, and the explicit
 existing-interpreter local path.
 
+YOLOv5, YOLOv8, YOLOv10, and YOLO11 builds do not require the `ultralytics`
+package. Supply your own appropriately licensed checkpoint; Model Connect does
+not include model weights. The `.pt` readers require PyTorch and accept only
+trusted checkpoints, because the archive format uses pickle.
+
+Their accuracy references live under each family's `tests/reference/` and use
+ordinary PyTorch layers with torchvision suppression where applicable. Neither
+builds nor tests install or import the Ultralytics package. E2E references run
+with the normal test interpreter; standalone qualification declares its optional
+dependencies in `tests/requirements.txt`. The reference implementations and their
+dependency declarations are excluded from the wheel. Checkpoint identifiers and
+serialized class names still identify the upstream model format. The references
+use the same checkpoints and preserve the existing accuracy thresholds. Selected
+E2E tests also check both the original and mirrored image against numeric
+snapshots recorded before the upstream package was removed. The snapshots pin
+checkpoint and image hashes; they contain predictions, not model weights.
+
 The manual commands below remain the direct source-build path and show the
 operations performed by development mode.
 

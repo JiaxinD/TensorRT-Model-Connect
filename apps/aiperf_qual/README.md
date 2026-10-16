@@ -19,11 +19,20 @@ It does not use `qualification_tests/benchmark_qualification`.
 |---|---|---|
 | Execution | One workload recorder, with native and TRTMC servers running separately and speaking the same `/v1/tasks/{operation}` protocol: TRTMC (`trtmc-perf-serve --backend trtmc`, later `trtmc-server`) and the native reference (`--backend reference`: the generic adapter of the operation, or a family's own pipeline, `families/<family>/reference/adapter.py`). AIPerf sends every request. | No (adapters: per family) |
 | Task | `config/tasks.yaml`: per catalog Task, its benchmarks (`absolute`) and checks (`supplementary`), and Perf settings. | No |
-| Model | Derived from the catalog entry and its Task. `config/models/<profile>.yaml` holds only exceptions. | Only exceptions |
+| Model | Derived from the catalog entry and its Task. `families/<family>/tests/aiperf/<profile>.yaml` owns exceptions and benchmark definitions; legacy `config/models/<profile>.yaml` remains supported. | Per family |
 
 `trtmc-aiperf-qual plan` prints the derived configuration of every model; `trtmc-aiperf-qual matrix`
 writes the execution matrix (native path, environment, workloads, checks, and whether each profile is
 executable).
+
+Family definitions are merged after Task defaults and legacy overrides. They may declare local
+`benchmarks` and select them through `absolute`, so model-specific requests, native adapters and
+conversion criteria stay with their family. RT-DETR v2 keeps the bundle's fixed score threshold of
+0.3 on both sides. BiRefNet Lite compares binary foreground masks on 50 pinned COCO images against
+its official native model, using the unchanged family E2E IoU threshold of 0.90 for every image.
+This is conversion parity, not ADE20K semantic-segmentation accuracy. Acc and task-call P50 use the
+same requests. Remote-code module caches default to `hf-modules` beside the configured Hub cache;
+an explicit `HF_MODULES_CACHE` takes precedence.
 
 ### Accuracy
 
@@ -294,7 +303,7 @@ retention:
 ```
 
 Only set `hf_cache: delete_unused` for a cache this batch exclusively owns. Deletion never leaves
-the configured roots. Reference environments, datasets, runtime binaries and reports are kept.
+the configured roots. Reference environments, datasets (with the shared media store), runtime binaries and reports are kept.
 The peak includes the current checkpoint, bundle and generated media, plus the next checkpoint
 if prefetch is enabled (`--no-prefetch` avoids that overlap). Temporary cleanup happens per model,
 so there must still be enough space for one model's complete scoring workload.
@@ -329,6 +338,32 @@ AIPerf metrics together. `execution.rechecked.jsonl` keeps the active measuremen
 Outputs are reused only with their matching execution evidence; a failed regeneration cannot retain an
 older passing timing. Workloads outside the recheck keep their original measurements.
 
+### Shared media store
+
+A dataset with images, audio or video (ImageNet, COCO, LibriSpeech, ...) is kept **once per machine**, not once
+per model. `build_suite` writes every input to a content-addressed store and the request carries only its digest:
+
+```text
+<media_root>/<aa>/<sha256><suffix>     # read-only, named by content; one store for every model, side, suite and run
+```
+
+```json
+{"image_path": {"$file": {"suffix": ".jpg", "sha256": "<64 hex digits>"}}}
+```
+
+The store defaults to `<hf_datasets_cache>/trtmc-media`; `media_root` in the environment file moves it (put it on the
+large disk). `services.serving` starts every server with `--media-root`; a server resolves a digest only inside its own
+store, checks the bytes against it, and hands the backend a per-request copy, so a client never names a path and a
+backend never modifies the store. Because requests no longer contain the bytes, `<suite>.inputs.jsonl`, AIPerf's
+`inputs.json` and `profile_export_raw.jsonl` hold a few hundred bytes per request instead of the whole image: a
+10 000-image ImageNet suite wrote about 5 GB of inline base64 per side and model, and now writes kilobytes per request.
+
+`request_sha` is content-bound (the same bytes have the same digest on every machine), so a result stays
+self-consistent without the store. Inline `b64` remains accepted by the server for ad-hoc requests and the OpenAI routes;
+results written before this change keep their inline payloads and stay readable. Any run of a suite repopulates the store
+from its dataset, so the store is a cache: `retention` never deletes it, and deleting it only costs the next run a rewrite.
+A suite with media and neither `media_root` nor `hf_datasets_cache` configured is a configuration error.
+
 ## Extending
 
 - New model of a known Task: nothing to add.
@@ -357,6 +392,9 @@ modes require their own evidence.
 | --- | --- | --- | --- |
 | `bge-small-en-v1.5` | `/v1/embeddings` / `embeddings` | One sentence per request, FP16, context 512, concurrency 1; five fixed example sentences, 5 warmups and 50 measured requests | [Stage 1](https://github.com/NVIDIA/TensorRT-Model-Connect/issues/1668) |
 | `nemotron-rerank-vl-1b-v2` | `/v1/ranking` / `nim_rankings` | One query plus two fixed text passages, FP16, context 685, concurrency 1; 5 warmups and 50 measured requests | [Stage 2](https://github.com/NVIDIA/TensorRT-Model-Connect/issues/1669) |
+| `whisper-tiny-fp16` | `/v1/audio/transcriptions` / `audio_transcription` | One complete mono PCM16 WAV clip; ten pinned LibriSpeech clips, FP16, context 128, output limit 120, concurrency 1; 5 warmups and 50 measured requests | [Stage 3](https://github.com/NVIDIA/TensorRT-Model-Connect/issues/1670) |
+
+| `yolo11n` | `/v1/infer` / `image_retrieval` | One original RGB image per request; 100 pinned COCO images, FP16, family threshold 0.25, concurrency 1; 5 warmups and 50 measured requests | [Stage 4](https://github.com/NVIDIA/TensorRT-Model-Connect/issues/1671) |
 
 The embedding pilot passed the unchanged bert family correctness checks and a
 real published AIPerf 0.13.0 run on one GB300 with TensorRT 11.1.0.106. All
@@ -368,8 +406,31 @@ real finite scores and original passage indices. Both pilots matched all
 client/server request IDs and timing exports. Additional epic stages remain
 planned until their native correctness and actual client runs are complete.
 
-Use [Profile Embeddings with AIPerf](../../website/docs/user-guides/profile-embeddings-with-aiperf.md)
-or [Profile Reranking with AIPerf](../../website/docs/user-guides/profile-reranking-with-aiperf.md)
+The transcription pilot passed the existing whisper family native/reference
+testcase and benchmark WER criteria on the exact served bundle. The ten native
+transcripts matched the FP32 reference under family WER normalization; both
+had 3.59% WER against the gold corpus. All 55 published-client responses matched
+the corresponding native transcript, with complete request and timing joins.
+Audio sample rates, counts, and durations remain recorded. This stage qualifies
+recorded complete clips; streaming ASR and audio question answering remain planned.
+Whisper now honors the checkpoint GELU with an FP32 activation boundary for
+half inputs, and an FP32 encoder disables TF32 operand rounding. The decoder
+computes its comparison-sensitive output projection in FP32. Older Whisper
+bundles need rebuilding. The numerical gates remain unchanged.
+
+The detection pilot passed the unchanged yolo11 checkpoint/native/reference testcase
+and 100-image family mAP gates. Native and reference mAP@[.50:.95] were both
+about 39.5% (permitted drop: 2 percentage points). One grayscale
+image was skipped under the RGB input contract and remains in the selection audit.
+All 100 HTTP/native verification calls and 55 published-client responses preserved
+the complete boxes, native class IDs, scores, and coordinate normalization; request
+and timing joins were complete. Prepared data URLs preserve original image bytes
+through AIPerf. This qualifies object detection; document/table layout remains planned.
+
+Use [Profile Embeddings with AIPerf](../../website/docs/user-guides/profile-embeddings-with-aiperf.md),
+[Profile Reranking with AIPerf](../../website/docs/user-guides/profile-reranking-with-aiperf.md),
+[Profile Transcription with AIPerf](../../website/docs/user-guides/profile-transcription-with-aiperf.md),
+or [Profile Object Detection with AIPerf](../../website/docs/user-guides/profile-detection-with-aiperf.md)
 for the short recipes. Native Task-call wall time stays separate from client
 HTTP latency; these small runs are integration examples, not performance gates.
 
@@ -382,10 +443,11 @@ length/load sweeps, request-ID timing joins and an optional sequential
 native-reference comparison. It produces
 benchmark evidence independently of the qualification verdicts above.
 
-Qwen and GPT-2 prebuilt validation checks the builder-recorded immutable Hugging Face
-checkpoint identity and build settings against the selected pinned snapshot and family manifest.
-Bundles created before this metadata was added must be rebuilt for automated
-exact-bundle validation. Declaring a profile or revision in YAML is insufficient.
+Qwen and GPT-2 prebuilt validation reads the bundle's core build provenance with
+`trtmc inspect` and checks the recorded immutable Hugging Face checkpoint identity and
+build settings against the selected pinned snapshot and family manifest. Bundles built
+without core build provenance must be rebuilt for automated exact-bundle validation.
+Declaring a profile or revision in YAML is insufficient.
 
 
 ```bash

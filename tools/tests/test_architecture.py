@@ -375,6 +375,7 @@ def test_shared_python_and_native_trees_are_closed_minimal_sets() -> None:
         "core/builder/tensorrt_model_connect/graph_transform.py",
         "core/builder/tensorrt_model_connect/family_cli.py",
         "core/builder/tensorrt_model_connect/model_support.py",
+        "core/builder/tensorrt_model_connect/provenance.py",
         "core/builder/tests/__init__.py",
         "core/builder/tests/test_build.py",
         "core/builder/tests/test_build_cli.py",
@@ -384,6 +385,7 @@ def test_shared_python_and_native_trees_are_closed_minimal_sets() -> None:
         "core/builder/tests/test_graph_transform.py",
         "core/builder/tests/test_family_cli.py",
         "core/builder/tests/test_model_support.py",
+        "core/builder/tests/test_provenance.py",
     }
     expected_native = {
         "core/runtime/bundle/bundle_format.cpp",
@@ -1145,7 +1147,9 @@ def test_dependency_declarations_are_thin_and_family_owned() -> None:
     }
     assert 'edgellm = ["tensorrt-edgellm==0.11.0"]' in optional
 
-    requirements = sorted(FAMILIES.glob("*/requirements.txt"))
+    requirements = sorted(FAMILIES.glob("*/requirements.txt")) + sorted(
+        FAMILIES.glob("*/tests/requirements.txt")
+    )
     assert requirements
     for path in requirements:
         lines = dependency_lines(path)
@@ -1163,7 +1167,7 @@ def test_dependency_declarations_are_thin_and_family_owned() -> None:
         path.relative_to(REPO)
         for family in family_dirs()
         for path in family.rglob("*requirements*.txt")
-        if path != family / "requirements.txt"
+        if path not in {family / "requirements.txt", family / "tests/requirements.txt"}
     ]
     assert nested == []
 
