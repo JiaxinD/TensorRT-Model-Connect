@@ -105,8 +105,9 @@ class _GptOssModel:
 
         # Embedding
         embedding = take("model.embed_tokens.weight")
-        if embedding.shape != (vocab, hidden):
-            raise ValueError(f"Embedding shape {embedding.shape} != ({vocab}, {hidden})")
+        assert embedding.shape == (vocab, hidden), (
+            f"Embedding shape {embedding.shape} != ({vocab}, {hidden})"
+        )
         weights["embedding"] = np.ascontiguousarray(embedding, dtype=target_np_dtype)
 
         attention_size = 0

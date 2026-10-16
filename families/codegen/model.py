@@ -60,8 +60,9 @@ class _CodeGenModel:
 
         # Token embedding (wte) — no position embedding (uses RoPE)
         embedding = _load_tensor(readers, "transformer.wte.weight")
-        if embedding.shape != (vocab, hidden):
-            raise ValueError(f"Embedding shape {embedding.shape} != ({vocab}, {hidden})")
+        assert embedding.shape == (vocab, hidden), (
+            f"Embedding shape {embedding.shape} != ({vocab}, {hidden})"
+        )
         weights["embedding"] = embedding.astype(np.float32)
 
         attention_size = hidden

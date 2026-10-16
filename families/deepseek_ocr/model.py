@@ -119,8 +119,9 @@ class _DeepseekOcrModel:
 
         # Embedding
         embedding = _load_tensor(readers, f"{lang_prefix}model.embed_tokens.weight")
-        if embedding.shape != (vocab, hidden):
-            raise ValueError(f"Embedding shape {embedding.shape} != ({vocab}, {hidden})")
+        assert embedding.shape == (vocab, hidden), (
+            f"Embedding shape {embedding.shape} != ({vocab}, {hidden})"
+        )
         embedding = embedding.astype(io_np_dtype)
         weights["embedding"] = embedding
 

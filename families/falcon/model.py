@@ -69,8 +69,9 @@ class _FalconModel:
             "transformer.word_embeddings.weight" if rw_style else "model.embed_tokens.weight"
         )
         embedding = _load_tensor(readers, embed_key)
-        if embedding.shape != (vocab, hidden):
-            raise ValueError(f"Embedding shape {embedding.shape} != ({vocab}, {hidden})")
+        assert embedding.shape == (vocab, hidden), (
+            f"Embedding shape {embedding.shape} != ({vocab}, {hidden})"
+        )
         weights["embedding"] = embedding.astype(np.float32)
 
         mlp_size = 0

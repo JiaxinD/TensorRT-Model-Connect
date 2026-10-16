@@ -370,8 +370,16 @@ class _QwenVLModel:
             "dynamic_image_resolution": dynamic_resolution,
             "vision_output_dim": config.hidden_size,
             "preprocessor_type": preproc,
-            "image_mean": [0.48145466, 0.4578275, 0.40821073],
-            "image_std": [0.26862954, 0.26130258, 0.27577711],
+            "image_mean": (
+                [0.5, 0.5, 0.5]
+                if _is_qwen3_vl(config)
+                else [0.48145466, 0.4578275, 0.40821073]
+            ),
+            "image_std": (
+                [0.5, 0.5, 0.5]
+                if _is_qwen3_vl(config)
+                else [0.26862954, 0.26130258, 0.27577711]
+            ),
             "interpolation": "bicubic",
             "vl_prompt_template": prompt_template,
             "image_token_str": "<|image_pad|>",
@@ -475,8 +483,9 @@ def _load_qwen3_vl_weights(model_dir: str, config: ModelConfig) -> WeightDict:
     if not _has_tensor(readers, embed_key):
         embed_key = "model.embed_tokens.weight"
     embedding = _load_tensor(readers, embed_key)
-    if embedding.shape != (vocab, hidden):
-        raise ValueError(f"Embedding shape {embedding.shape} != ({vocab}, {hidden})")
+    assert embedding.shape == (vocab, hidden), (
+        f"Embedding shape {embedding.shape} != ({vocab}, {hidden})"
+    )
     weights["embedding"] = embedding.astype(np.float32)
 
     attention_size = 0

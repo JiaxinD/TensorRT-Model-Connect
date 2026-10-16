@@ -61,8 +61,7 @@ class _OPTModel:
 
         # Token embedding
         embedding = _load_tensor(readers, "model.decoder.embed_tokens.weight")
-        if embedding.shape[0] != vocab:
-            raise ValueError(f"Embedding vocabulary size {embedding.shape[0]} != {vocab}")
+        assert embedding.shape[0] == vocab
         weights["embedding"] = embedding.astype(np.float32)
 
         # If word_embed_proj_dim != hidden_size, OPT has a project_in linear

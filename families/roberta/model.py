@@ -88,8 +88,9 @@ class _RobertaModel:
 
         # Word embedding
         embedding = _load_tensor(readers, f"{hf_root}.embeddings.word_embeddings.weight")
-        if embedding.shape != (vocab, hidden):
-            raise ValueError(f"Embedding shape {embedding.shape} != ({vocab}, {hidden})")
+        assert embedding.shape == (vocab, hidden), (
+            f"Embedding shape {embedding.shape} != ({vocab}, {hidden})"
+        )
         weights["embedding"] = embedding.astype(np.float32)
 
         # Position embedding (learned absolute).
@@ -108,10 +109,9 @@ class _RobertaModel:
         tt_key = f"{hf_root}.embeddings.token_type_embeddings.weight"
         if _has_tensor(readers, tt_key):
             tt_embed = _load_tensor(readers, tt_key)
-            if tt_embed.shape != (type_vocab_size, hidden):
-                raise ValueError(
-                    f"Token type embedding shape {tt_embed.shape} != ({type_vocab_size}, {hidden})"
-                )
+            assert tt_embed.shape == (type_vocab_size, hidden), (
+                f"Token type embedding shape {tt_embed.shape} != ({type_vocab_size}, {hidden})"
+            )
             weights["token_type_embedding"] = tt_embed.astype(np.float32)
         else:
             weights["token_type_embedding"] = np.zeros((type_vocab_size, hidden), dtype=np.float32)

@@ -497,8 +497,9 @@ class VoiceChatThinkerBuilder:
         # Parse layer types from hybrid_override_pattern
         pattern = raw.get("hybrid_override_pattern", "M" * num_layers)
         layer_types = _parse_layer_types(pattern)
-        if len(layer_types) != num_layers:
-            raise ValueError(f"Pattern length {len(layer_types)} != num_hidden_layers {num_layers}")
+        assert len(layer_types) == num_layers, (
+            f"Pattern length {len(layer_types)} != num_hidden_layers {num_layers}"
+        )
 
         # Mamba-2 dimensions
         mamba_num_heads = raw.get("mamba_num_heads", 64)
@@ -518,8 +519,9 @@ class VoiceChatThinkerBuilder:
 
         # Embedding
         embedding = _load_tensor(readers, "stt_model.embed_tokens.weight")
-        if embedding.shape != (vocab, hidden):
-            raise ValueError(f"Embedding shape {embedding.shape} != ({vocab}, {hidden})")
+        assert embedding.shape == (vocab, hidden), (
+            f"Embedding shape {embedding.shape} != ({vocab}, {hidden})"
+        )
         weights["embedding"] = embedding.astype(np.float32)
 
         mamba_count = 0

@@ -57,8 +57,7 @@ class _GPTNeoXModel:
 
         # Embedding
         embedding = _load_tensor(readers, "gpt_neox.embed_in.weight")
-        if embedding.shape != (vocab, hidden):
-            raise ValueError(f"Embedding shape {embedding.shape} != ({vocab}, {hidden})")
+        assert embedding.shape == (vocab, hidden)
         weights["embedding"] = embedding.astype(np.float32)
 
         attention_size = hidden

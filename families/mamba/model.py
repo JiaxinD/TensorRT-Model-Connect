@@ -83,8 +83,9 @@ class _MambaModel:
 
         # Embedding
         embedding = _load_tensor(readers, "backbone.embeddings.weight")
-        if embedding.shape != (vocab, hidden):
-            raise ValueError(f"Embedding shape {embedding.shape} != ({vocab}, {hidden})")
+        assert embedding.shape == (vocab, hidden), (
+            f"Embedding shape {embedding.shape} != ({vocab}, {hidden})"
+        )
         weights["embedding"] = embedding.astype(np.float32)
 
         for layer_idx in range(num_layers):
@@ -97,8 +98,9 @@ class _MambaModel:
 
             # in_proj: [2*d_inner, hidden] -> split into x_proj [d_inner, hidden] and z_proj [d_inner, hidden]
             in_proj_raw = _load_tensor(readers, f"{hf_prefix}.mixer.in_proj.weight")
-            if in_proj_raw.shape != (2 * d_inner, hidden):
-                raise ValueError(f"in_proj shape {in_proj_raw.shape} != ({2 * d_inner}, {hidden})")
+            assert in_proj_raw.shape == (2 * d_inner, hidden), (
+                f"in_proj shape {in_proj_raw.shape} != ({2 * d_inner}, {hidden})"
+            )
             # Transpose to [hidden, d_inner] for matmul
             weights[f"{prefix}.w_in_x"] = _transpose_2d(
                 in_proj_raw[:d_inner, :], "in_proj_x"
@@ -120,10 +122,9 @@ class _MambaModel:
             # x_proj: [dt_rank + 2*state_size, d_inner] -- projects x to dt, B, C
             x_proj_raw = _load_tensor(readers, f"{hf_prefix}.mixer.x_proj.weight")
             expected_xproj_rows = dt_rank + 2 * state_size
-            if x_proj_raw.shape != (expected_xproj_rows, d_inner):
-                raise ValueError(
-                    f"x_proj shape {x_proj_raw.shape} != ({expected_xproj_rows}, {d_inner})"
-                )
+            assert x_proj_raw.shape == (expected_xproj_rows, d_inner), (
+                f"x_proj shape {x_proj_raw.shape} != ({expected_xproj_rows}, {d_inner})"
+            )
             # Split into dt_proj_in [dt_rank, d_inner], B_proj [state_size, d_inner], C_proj [state_size, d_inner]
             # Transpose each to [d_inner, out_dim] for matmul
             weights[f"{prefix}.w_dt_in"] = _transpose_2d(
@@ -139,8 +140,9 @@ class _MambaModel:
 
             # dt_proj: [d_inner, dt_rank] -- projects dt_rank -> d_inner
             dt_proj_raw = _load_tensor(readers, f"{hf_prefix}.mixer.dt_proj.weight")
-            if dt_proj_raw.shape != (d_inner, dt_rank):
-                raise ValueError(f"dt_proj shape {dt_proj_raw.shape} != ({d_inner}, {dt_rank})")
+            assert dt_proj_raw.shape == (d_inner, dt_rank), (
+                f"dt_proj shape {dt_proj_raw.shape} != ({d_inner}, {dt_rank})"
+            )
             weights[f"{prefix}.w_dt_out"] = _transpose_2d(
                 dt_proj_raw, "dt_proj"
             )  # [dt_rank, d_inner]
@@ -151,8 +153,7 @@ class _MambaModel:
 
             # A_log: [d_inner, state_size] -- compute A = -exp(A_log)
             A_log = _load_tensor(readers, f"{hf_prefix}.mixer.A_log")
-            if A_log.shape != (d_inner, state_size):
-                raise ValueError(f"A_log shape {A_log.shape} != ({d_inner}, {state_size})")
+            assert A_log.shape == (d_inner, state_size)
             A = -np.exp(A_log.astype(np.float32))
             weights[f"{prefix}.A"] = A  # [d_inner, state_size]
 

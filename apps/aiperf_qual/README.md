@@ -2,7 +2,6 @@
 
 Accuracy and performance qualification of every ready catalog model against its native
 (unconverted) Hugging Face / PyTorch model, driven by [AIPerf](https://github.com/ai-dynamo/aiperf).
-It does not use `qualification_tests/benchmark_qualification`.
 
 - **Acc**: TRTMC must be as accurate as the native model on the Task's workloads. Both sides answer the
   Task's gold-labelled benchmarks (`absolute`) and each benchmark is a paired non-inferiority decision
@@ -53,6 +52,14 @@ or intrinsic model capability. This applies to the random-weight DeepSeek V2 tin
 Conversion-parity benchmarks (`gold_metrics.PARITY`) compare each output with the native one within a
 tolerance: raw encoders' vectors, MoGe geometry, ACT action chunks, stereo disparities, PersonaPlex speech.
 Inputs a family prepares itself come from its `reference/inputs.py` (`family_inputs` suites).
+
+A family configuration can declare a complete local `benchmarks` entry (`suite`,
+`suite_definition`, `metric`, and `gate`) and select it through `absolute`, without adding
+family policy to the shared Task defaults. `family_parity` delegates
+to `gate.checker`, a `families.<family>.<module>:<function>` taking the two observations and gate;
+the ordinary parity decision still requires every selected sample to pass.
+DINOv3 uses 50 seeded COCO val2017 images, complete hidden and pooled features, and its existing
+family E2E criteria. Accuracy and task-call P50 come from the same extraction requests.
 
 Checks for every model of a Task (`supplementary`): text-to-speech round-trip WER (corpus, bootstrap) and
 audio validity (every output finite and not silent; the median per-sentence duration ratio to the native model
@@ -381,19 +388,76 @@ A suite with media and neither `media_root` nor `hf_datasets_cache` configured i
   assignment) stay with that run's results and are passed by path (`run-all --ledger`, `--assignment`).
 
 
-## Native endpoint pilot coverage
+## Native endpoint group coverage
 
 The native `trtmc-server` endpoint expansion is tracked in
 [epic #1667](https://github.com/NVIDIA/TensorRT-Model-Connect/issues/1667).
-Each row qualifies only its named profile and workload; other models and load
-modes require their own evidence.
+Stages 1–10 require every supported checkpoint in each group for one workload.
+Use each stage issue for its per-model results. The original pilot results
+below qualify only their named profiles; their pilot PRs alone do not establish
+full-group coverage.
+
+Discover the current checkpoint inventory from family-owned manifests:
+
+```bash
+PYTHONPATH=apps/aiperf_qual:apps/benchmark:core/builder:. \
+  python -m trtmc_aiperf_qual endpoint-models --repo . --group embeddings
+```
+
+Groups are `embeddings`, `reranking`, `transcription`, and `detection`.
+The inventory selects a normal full-model profile when one is available, with
+precision and parallel variants listed separately. Checkpoints without one
+remain explicit gaps. Discovery reports `unverified`; it does not claim
+correctness or AIPerf qualification. An encoder bundle is not counted as a reranker merely because
+the family implementation inherits both interfaces. Streaming-oriented ASR
+checkpoints with a whole-clip Task belong to the recorded-clip workload; this
+does not establish streaming HTTP support.
+
+After running the owning family's unchanged correctness checks on an actual
+bundle, `endpoint-profile` automates the existing native/HTTP and pip-client
+checks for that profile. It reuses `trtmc-server`, the native benchmark worker,
+the published AIPerf runner, and request/metric joins. Use a local environment
+file containing your paths:
+
+```yaml
+repo: /path/to/TensorRT-Model-Connect
+serve_python: /path/to/serving-python
+runtime_root: /path/to/native-build
+aiperf_python: /path/to/aiperf-venv/bin/python
+aiperf: /path/to/aiperf-venv/bin/python
+hf_datasets_cache: /path/to/datasets
+```
+
+```bash
+PYTHONPATH=apps/aiperf_qual:apps/benchmark:apps/perf_serving:core/builder:. \
+  python -m trtmc_aiperf_qual endpoint-profile \
+    --environment /path/to/local-environment.yaml \
+    --profile bge-small-en-v1.5 --bundle /path/to/bge.bundle \
+    --inputs apps/aiperf_qual/examples/embedding-inputs.jsonl \
+    --out /path/to/new-result-directory
+```
+
+Use the existing sentence/ranking examples or prepared audio/image JSONL from
+the guides below. The command verifies every corpus input against native output,
+then checks all 55 complete responses from five warmups and 50 measured requests,
+including SHA-256 hashes of media bytes, complete vectors/transcripts/boxes,
+native class IDs or passage indices, and every request/timing join. Results
+separate HTTP latency from public Task time. Build/load/startup, native/HTTP verification and
+warmup are excluded from measured throughput. This transport verification is
+separate from the owning family's numerical/quality criteria. It establishes
+no capacity or performance regression gate. The client is AIPerf 0.13.0 from
+PyPI; an AIPerf source checkout is unnecessary.
+
+## Native endpoint pilot coverage
+
+These original deliveries are historical pilot evidence. Use the stage issues
+for the expanded per-model correctness and client results.
 
 | Profile | Endpoint / AIPerf type | Qualified workload | Evidence |
 | --- | --- | --- | --- |
 | `bge-small-en-v1.5` | `/v1/embeddings` / `embeddings` | One sentence per request, FP16, context 512, concurrency 1; five fixed example sentences, 5 warmups and 50 measured requests | [Stage 1](https://github.com/NVIDIA/TensorRT-Model-Connect/issues/1668) |
 | `nemotron-rerank-vl-1b-v2` | `/v1/ranking` / `nim_rankings` | One query plus two fixed text passages, FP16, context 685, concurrency 1; 5 warmups and 50 measured requests | [Stage 2](https://github.com/NVIDIA/TensorRT-Model-Connect/issues/1669) |
 | `whisper-tiny-fp16` | `/v1/audio/transcriptions` / `audio_transcription` | One complete mono PCM16 WAV clip; ten pinned LibriSpeech clips, FP16, context 128, output limit 120, concurrency 1; 5 warmups and 50 measured requests | [Stage 3](https://github.com/NVIDIA/TensorRT-Model-Connect/issues/1670) |
-
 | `yolo11n` | `/v1/infer` / `image_retrieval` | One original RGB image per request; 100 pinned COCO images, FP16, family threshold 0.25, concurrency 1; 5 warmups and 50 measured requests | [Stage 4](https://github.com/NVIDIA/TensorRT-Model-Connect/issues/1671) |
 
 The embedding pilot passed the unchanged bert family correctness checks and a
