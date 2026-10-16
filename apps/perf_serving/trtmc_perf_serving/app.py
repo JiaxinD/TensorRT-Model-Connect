@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import shutil
@@ -49,6 +50,9 @@ class ServingConfig:
     # latents.Replay: turn a request's latent_seed into initial-noise file (latent replay); without
     # one, the seed is dropped and the observation says the noise was not replayed.
     latent_replay: Any = None
+    # The content-addressed media store that ``{"$file": {"sha256": ...}}`` references name; without
+    # one the server accepts inline bytes only.
+    media_root: Path | None = None
 
 
 MAX_INLINE_ITEMS = 64
@@ -122,7 +126,7 @@ def create_app(backend: Backend, config: ServingConfig) -> FastAPI:
         try:
             # Backends write output artifacts below the request directory even without inputs.
             workdir.mkdir(parents=True, exist_ok=True)
-            resolved = materialize_files(operation_request, workdir / "inputs")
+            resolved = materialize_files(operation_request, workdir / "inputs", media_root=config.media_root)
             replayed = None
             if "latent_seed" in resolved:
                 if config.latent_replay is None:
@@ -143,6 +147,9 @@ def create_app(backend: Backend, config: ServingConfig) -> FastAPI:
             observation = add_media_digests(invocation.observation, operation, workdir)
             if replayed is not None:
                 observation["latent_replay"] = replayed
+                if replayed:
+                    observation["initial_latents_sha256"] = hashlib.sha256(
+                        Path(resolved["initial_latents_path"]).read_bytes()).hexdigest()
             invocation = Invocation(observation, invocation.model_call_ms, invocation.extra)
         except BackendUnavailable:
             state["available"] = False

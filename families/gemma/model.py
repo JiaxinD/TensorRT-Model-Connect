@@ -407,6 +407,11 @@ def build(request: "BuildRequest", writer: "BundleWriter") -> None:
         build_pair(request, writer, request.execution)
         return
 
+    from .edge_llm.standalone import try_build
+
+    if try_build(request, writer):
+        return
+
     if request.dynamic_kv_cache:
         raise NotImplementedError("gemma does not support dynamic_kv_cache")
 
@@ -462,6 +467,8 @@ def build(request: "BuildRequest", writer: "BundleWriter") -> None:
         raise NotImplementedError("Gemma has no qualified family-owned quantized build")
     if request.fp32_layers:
         raise NotImplementedError("Gemma does not expose mixed-precision layer selection")
+    if request.mtp_seq_len is not None:
+        raise NotImplementedError("Gemma does not support MTP speculative decoding")
 
     parallel = ParallelConfig(
         tp_size=_positive_int(request.tensor_parallel_size, "tensor_parallel_size")
