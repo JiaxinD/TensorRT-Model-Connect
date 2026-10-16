@@ -96,6 +96,16 @@ def extract_task_timing(result: Mapping[str, Any]) -> dict[str, float]:
     return {"model_call_ms": float(wall)}
 
 
+def extract_transcription(result: Any, sample_count: int, sample_rate: int) -> str:
+    if (not isinstance(result, Mapping) or not isinstance(result.get("text"), str) or
+            type(result.get("audio_sample_count")) is not int or
+            type(result.get("audio_sample_rate")) is not int or
+            result["audio_sample_count"] != sample_count or result["audio_sample_rate"] != sample_rate):
+        raise WorkerProtocolError("worker transcription result has invalid text or audio identity")
+    extract_task_timing(result)
+    return result["text"]
+
+
 def public_worker_error(error: Exception) -> str:
     if isinstance(error, WorkerRequestTooLargeError):
         return "request exceeds the native worker transport limit"
@@ -106,3 +116,23 @@ def public_worker_error(error: Exception) -> str:
             if isinstance(message, str) and message:
                 return message
     return "The model worker is unavailable"
+
+
+def extract_detection(result: Any, height: int, width: int) -> tuple[dict[str, list], dict[str, float]]:
+    if (not isinstance(result, Mapping) or not isinstance(result.get("boxes"), list) or
+            type(result.get("image_height")) is not int or type(result.get("image_width")) is not int or
+            result["image_height"] != height or result["image_width"] != width):
+        raise WorkerProtocolError("worker detection result has invalid image identity")
+    grouped: dict[str, list] = {}
+    for box in result["boxes"]:
+        if (not isinstance(box, Mapping) or type(box.get("class_id")) is not int or box["class_id"] < 0 or
+                any(not _finite_number(box.get(key)) for key in
+                    ("x_min", "y_min", "x_max", "y_max", "confidence")) or
+                box["x_min"] > box["x_max"] or
+                box["y_min"] > box["y_max"] or not 0 <= box["confidence"] <= 1):
+            raise WorkerProtocolError("worker detection result has invalid boxes")
+        grouped.setdefault(str(box["class_id"]), []).append(
+            {"x_min": box["x_min"] / width, "y_min": box["y_min"] / height,
+             "x_max": box["x_max"] / width, "y_max": box["y_max"] / height,
+             "confidence": box["confidence"]})
+    return grouped, extract_task_timing(result)

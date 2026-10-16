@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -421,7 +422,8 @@ def test_requests_with_top_k_one_are_greedy():
 def _environment(tmp_path=None):
     from trtmc_aiperf_qual.config import Environment
 
-    return Environment({"repo": str(REPOSITORY), **({"data_root": str(tmp_path)} if tmp_path else {})})
+    return Environment({"repo": str(REPOSITORY),
+                        **({"data_root": str(tmp_path), "media_root": str(tmp_path / "media")} if tmp_path else {})})
 
 
 def _manifest(path, text):
@@ -450,7 +452,9 @@ def test_tsv_manifests_and_nested_file_fields(tmp_path):
                                     "records": "samples", "file_fields": ["media.0.path"]},
                          "fields": {"media.0.path": "image_path", "question": "prompt"}}, _environment(tmp_path))
     request = suite.samples[0]["request"]
-    assert request["prompt"] == "What text?" and request["image_path"]["$file"]["suffix"] == ".jpg"
+    assert request["prompt"] == "What text?"
+    # The image is kept once in the media store; the request names it by digest.
+    assert request["image_path"] == {"$file": {"suffix": ".jpg", "sha256": hashlib.sha256(b"jpg").hexdigest()}}
 
 
 def test_etth1_windows_follow_the_declared_window(tmp_path):
@@ -668,8 +672,9 @@ def test_one_checkpoint_serves_the_bundle_and_the_reference():
     from trtmc_aiperf_qual.models import resolve_model
 
     environment = Environment({"repo": str(REPOSITORY)})
-    albert = resolve_model("albert-base", environment)  # unpinned in the catalog: both sides load the cached snapshot
-    assert albert["candidate"]["revision"] is None and albert["reference"]["revision"] is None
+    albert = resolve_model("albert-base", environment)
+    manifest = json.loads((REPOSITORY / "families/albert/tests/manifests/albert-base.json").read_text())
+    assert albert["candidate"]["revision"] == albert["reference"]["revision"] == manifest["hf_revision"]
     assert albert["candidate"]["bundle"] == "albert-base/albert-base.bundle" and not albert["candidate"]["build"]
     k2 = resolve_model("k2-horizon-7b-uno", environment)  # the adapter's native model is its base checkpoint
     assert (k2["reference"]["model"], k2["reference"]["revision"]) == (

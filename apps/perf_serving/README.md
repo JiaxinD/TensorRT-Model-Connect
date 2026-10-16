@@ -53,9 +53,11 @@ first one.
 | `GET /health/live`, `/health/ready`, `/v1/models`, `/v1/serving/info` | — | — |
 
 A request body is merged over the profile's base request. Paths inside
-`*_path`/`*_paths` fields are sent inline as
-`{"$file": {"suffix": ".png", "b64": "..."}}` and written to per-request files
-on the server. OpenAI fields that every backend cannot honor in the same way
+`*_path`/`*_paths` fields are sent as `$file` references and written to per-request files
+on the server: the bytes inline, `{"$file": {"suffix": ".png", "b64": "..."}}`, or, for a server started with
+`--media-root`, the digest of a file in that shared media store,
+`{"$file": {"suffix": ".png", "sha256": "..."}}` (the server resolves it only inside its store and checks the bytes
+against the digest; a client never names a path). OpenAI fields that every backend cannot honor in the same way
 (for example `ignore_eos`) are rejected with HTTP 400 instead of being
 silently ignored.
 
@@ -105,13 +107,18 @@ Generic Python reference adapters exist for `generate`, `translate`, `encode`,
 `extract_features`, `transcribe`, `generate_audio` (Bark), `generate_image`
 (Diffusers), `solve`, and `regress` (Transformers PatchTST/PatchTSMixer). A model
 whose native pipeline they cannot run (an upstream checkout such as PersonaPlex,
-MoGe, LeRobot, Fast-FoundationStereo, SANA-WM; Ultralytics archives; a
+MoGe, LeRobot, Fast-FoundationStereo, SANA-WM; YOLO checkpoints; a
 speech-conditioned LM) is served by its family's own adapter:
 `--reference-adapter families/<family>/reference/adapter.py`, a file defining
 `Adapter(spec, host)` with `invoke(request, artifact_base)`. The family file imports nothing
 from this package: `host` (`NativeHost`) carries the backend's model-agnostic mechanics (the
 request's fields and pre-decoded input files, the timed call, output tensors and files written
 after it, the result, and `host.Error` for a rejected request).
+
+YOLOv5, YOLOv8, YOLOv10, and YOLO11 use their local PyTorch reference at
+`families/<family>/tests/reference/adapter.py`, with optional dependencies in
+`families/<family>/tests/requirements.txt`. They do not require the Ultralytics
+package. See [source-build guidance](../../website/docs/getting-started/source-build.md).
 
 `reference-env --requirements FILE --root DIR [--prepare SCRIPT]` creates (once, cached
 by digest) a virtual environment that layers `FILE` on this interpreter, runs `SCRIPT`
