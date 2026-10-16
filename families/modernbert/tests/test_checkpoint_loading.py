@@ -145,10 +145,19 @@ def test_missing_bare_projection_is_not_silently_accepted(tmp_path, load_weights
 
 
 @pytest.mark.parametrize("root", ["", "model."], ids=["bare", "wrapped"])
-def test_malformed_embedding_is_rejected(tmp_path, load_weights, root):
+@pytest.mark.parametrize(
+    "name,shape,message",
+    [
+        ("embeddings.tok_embeddings.weight", (7, 4), r"Embedding shape \(7, 4\) != \(8, 4\)"),
+        ("layers.0.attn.Wqkv.weight", (9, 4), r"QKV weight shape \(9, 4\) != \(12, 4\)"),
+        ("layers.0.mlp.Wi.weight", (10, 4), r"MLP input weight shape \(10, 4\) != \(12, 4\)"),
+    ],
+    ids=["embedding", "fused-qkv", "mlp-input"],
+)
+def test_malformed_checkpoint_shape_is_rejected(tmp_path, load_weights, root, name, shape, message):
     config, tensors, _ = _checkpoint(root, np.float32, False)
-    tensors[root + "embeddings.tok_embeddings.weight"] = np.zeros((7, 4), dtype=np.float32)
+    tensors[root + name] = np.zeros(shape, dtype=np.float32)
     _save_checkpoint(tmp_path, tensors, False)
 
-    with pytest.raises(ValueError, match=r"Embedding shape \(7, 4\) != \(8, 4\)"):
+    with pytest.raises(ValueError, match=message):
         load_weights(None, str(tmp_path), config)
