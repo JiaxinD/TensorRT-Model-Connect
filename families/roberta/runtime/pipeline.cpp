@@ -60,7 +60,8 @@ EncoderPipeline::EncoderPipeline(std::unique_ptr<ITrtModule> encoder, std::strin
     : encoder_(std::move(encoder)), mode_(std::move(mode)), tokenizer_(std::move(tokenizer)),
       model_id_(std::move(model_id_str)) {
     if (mode_ == "reranking")
-        throw std::invalid_argument("RoBERTa reranking requires a scoring head and is not supported");
+        throw std::invalid_argument(
+            "RoBERTa reranking requires a scoring head and is not supported");
     if (!encoder_ || !encoder_->ok())
         throw std::runtime_error("EncoderPipeline: invalid encoder module");
 }
