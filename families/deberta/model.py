@@ -629,6 +629,8 @@ def _positive_int(value: object, name: str) -> int:
 def _tokenizer_runtime_contract(model_dir: Path) -> dict[str, object]:
     """Resolve this family's exact native-tokenizer framing."""
 
+    import tempfile
+
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -636,6 +638,25 @@ def _tokenizer_runtime_contract(model_dir: Path) -> dict[str, object]:
         trust_remote_code=True,
         use_fast=True,
     )
+    tokenizer_path = model_dir / "tokenizer.json"
+    if not tokenizer_path.is_file():
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=model_dir,
+                prefix=".trtmc-deberta-tokenizer-",
+                suffix=".json",
+                delete=False,
+            ) as output:
+                temporary_path = Path(output.name)
+            tokenizer.backend_tokenizer.save(str(temporary_path))
+            if not temporary_path.is_file() or temporary_path.stat().st_size == 0:
+                raise RuntimeError("tokenizer conversion did not create tokenizer.json")
+            temporary_path.replace(tokenizer_path)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
     default_ids = list(tokenizer.encode("hello"))
     plain_ids = list(tokenizer.encode("hello", add_special_tokens=False))
     if default_ids == plain_ids:
@@ -702,6 +723,8 @@ def build(request: "BuildRequest", writer: "BundleWriter") -> None:
         raise NotImplementedError("DeBERTa has no family-owned quantized build")
     if request.fp32_layers:
         raise NotImplementedError("DeBERTa does not expose mixed-precision layers")
+    if request.mtp_seq_len is not None:
+        raise NotImplementedError("DeBERTa does not support MTP speculative decoding")
     parallel = ParallelConfig(
         tp_size=_positive_int(request.tensor_parallel_size, "tensor_parallel_size")
     )

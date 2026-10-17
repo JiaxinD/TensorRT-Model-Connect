@@ -370,8 +370,16 @@ class _QwenVLModel:
             "dynamic_image_resolution": dynamic_resolution,
             "vision_output_dim": config.hidden_size,
             "preprocessor_type": preproc,
-            "image_mean": [0.48145466, 0.4578275, 0.40821073],
-            "image_std": [0.26862954, 0.26130258, 0.27577711],
+            "image_mean": (
+                [0.5, 0.5, 0.5]
+                if _is_qwen3_vl(config)
+                else [0.48145466, 0.4578275, 0.40821073]
+            ),
+            "image_std": (
+                [0.5, 0.5, 0.5]
+                if _is_qwen3_vl(config)
+                else [0.26862954, 0.26130258, 0.27577711]
+            ),
             "interpolation": "bicubic",
             "vl_prompt_template": prompt_template,
             "image_token_str": "<|image_pad|>",
@@ -1068,6 +1076,8 @@ def _generation_token_contract(model_dir: Path, vocab_size: int) -> dict[str, ob
 
 def build(request: "BuildRequest", writer: "BundleWriter") -> None:
     """Build one Qwen-VL vision-language bundle."""
+    if request.mtp_seq_len is not None:
+        raise NotImplementedError("Qwen-VL does not support MTP speculative decoding")
     if request.dynamic_kv_cache:
         raise NotImplementedError("qwen_vl does not support dynamic_kv_cache")
 

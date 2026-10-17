@@ -485,9 +485,21 @@ MODEL_DEFAULT_FIELDS = ("num_steps", "num_inference_steps", "num_sampling_steps"
                         "num_frames", "video_num_frames")
 
 
-def unstated_defaults(request: Mapping[str, Any]) -> list[str]:
-    """The generation controls ``request`` leaves to each side's default (-1)."""
-    return [field for field in MODEL_DEFAULT_FIELDS if request.get(field) in (-1, -1.0)]
+def unstated_defaults(request: Mapping[str, Any], operation: str | None = None) -> list[str]:
+    """Unresolved controls and fields required by the image/video request contract.
+
+    Text, speech and tensor operations do not inherit image-generation requirements.
+    """
+    problems = [field for field in MODEL_DEFAULT_FIELDS if request.get(field) in (-1, -1.0)]
+    if operation == "generate_image":
+        required = ["num_steps", "guidance_scale", "height", "width"]
+        if request.get("media_type") == "video":
+            required.append("num_frames")
+        problems += [field for field in required if request.get(field) in (None, "") and field not in problems]
+        problems += [field for field in ("num_steps", "height", "width", "num_frames")
+                     if field in request and (not isinstance(request[field], (int, float))
+                                              or request[field] <= 0) and field not in problems]
+    return problems
 
 
 def _catalog_testcase_records(source: Mapping[str, Any], environment: Environment) -> list[dict[str, Any]]:
@@ -622,7 +634,7 @@ def _family_input_records(source: Mapping[str, Any], selection: Mapping[str, Any
 
 
 def build_suite(definition: Mapping[str, Any], environment: Environment) -> Suite:
-    from trtmc_perf_serving.files import inline_files
+    from trtmc_perf_serving.files import externalize_files
 
     source = definition["source"]
     kind = require(source, "kind", "source")
@@ -673,7 +685,11 @@ def build_suite(definition: Mapping[str, Any], environment: Environment) -> Suit
             request[request_field] = record[source_field] if source_field in record else _field(record, source_field)
         if isinstance(request.get("prompt"), str) and (definition.get("prompt_prefix") or definition.get("prompt_suffix")):
             request["prompt"] = f"{definition.get('prompt_prefix', '')}{request['prompt']}{definition.get('prompt_suffix', '')}"
-        request = inline_files(request)
+        try:  # the media go to the shared store once; the request keeps their digests
+            request = externalize_files(request, environment.media_root())
+        except ValueError as error:
+            raise ConfigError(f"suite {definition['suite']}: {error}; set media_root (or hf_datasets_cache) "
+                              "in the environment") from error
         sample = {"sample_id": record["id"], "task": record.get("task", definition["suite"]),
                   "request": request, "request_sha": request_sha(request)}
         if "label" in record:

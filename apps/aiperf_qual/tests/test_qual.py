@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -264,6 +265,12 @@ def test_models_are_derived_from_the_catalog_and_task_defaults():
     random = resolve_model("qwen3-moe-tiny-random", environment)  # random weights: Perf only
     assert random["accuracy_source"] == "none" and not random["absolute"] and "random" in random["accuracy_note"]
     assert random["performance"]["suite"]["source"]["kind"] == "catalog_testcase"
+    tiny = resolve_model("deepseek-v2-tiny", environment)
+    assert tiny["accuracy_source"] == "absolute" and [item["suite"] for item in tiny["absolute"]] == ["mmlu-0shot"]
+    assert tiny["candidate"]["max_sequence_length"] == 512
+    fnet = resolve_model("fnet-base", environment)
+    assert fnet["reference"]["adapter"] == "families/fnet/reference/adapter.py"
+    assert fnet["reference"]["options"]["max_sequence_length"] == fnet["candidate"]["max_sequence_length"]
     world = resolve_model("sana-wm-bidirectional", environment)  # the family's own native adapter
     assert world["reference"]["backend"] == "reference" and world["reference"]["adapter"].startswith("families/sana_wm/")
     with tempfile.TemporaryDirectory() as directory:  # without it no generic adapter serves a world model
@@ -415,7 +422,8 @@ def test_requests_with_top_k_one_are_greedy():
 def _environment(tmp_path=None):
     from trtmc_aiperf_qual.config import Environment
 
-    return Environment({"repo": str(REPOSITORY), **({"data_root": str(tmp_path)} if tmp_path else {})})
+    return Environment({"repo": str(REPOSITORY),
+                        **({"data_root": str(tmp_path), "media_root": str(tmp_path / "media")} if tmp_path else {})})
 
 
 def _manifest(path, text):
@@ -444,7 +452,9 @@ def test_tsv_manifests_and_nested_file_fields(tmp_path):
                                     "records": "samples", "file_fields": ["media.0.path"]},
                          "fields": {"media.0.path": "image_path", "question": "prompt"}}, _environment(tmp_path))
     request = suite.samples[0]["request"]
-    assert request["prompt"] == "What text?" and request["image_path"]["$file"]["suffix"] == ".jpg"
+    assert request["prompt"] == "What text?"
+    # The image is kept once in the media store; the request names it by digest.
+    assert request["image_path"] == {"$file": {"suffix": ".jpg", "sha256": hashlib.sha256(b"jpg").hexdigest()}}
 
 
 def test_etth1_windows_follow_the_declared_window(tmp_path):
@@ -496,7 +506,30 @@ def test_quantized_candidates_get_the_benchmarks_quantization_gate():
     fp8 = resolve_model("qwen3-0.6b-fp8", _environment())
     assert fp8["candidate"]["quantization"] == "fp8"
     assert [(item["suite"], item["gate"]) for item in fp8["absolute"]] == [
-        ("mmlu-0shot", {"margin": 2.0, "min_native": 30.0})]
+        ("mmlu-0shot", {"margin": 2.0})]
+
+
+def test_stable_diffusion_uses_explicit_controls_on_its_actual_request(tmp_path):
+    import sys
+
+    from trtmc_aiperf_qual.config import Environment
+    from trtmc_aiperf_qual.models import resolve_model
+    from trtmc_aiperf_qual.suites import build_suite, unstated_defaults
+
+    environment = Environment({**_environment().values, "serve_python": sys.executable, "data_root": str(tmp_path)})
+    model = resolve_model("stable-diffusion-v1-5", environment)
+    suite = build_suite(model["performance"]["suite"], environment)
+    request = suite.samples[0]["request"]
+    assert request["num_steps"] == 10 and request["cfg_scale"] == request["guidance_scale"] == 7.5
+    assert not unstated_defaults(request)
+
+
+def test_rwkv_qualification_build_and_selection_use_the_same_capacity():
+    from trtmc_aiperf_qual.models import resolve_model
+
+    model = resolve_model("rwkv-169m", _environment())
+    assert model["candidate"]["build"]["max_sequence_length"] == model["candidate"]["max_sequence_length"] == 256
+    assert model["candidate"]["bundle"].startswith("rwkv-169m-qual/")
 
 
 def test_timing_reference_precision_can_differ_from_the_candidate_precision():
@@ -639,8 +672,9 @@ def test_one_checkpoint_serves_the_bundle_and_the_reference():
     from trtmc_aiperf_qual.models import resolve_model
 
     environment = Environment({"repo": str(REPOSITORY)})
-    albert = resolve_model("albert-base", environment)  # unpinned in the catalog: both sides load the cached snapshot
-    assert albert["candidate"]["revision"] is None and albert["reference"]["revision"] is None
+    albert = resolve_model("albert-base", environment)
+    manifest = json.loads((REPOSITORY / "families/albert/tests/manifests/albert-base.json").read_text())
+    assert albert["candidate"]["revision"] == albert["reference"]["revision"] == manifest["hf_revision"]
     assert albert["candidate"]["bundle"] == "albert-base/albert-base.bundle" and not albert["candidate"]["build"]
     k2 = resolve_model("k2-horizon-7b-uno", environment)  # the adapter's native model is its base checkpoint
     assert (k2["reference"]["model"], k2["reference"]["revision"]) == (
@@ -789,6 +823,21 @@ def test_sampled_speech_is_valid_by_its_median_duration_not_each_utterance():
     assert validity([], [], [])["status"] == "error"
 
 
+def test_silent_speech_failure_reports_the_paired_native_baseline():
+    from trtmc_aiperf_qual.intelligibility import validity
+
+    problem = [{"sample_id": "same-request"}]
+    quiet = {"finite": True, "dbfs": -56.58, "seconds": 6.69}
+    native = {"finite": True, "dbfs": -56.52, "seconds": 6.69}
+    result = validity(problem, [quiet], [native])
+    assert result["status"] == "fail" and result["passed"] == 0
+    assert "native also silent (-56.5 dBFS)" in result["failures"][0]["explanation"]
+    assert result["failures"][0]["native_audio"] == native
+    # Native validity is evidence, not an additional absolute-quality floor.
+    good = {"finite": True, "dbfs": -20.0, "seconds": 6.69}
+    assert validity(problem, [good], [native])["status"] == "pass"
+
+
 def test_reports_label_a_timing_normalized_per_audio_second(tmp_path):
     from trtmc_aiperf_qual import report_html
     from trtmc_aiperf_qual.report import write_report
@@ -799,3 +848,15 @@ def test_reports_label_a_timing_normalized_per_audio_second(tmp_path):
     write_report(tmp_path, {"model": "m", "provenance": {}, "performance": [item]})
     assert "| 40.000 per audio second |" in (tmp_path / "report.md").read_text()
     assert "40.000 per audio second</td><td>90.000 per audio second" in report_html._performance([item])
+
+
+def test_lance_qualification_has_a_native_path_and_sizes_the_multimodal_benchmark():
+    from trtmc_aiperf_qual.config import Environment
+    from trtmc_aiperf_qual.models import resolve_model
+
+    repository = Path(__file__).resolve().parents[3]
+    model = resolve_model("lance-3b-x2t-image", Environment({"repo": str(repository)}))
+    assert model["reference"]["backend"] == "reference" and "not_covered" not in model["reference"]
+    assert (repository / model["reference"]["adapter"]).is_file()
+    assert model["candidate"]["benchmark_sequence_length"]["extra_tokens"] == 288
+    assert model["candidate"]["tokenizer_subfolder"] == "Lance_3B"

@@ -16,6 +16,7 @@ Weight prefix: vision_tower.*, multi_modal_projector.*, language_model.*
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -37,6 +38,28 @@ if TYPE_CHECKING:
     pass
 
 _DEFAULT_FIXED_IMAGE_SIZE = 448
+# GotOcr2ImageProcessor defaults, used when preprocessor_config.json omits them.
+_PROCESSOR_MIN_PATCHES = 1
+_PROCESSOR_MAX_PATCHES = 12
+
+
+def _image_tiling(model_dir: str | None) -> dict[str, object]:
+    """InternVLProcessor's crop_to_patches contract for one image.
+
+    The processor always tiles (its images_kwargs default crop_to_patches to
+    True) into min_patches..max_patches tiles plus a thumbnail.
+    """
+    processor: dict = {}
+    if model_dir is not None:
+        path = Path(model_dir) / "preprocessor_config.json"
+        if path.is_file():
+            processor = json.loads(path.read_text())
+    return {
+        "preprocessor_type": "dynamic_tiles_chw",
+        "min_image_tiles": int(processor.get("min_patches", _PROCESSOR_MIN_PATCHES)),
+        "max_image_tiles": int(processor.get("max_patches", _PROCESSOR_MAX_PATCHES)),
+        "use_thumbnail": True,
+    }
 
 
 if TYPE_CHECKING:
@@ -164,17 +187,21 @@ class _InternVLModel:
             "num_image_pad_tokens": image_seq_length,
             "vision_output_dim": config.hidden_size,
             "preprocessor_type": "simple_chw",
-            "image_mean": [0.48145466, 0.4578275, 0.40821073],
-            "image_std": [0.26862954, 0.26130258, 0.27577711],
+            "image_mean": [0.485, 0.456, 0.406],
+            "image_std": [0.229, 0.224, 0.225],
             "interpolation": "bicubic",
+            # As AutoProcessor renders the checkpoint's chat template: no
+            # default system turn, and the image tokens framed by <img></img>.
             "vl_prompt_template": (
-                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
                 "<|im_start|>user\n"
-                "{image_pads}\n"
+                "<img>{image_pads}</img>\n"
                 "{prompt}<|im_end|>\n"
                 "<|im_start|>assistant\n"
             ),
             "image_token_str": "<IMG_CONTEXT>",
+            # InternVLProcessor always tiles; this replaces the single-tile
+            # preprocessor_type above.
+            **_image_tiling(config.raw.get("_model_dir")),
         }
 
     def get_bundle_config_overrides(self, config: ModelConfig) -> dict[str, int]:
@@ -396,6 +423,8 @@ def build(request: "BuildRequest", writer: "BundleWriter") -> None:
     from .build_request import coerce_request
 
     request = coerce_request(request)
+    if request.mtp_seq_len is not None:
+        raise NotImplementedError("InternVL does not support MTP speculative decoding")
     from .edge_llm.dispatch import build as dispatch_build
 
     def _build_native(request: "BuildRequest", writer: "BundleWriter") -> None:
@@ -498,6 +527,11 @@ def build(request: "BuildRequest", writer: "BundleWriter") -> None:
             },
         }
         runtime.update(vl)
+        if parallel.enabled:
+            # Up to max_image_tiles tiles of 256 tokens need a multi-thousand
+            # token cache; the tensor-parallel decoder keeps one tile until its
+            # single-query attention avoids masked IAttention over >512 rows.
+            runtime.update({"preprocessor_type": "simple_chw", "max_image_tiles": 1})
         writer.add_bytes("vision.plan", vision)
         runtime.update(_tokenizer_runtime_contract(model_dir))
         writer.add_json("runtime.json", runtime)
