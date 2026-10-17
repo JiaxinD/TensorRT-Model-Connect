@@ -721,6 +721,7 @@ Json run_extract_features(trtmc::ITask& task, const Json& request, const Timing&
         },
         [](const trtmc::ImageFeaturesResult& result) {
             return Json{{"processed_images", 1},
+                        {"last_hidden_state", result.last_hidden_state},
                         {"last_hidden_state_shape", result.last_hidden_state_shape},
                         {"pooler_output", result.pooler_output},
                         {"pooler_output_shape", result.pooler_output_shape},
@@ -1235,8 +1236,12 @@ Json run_transcribe(const trtmc::Model& model, const Json& request, const Timing
             {"audio_path", "language", "target_language", "streaming", "max_new_tokens"});
         // Preserve the existing worker spelling, without overwriting a nested key.
         if (request.contains("max_new_tokens")) {
-            const auto limit =
-                sdk_config({{"max_output_tokens", request.at("max_new_tokens")}}, fields, {});
+            const auto name =
+                std::any_of(fields.begin(), fields.end(),
+                            [](const auto& field) { return field.name == "max_new_tokens"; })
+                    ? "max_new_tokens"
+                    : "max_output_tokens";
+            const auto limit = sdk_config({{name, request.at("max_new_tokens")}}, fields, {});
             for (const auto& entry : limit.entries())
                 config.add(entry.name, entry.value);
         }
