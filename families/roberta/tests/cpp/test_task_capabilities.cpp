@@ -114,7 +114,7 @@ void test_legacy_bundle_rejected_before_backend() {
             std::filesystem::remove(path, ignored);
         }
     } file{pattern};
-    const std::string config = R"({"tensor_parallel_size":1})";
+    const std::string config = R"({"tensor_parallel_size":1,"tokenizer_add_special_tokens":true})";
     const std::string header =
         R"({"format":1,"family":"roberta","task":"reranking","backend":"trt","sections":{"runtime.json":{"offset":0,"length":)" +
         std::to_string(config.size()) + R"(},"engine.plan":{"offset":)" +
