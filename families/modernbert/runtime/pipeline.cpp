@@ -22,8 +22,7 @@ EncoderPipeline::EncoderPipeline(std::unique_ptr<ITrtModule> encoder, std::strin
     if (!encoder_ || !encoder_->ok() || !tokenizer_)
         throw std::invalid_argument("ModernBERT requires an encoder and tokenizer");
     if (task_ != internal::ITextToPooledFeatures::kTask &&
-        task_ != internal::ITextToEmbedding::kTask &&
-        task_ != internal::ITextPairToRelevance::kTask)
+        task_ != internal::ITextToEmbedding::kTask)
         throw internal::UnsupportedTask("ModernBERT unsupported task: " + task_);
     if (vocab_size_ <= 0 || max_sequence_length_ <= 0)
         throw std::invalid_argument("ModernBERT requires positive vocabulary and sequence bounds");
@@ -58,9 +57,6 @@ void EncoderPipeline::require_task(std::string_view task, internal::ConfigView c
 std::vector<internal::TaskInstance> EncoderPipeline::task_bindings() {
     if (task_ == internal::ITextToEmbedding::kTask)
         return {internal::bind<internal::ITextToEmbedding>(*this)};
-    if (task_ == internal::ITextPairToRelevance::kTask)
-        return {internal::bind<internal::ITextPairToRelevance>(*this),
-                internal::bind<internal::ITextQueryDocumentsToRelevance>(*this)};
     return {internal::bind<internal::ITextToPooledFeatures>(*this)};
 }
 
@@ -145,29 +141,6 @@ EncoderPipeline::run(const internal::TextToEmbeddingRequest& request, internal::
         for (auto& value : values)
             value /= norm;
     return {std::move(values), "", "mean", "l2"};
-}
-
-internal::RelevanceResult EncoderPipeline::run(const internal::TextPairToRelevanceRequest& request,
-                                               internal::ConfigView config) {
-    require_task(internal::ITextPairToRelevance::kTask, config);
-    const auto text =
-        "question:" + std::string(request.query) + "   passage:" + std::string(request.document);
-    const auto values = forward(resolve_ids(internal::TextSource{std::string_view(text)}));
-    // Note (Jiaxin Deng): Preserve the legacy first-feature score, without claiming a trained head.
-    return {values.front(), internal::ScoreKind::Unbounded};
-}
-
-internal::DocumentRelevanceResult
-EncoderPipeline::run(const internal::TextQueryDocumentsToRelevanceRequest& request,
-                     internal::ConfigView config) {
-    require_task(internal::ITextPairToRelevance::kTask, config);
-    internal::DocumentRelevanceResult result;
-    result.kind = internal::ScoreKind::Unbounded;
-    result.scores.reserve(request.documents.size());
-    for (const auto document : request.documents)
-        result.scores.push_back(
-            run(internal::TextPairToRelevanceRequest{request.query, document}, {}).score);
-    return result;
 }
 
 } // namespace trtmc::modernbert

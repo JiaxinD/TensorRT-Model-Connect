@@ -18,9 +18,7 @@ namespace trtmc::modernbert {
 
 class EncoderPipeline final : public internal::IModel,
                               public internal::ITextToPooledFeatures,
-                              public internal::ITextToEmbedding,
-                              public internal::ITextPairToRelevance,
-                              public internal::ITextQueryDocumentsToRelevance {
+                              public internal::ITextToEmbedding {
   public:
     EncoderPipeline(std::unique_ptr<ITrtModule> encoder, std::string task,
                     std::shared_ptr<ITokenizer> tokenizer, std::int64_t vocab_size,
@@ -31,10 +29,6 @@ class EncoderPipeline final : public internal::IModel,
     internal::PooledFeaturesResult run(const internal::TextToPooledFeaturesRequest&,
                                        internal::ConfigView) override;
     internal::SemanticEmbeddingResult run(const internal::TextToEmbeddingRequest&,
-                                          internal::ConfigView) override;
-    internal::RelevanceResult run(const internal::TextPairToRelevanceRequest&,
-                                  internal::ConfigView) override;
-    internal::DocumentRelevanceResult run(const internal::TextQueryDocumentsToRelevanceRequest&,
                                           internal::ConfigView) override;
 
   private:

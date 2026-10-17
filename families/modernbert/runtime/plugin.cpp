@@ -46,8 +46,7 @@ std::int32_t require_tensor_parallel_size(const nlohmann::json& config) {
 
 std::string require_task(const BundleInfo& info) {
     if (info.task == internal::ITextToPooledFeatures::kTask ||
-        info.task == internal::ITextToEmbedding::kTask ||
-        info.task == internal::ITextPairToRelevance::kTask) {
+        info.task == internal::ITextToEmbedding::kTask) {
         return info.task;
     }
     throw std::runtime_error("ModernBERT does not implement task: " + info.task);
@@ -69,9 +68,9 @@ std::int64_t require_positive_integer(const nlohmann::json& config, const char* 
 extern "C" trtmc::ITask* trtmc_create_family(const trtmc::FamilyContext& context) {
     if (context.kv_cache_size_bytes != 0)
         throw std::invalid_argument("modernbert does not support --kv-cache-size");
+    const auto task = trtmc::modernbert_factory::require_task(context.reader.info());
     const auto config = trtmc::modernbert_factory::require_config(context.reader);
     const auto tp_size = trtmc::modernbert_factory::require_tensor_parallel_size(config);
-    const auto task = trtmc::modernbert_factory::require_task(context.reader.info());
     const auto vocab_size =
         trtmc::modernbert_factory::require_positive_integer(config, "vocab_size");
     const auto max_sequence_length =

@@ -4,10 +4,17 @@
  */
 
 #include "families/modernbert/runtime/pipeline.h"
+#include "runtime/bundle/bundle_format.h"
+#include "trtmc/runtime/family_factory.h"
+#include "trtmc/runtime/trt_backend.h"
 
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <type_traits>
+#include <unistd.h>
 
 namespace {
 using namespace trtmc;
@@ -199,30 +206,76 @@ void embedding_contract(bool dynamic) {
         [&] { model.run(TextToEmbeddingRequest{"long", static_cast<EmbeddingRole>(99)}, {}); });
 }
 
-void relevance_contract() {
-    auto engine = std::make_unique<Engine>();
-    auto* observed = engine.get();
-    auto tokenizer = std::make_shared<Tokenizer>();
-    modernbert::EncoderPipeline model(std::move(engine), "text_pair_to_relevance", tokenizer, 100,
-                                      4);
-    const auto bindings = model.task_bindings();
-    check(bindings.size() == 2 && bindings[0].key.id == ITextPairToRelevance::kTask &&
-          bindings[1].key.id == ITextQueryDocumentsToRelevance::kTask);
-    const auto single = model.run(TextPairToRelevanceRequest{"query", "document"}, {});
-    check(single.score == 1 && single.kind == ScoreKind::Unbounded);
-    check(tokenizer->inputs.back() == "question:query   passage:document");
-    std::vector<std::string_view> documents{"first", "second"};
-    const auto list = model.run(
-        TextQueryDocumentsToRelevanceRequest{"query", {documents.data(), documents.size()}}, {});
-    check(list.scores == std::vector<float>({1, 1}) && list.kind == ScoreKind::Unbounded);
-    check(tokenizer->inputs[tokenizer->inputs.size() - 2] == "question:query   passage:first");
-    check(tokenizer->inputs.back() == "question:query   passage:second");
-    const auto calls = observed->calls;
-    check(model.run(TextQueryDocumentsToRelevanceRequest{"query", {}}, {}).scores.empty());
-    check(observed->calls == calls);
-    ConfigEntry config{"unknown", std::int64_t(1)};
-    rejects<ConfigError>(
-        [&] { model.run(TextQueryDocumentsToRelevanceRequest{"query", {}}, {&config, 1}); });
+class Backend final : public trtmc::IBackend {
+  public:
+    int calls{0};
+    std::unique_ptr<trtmc::ITrtModule> create_module(const void*, std::size_t,
+                                                     const trtmc::ModuleCreateOptions&) override {
+        ++calls;
+        return std::make_unique<Engine>();
+    }
+    std::unique_ptr<trtmc::ITrtModule>
+    create_module_prebound(const void*, std::size_t, const trtmc::ModuleCreateOptions&,
+                           const std::vector<trtmc::ModuleExternalBinding>&) override {
+        ++calls;
+        throw std::runtime_error("unexpected backend call");
+    }
+    trtmc::BackendDualProfileModules
+    create_dual_profile_modules(const void*, std::size_t,
+                                const trtmc::ModuleCreateOptions&) override {
+        ++calls;
+        throw std::runtime_error("unexpected backend call");
+    }
+    const char* name() const override { return "trt"; }
+};
+
+void unsupported_bundle_contract(const std::string& task_id) {
+    char pattern[] = "/tmp/trtmc-modernbert-task-XXXXXX";
+    const int fd = mkstemp(pattern);
+    if (fd < 0)
+        throw std::runtime_error("cannot create test bundle");
+    close(fd);
+    struct File {
+        std::filesystem::path path;
+        ~File() {
+            std::error_code ignored;
+            std::filesystem::remove(path, ignored);
+        }
+    } file{pattern};
+    const std::string config =
+        R"({"tensor_parallel_size":1,"vocab_size":100,"max_sequence_length":4,"tokenizer_add_special_tokens":true})";
+    const std::string header =
+        R"({"format":1,"family":"modernbert","task":")" + task_id +
+        R"(","backend":"trt","sections":{"runtime.json":{"offset":0,"length":)" +
+        std::to_string(config.size()) + R"(},"engine.plan":{"offset":)" +
+        std::to_string(config.size()) + R"(,"length":4}}})";
+    {
+        std::ofstream output(file.path, std::ios::binary);
+        output.write(reinterpret_cast<const char*>(kBundleMagic), 8);
+        for (int shift = 0; shift < 64; shift += 8)
+            output.put(static_cast<char>((header.size() >> shift) & 0xffU));
+        output << header << config << "PLAN";
+    }
+    BundleReader reader(file.path.string());
+    Backend backend;
+    bool rejected = false;
+    try {
+        std::unique_ptr<ITask> task(trtmc_create_family({reader, backend}));
+    } catch (const std::runtime_error& error) {
+        rejected = std::string(error.what()) == "ModernBERT does not implement task: " + task_id;
+    }
+    if (!rejected || backend.calls != 0)
+        throw std::runtime_error("unsupported relevance bundle reached the backend: " + task_id);
+}
+
+void unsupported_relevance_contract() {
+    check((!std::is_base_of<ITextPairToRelevance, modernbert::EncoderPipeline>::value));
+    check((!std::is_base_of<ITextQueryDocumentsToRelevance, modernbert::EncoderPipeline>::value));
+    for (const auto* task : {"text_pair_to_relevance", "text_query_documents_to_relevance"})
+        rejects<UnsupportedTask>([&] {
+            modernbert::EncoderPipeline model(std::make_unique<Engine>(), task,
+                                              std::make_shared<Tokenizer>(), 100, 4);
+        });
 }
 } // namespace
 
@@ -233,7 +286,10 @@ int main() {
             pooled_contract(trtmc::DType::kFloat32, dynamic);
             embedding_contract(dynamic);
         }
-        relevance_contract();
+        for (const auto* task :
+             {"reranking", "text_pair_to_relevance", "text_query_documents_to_relevance"})
+            unsupported_bundle_contract(task);
+        unsupported_relevance_contract();
         rejects<trtmc::internal::UnsupportedTask>([] {
             trtmc::modernbert::EncoderPipeline model(std::make_unique<Engine>(), "encoding",
                                                      std::make_shared<Tokenizer>(), 100, 4);

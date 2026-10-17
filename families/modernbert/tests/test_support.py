@@ -12,7 +12,7 @@ from families.modernbert.support import describe
 from tensorrt_model_connect import BuildRequest
 from tensorrt_model_connect.model_support import ModelMetadata
 
-TASKS = ("text_to_pooled_features", "text_to_embedding", "text_pair_to_relevance")
+TASKS = ("text_to_pooled_features", "text_to_embedding")
 
 
 def test_support_exposes_semantic_tasks():
@@ -85,6 +85,27 @@ def test_build_semantic_bundle_contract(builder, task, tp):
 @pytest.mark.parametrize("task", ["encoding", "embedding", "reranking", "text_continuation"])
 def test_build_rejects_retired_and_unrelated_tasks(builder, task):
     model, path = builder
+    with pytest.raises(ValueError, match="text_to_pooled_features"):
+        model.build(
+            BuildRequest(
+                model_dir=path,
+                output_path=path / "unused.bundle",
+                family="modernbert",
+                task=task,
+                precision="fp32",
+            ),
+            Writer(),
+        )
+
+
+@pytest.mark.parametrize("task", ["text_pair_to_relevance", "text_query_documents_to_relevance"])
+def test_build_rejects_unimplemented_relevance_before_checkpoint(builder, monkeypatch, task):
+    model, path = builder
+
+    def unexpected_checkpoint(*args):
+        pytest.fail("unsupported relevance task must fail before checkpoint access")
+
+    monkeypatch.setattr(model.ModelConfig, "from_dir", unexpected_checkpoint)
     with pytest.raises(ValueError, match="text_to_pooled_features"):
         model.build(
             BuildRequest(

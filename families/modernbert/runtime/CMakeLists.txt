@@ -43,9 +43,10 @@ if(TRTMC_BUILD_TESTS)
   target_include_directories(test_modernbert_task_contract PRIVATE
     ${PROJECT_SOURCE_DIR}
     ${PROJECT_SOURCE_DIR}/core/runtime/include
+    ${PROJECT_SOURCE_DIR}/core
   )
   target_include_directories(test_modernbert_task_contract SYSTEM PRIVATE ${TRTMC_CUDA_INCLUDE_DIR})
-  target_link_libraries(test_modernbert_task_contract PRIVATE trtmc_model_modernbert)
+  target_link_libraries(test_modernbert_task_contract PRIVATE trtmc_model_modernbert trtmc_core)
   target_compile_options(test_modernbert_task_contract PRIVATE -Wall -Wextra -Wpedantic -Werror)
   add_test(NAME modernbert_task_contract COMMAND test_modernbert_task_contract)
   set_tests_properties(modernbert_task_contract PROPERTIES LABELS "cpu")
