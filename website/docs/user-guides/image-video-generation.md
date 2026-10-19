@@ -28,6 +28,11 @@ file plus comma-separated seeds for a family that declares the batch Task.
 
 To benchmark a built text-to-image bundle over HTTP, see
 [Profile Image Generation with AIPerf](./profile-images-with-aiperf.md).
+For one reference image and instruction, use
+[Profile Image Editing with AIPerf](./profile-image-edits-with-aiperf.md).
+
+For complete prompt-to-video clips with polling and download, see
+[Profile Video Generation with AIPerf](./profile-videos-with-aiperf.md).
 
 ## Perception
 

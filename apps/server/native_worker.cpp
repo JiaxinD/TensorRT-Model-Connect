@@ -5,6 +5,7 @@
 
 #include "server/native_worker.h"
 
+#include "bundle_provenance.h"
 #include "cli/io.h"
 #include "config.h"
 #include "task_runtime.h"
@@ -24,12 +25,15 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <nlohmann/json.hpp>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -520,28 +524,132 @@ ImageGenerationConfig image_config(const Json& request) {
 }
 
 template <class Generate>
-int run_image_protocol(Generate&& generate, std::istream& input, std::ostream& output) {
-    return run_protocol({{"event", "ready"},
-                         {"protocol_version", 1},
-                         {"capabilities", Json::array({"image_generation"})}},
-                        {{"generate_image",
-                          [&](const Json& request) {
-                              const auto prompt = string_field(request, "prompt");
-                              const auto path = string_field(request, "output_path");
-                              // Generation and timing stay with the public Task. PNG encoding is
-                              // the same codec used by the CLI and benchmark artifact recorder.
-                              return generate(prompt, path, request);
-                          }}},
-                        input, output);
+int run_image_protocol(Generate&& generate, std::istream& input, std::ostream& output,
+                       std::string_view capability = "image_generation",
+                       std::string_view operation = "generate_image") {
+    return run_protocol(
+        {{"event", "ready"}, {"protocol_version", 1}, {"capabilities", Json::array({capability})}},
+        {{std::string(operation),
+          [&](const Json& request) {
+              const auto prompt = string_field(request, "prompt");
+              const auto path = string_field(request, "output_path");
+              // Generation and timing stay with the public Task. PNG encoding is
+              // the same codec used by the CLI and benchmark artifact recorder.
+              return generate(prompt, path, request);
+          }}},
+        input, output);
 }
 
-int run_existing_worker(ITask& task, std::istream& input, std::ostream& output) {
+template <class Edit>
+int run_edit_protocol(Edit&& edit, std::istream& input, std::ostream& output) {
+    return run_image_protocol(
+        [&](const std::string& prompt, const std::string& path, const Json& request) {
+            cli::io::LoadedImage image;
+            try {
+                image = cli::io::read_image(string_field(request, "image_path"));
+            } catch (const std::exception&) {
+                throw ProtocolError("image must be a readable image file");
+            }
+            if (image.height <= 0 || image.width <= 0 || image.pixels.empty())
+                throw ProtocolError("image must contain RGB pixels");
+            auto result = edit(prompt, image, path, request);
+            result["image_height"] = image.height;
+            result["image_width"] = image.width;
+            return result;
+        },
+        input, output, "image_edit", "edit_image");
+}
+
+Json write_generated_image(const ImageResult& result, const std::string& path, double wall_ms) {
+    if (result.num_frames != 1)
+        throw std::runtime_error("image endpoint requires one generated frame");
+    cli::io::save_png(path, result.pixels, result.width, result.height, result.channels);
+    return {{"height", result.height},     {"width", result.width},
+            {"channels", result.channels}, {"output_count", 1},
+            {"model_call_ms", wall_ms},    {"timing_scope", "public_task_call_wall"}};
+}
+
+Json write_video_frames(const ImageResult& result, const std::string& directory,
+                        VideoGeometry geometry, double wall_ms) {
+    if (result.width != geometry.width || result.height != geometry.height ||
+        result.num_frames != geometry.frames || result.channels != 3 ||
+        result.pixels.size() !=
+            static_cast<std::size_t>(geometry.width) * geometry.height * geometry.frames * 3U ||
+        !std::all_of(result.pixels.begin(), result.pixels.end(),
+                     [](float v) { return std::isfinite(v); }))
+        throw std::runtime_error("video result differs from the built RGB THWC geometry");
+    std::filesystem::create_directories(directory);
+    const auto frame_size = static_cast<std::size_t>(geometry.width) * geometry.height * 3U;
+    for (int frame = 0; frame < geometry.frames; ++frame) {
+        std::ostringstream name;
+        name << "frame-" << std::setw(6) << std::setfill('0') << frame << ".png";
+        const auto begin = result.pixels.begin() + static_cast<std::ptrdiff_t>(frame_size * frame);
+        cli::io::save_png(
+            (std::filesystem::path(directory) / name.str()).string(),
+            std::vector<float>(begin, begin + static_cast<std::ptrdiff_t>(frame_size)),
+            geometry.width, geometry.height);
+    }
+    return {{"width", geometry.width},
+            {"height", geometry.height},
+            {"channels", 3},
+            {"num_frames", geometry.frames},
+            {"model_call_ms", wall_ms},
+            {"timing_scope", "public_task_call_wall"}};
+}
+
+int run_existing_worker(ITask& task, std::istream& input, std::ostream& output,
+                        VideoGeometry geometry = {}) {
     // Legacy bundle modes select the declared public Task before invocation.
     // Several families implement more C++ interfaces than a given bundle enables.
+    if (std::string_view(task.task()) == IImageEditing::kTask) {
+        auto* editor = dynamic_cast<IImageEditing*>(&task);
+        if (!editor)
+            throw std::invalid_argument("bundle does not implement image editing");
+        return run_edit_protocol(
+            [&](const std::string& prompt, const cli::io::LoadedImage& image,
+                const std::string& path, const Json& request) {
+                const auto config = image_config(request);
+                const auto started = std::chrono::steady_clock::now();
+                const auto result = editor->generate_image(prompt, image.pixels.data(),
+                                                           image.height, image.width, config);
+                const auto wall_ms = std::chrono::duration<double, std::milli>(
+                                         std::chrono::steady_clock::now() - started)
+                                         .count();
+                return write_generated_image(result, path, wall_ms);
+            },
+            input, output);
+    }
     if (std::string_view(task.task()) == IImageGeneration::kTask) {
         auto* image = dynamic_cast<IImageGeneration*>(&task);
         if (!image)
             throw std::invalid_argument("bundle does not implement image generation");
+        if (geometry.frames > 1) {
+            const Json ready{{"event", "ready"},
+                             {"protocol_version", 1},
+                             {"capabilities", Json::array({"video_generation"})},
+                             {"video",
+                              {{"width", geometry.width},
+                               {"height", geometry.height},
+                               {"num_frames", geometry.frames}}}};
+            return run_protocol(
+                ready,
+                {{"generate_video",
+                  [&](const Json& request) {
+                      const auto prompt = string_field(request, "prompt");
+                      const auto path = string_field(request, "output_path");
+                      const auto config = image_config(request);
+                      if ((config.width && config.width != geometry.width) ||
+                          (config.height && config.height != geometry.height))
+                          throw ProtocolError("video size must match the built geometry");
+                      const auto started = std::chrono::steady_clock::now();
+                      const auto result = image->generate_image(prompt, config);
+                      const auto wall_ms = std::chrono::duration<double, std::milli>(
+                                               std::chrono::steady_clock::now() - started)
+                                               .count();
+                      return write_video_frames(result, path, geometry, wall_ms);
+                  }}},
+                input, output);
+        }
         return run_image_protocol(
             [&](const std::string& prompt, const std::string& path, const Json& request) {
                 const auto config = image_config(request);
@@ -550,14 +658,7 @@ int run_existing_worker(ITask& task, std::istream& input, std::ostream& output) 
                 const auto wall_ms = std::chrono::duration<double, std::milli>(
                                          std::chrono::steady_clock::now() - started)
                                          .count();
-                if (result.num_frames != 1)
-                    throw std::runtime_error("image endpoint requires one generated frame");
-                cli::io::save_png(path, result.pixels, result.width, result.height,
-                                  result.channels);
-                return Json{
-                    {"height", result.height},     {"width", result.width},
-                    {"channels", result.channels}, {"output_count", 1},
-                    {"model_call_ms", wall_ms},    {"timing_scope", "public_task_call_wall"}};
+                return write_generated_image(result, path, wall_ms);
             },
             input, output);
     }
@@ -668,6 +769,38 @@ int run_existing_worker(ITask& task, std::istream& input, std::ostream& output) 
 
 int run_model_worker(const Model& model, std::istream& input, std::ostream& output) {
     const auto primary = model.info().bundle_task;
+    if (primary == ImagesTextToImageEdit::kTask || primary == IImageEditing::kTask) {
+        const auto task = model.task<ImagesTextToImageEdit>();
+        const auto fields = task.config_fields();
+        return run_edit_protocol(
+            [&](const std::string& prompt, const cli::io::LoadedImage& image,
+                const std::string& path, const Json& request) {
+                const auto config = parse_sdk_config(request, fields);
+                const auto latents = image_latents(request);
+                const ImagesTextToImageEditRequest edit{
+                    {ImageInput{{image.pixels.data(), image.pixels.size()},
+                                static_cast<std::uint32_t>(image.height),
+                                static_cast<std::uint32_t>(image.width)}},
+                    prompt,
+                    {latents.data(), latents.size()}};
+                const auto started = std::chrono::steady_clock::now();
+                const auto result = task.run(edit, config);
+                const auto wall_ms = std::chrono::duration<double, std::milli>(
+                                         std::chrono::steady_clock::now() - started)
+                                         .count();
+                if (result.width() > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+                    result.height() > static_cast<std::uint32_t>(std::numeric_limits<int>::max()))
+                    throw std::runtime_error("image dimensions exceed the PNG writer range");
+                cli::io::save_png(path, result.pixels(), static_cast<int>(result.width()),
+                                  static_cast<int>(result.height()),
+                                  static_cast<int>(result.channels()));
+                return Json{
+                    {"height", result.height()},     {"width", result.width()},
+                    {"channels", result.channels()}, {"output_count", 1},
+                    {"model_call_ms", wall_ms},      {"timing_scope", "public_task_call_wall"}};
+            },
+            input, output);
+    }
     if (primary == TextToImage::kTask || primary == IImageGeneration::kTask) {
         const auto task = model.task<TextToImage>();
         const auto fields = task.config_fields();
@@ -897,8 +1030,9 @@ int run_sdk_worker(const Task& task, Request&& make_request, std::istream& input
 
 } // namespace
 
-int run_task_worker(ITask& task, std::istream& input, std::ostream& output) {
-    return run_existing_worker(task, input, output);
+int run_task_worker(ITask& task, std::istream& input, std::ostream& output,
+                    VideoGeometry geometry) {
+    return run_existing_worker(task, input, output, geometry);
 }
 
 int run_text_worker(ITask& task, std::istream& input, std::ostream& output) {
@@ -946,9 +1080,40 @@ int run_text_worker(const Model& model, std::istream& input, std::ostream& outpu
 int run_bundle_worker(const std::string& bundle, const LoadOptions& options, std::istream& input,
                       std::ostream& output) {
     const auto primary = Bundle::open(bundle).info().task;
+    VideoGeometry geometry;
+    if (primary == IImageGeneration::kTask) {
+        const auto provenance = app::read_provenance(bundle);
+        // Older image bundles and family-owned default dimensions do not need
+        // core geometry. Enable video only for an explicit multi-frame build.
+        const auto build = provenance.is_object() ? provenance.value("build", Json{}) : Json{};
+        const auto integer = [&](const char* name, int fallback) {
+            if (!build.is_object() || !build.contains(name) || build.at(name).is_null())
+                return fallback;
+            int result = fallback;
+            try {
+                assign(build, name, result);
+            } catch (const std::exception&) {
+                throw std::invalid_argument(std::string("invalid built geometry field: ") + name);
+            }
+            return result;
+        };
+        geometry.frames = integer("video_num_frames", 1);
+        if (geometry.frames < 1)
+            throw std::invalid_argument("invalid built video frame count");
+        if (geometry.frames > 1) {
+            geometry.width = integer("image_width", 0);
+            geometry.height = integer("image_height", 0);
+            if (geometry.width < 1 || geometry.height < 1 ||
+                static_cast<std::uint64_t>(geometry.width) * geometry.height >
+                    (512U * 1024U * 1024U) / static_cast<std::uint64_t>(geometry.frames))
+                throw std::invalid_argument("invalid or excessive built video geometry");
+        }
+    }
     if (app::uses_existing_task_runtime(primary)) {
         try {
             const auto model = Model::load(bundle, options);
+            if (geometry.frames > 1)
+                throw std::invalid_argument("SDK image binding cannot serve a video bundle");
             return run_model_worker(model, input, output);
         } catch (const Error& error) {
             // Only pre-SDK families may take this compatibility path. Never
@@ -961,7 +1126,7 @@ int run_bundle_worker(const std::string& bundle, const LoadOptions& options, std
         }
         auto task = load_task(bundle, options.runtime_root, options.kv_cache_size_bytes,
                               options.runtime_cache_path, options.cuda_graphs);
-        return run_existing_worker(*task, input, output);
+        return run_existing_worker(*task, input, output, geometry);
     }
     const auto model = Model::load(bundle, options);
     return run_model_worker(model, input, output);

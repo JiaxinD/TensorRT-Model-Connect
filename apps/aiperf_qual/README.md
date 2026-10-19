@@ -404,7 +404,8 @@ PYTHONPATH=apps/aiperf_qual:apps/benchmark:core/builder:. \
   python -m trtmc_aiperf_qual endpoint-models --repo . --group embeddings
 ```
 
-Groups are `embeddings`, `reranking`, `transcription`, `detection`, `vision`, and `images`.
+Groups are `embeddings`, `reranking`, `transcription`, `detection`, `vision`,
+`images`, and `image-edit`.
 The image group excludes legacy video profiles even when their Task string is
 `image_generation`.
 
@@ -435,6 +436,33 @@ against the selected existing profile, and retains the actual build provenance.
 Use a current-builder bundle with that provenance for qualification.
 See [Profile Image Generation with AIPerf](../../website/docs/user-guides/profile-images-with-aiperf.md)
 for the three-step interactive example.
+
+For one reference image plus instruction, use `image-edit-profile` instead:
+
+```bash
+PYTHONPATH=apps/aiperf_qual:apps/benchmark:apps/perf_serving:core/builder:. \
+  python -m trtmc_aiperf_qual image-edit-profile \
+    --environment /path/to/local-environment.yaml \
+    --profile qwen-image-edit-2511 --bundle /path/to/qwen-image-edit-2511.bundle \
+    --inputs /path/to/image-edits.jsonl --request-count 5 --warmup-request-count 1 \
+    --out /path/to/new-edit-results
+```
+
+Each JSONL row supplies `text`, one local `image` path (relative to the dataset
+file or absolute) or an embedded image data URL, and optional `extra` controls.
+The qualifier pins decoded RGB pixels in lossless PNG uploads, preserving the
+original source hash and avoiding AIPerf's lossy re-encoding of local JPEGs.
+It reuses the image-generation server/qualifier, with AIPerf `image_edit` and
+multipart `/v1/images/edits`. Each input image/instruction pair, native controls,
+replay noise and complete edited output is checked by request identity. Saved
+inputs accompany their outputs in `images.json`. Build geometry is recorded
+separately from actual conditioning and requested output geometry: an edit
+builder may use its image dimensions for the input. Checkpoint, Task, precision
+and other build provenance checks remain mandatory. Quality still requires the
+owning family's unchanged correctness criteria on the exact served bundle.
+See [Profile Image Editing with AIPerf](../../website/docs/user-guides/profile-image-edits-with-aiperf.md)
+for the three-step Qwen example.
+
 The inventory selects a normal full-model profile when one is available, with
 precision and parallel variants listed separately. Checkpoints without one
 remain explicit gaps. Discovery reports `unverified`; it does not claim
@@ -640,3 +668,79 @@ wall ratio. Mismatched work is reported as noncomparable.
 The normal qualification commands keep the existing perf-serving service and
 its raw Task/observation protocol. `services.serving(service="trtmc-server")`
 is an explicit text candidate option; callers must use the public text endpoints.
+
+### Complete text-to-video clips
+
+Use the existing full `minimax-h3-768p`, `wan21-t2v-1.3b` or `wan22-ti2v-5b`
+profile after its unchanged family correctness case passes on the exact bundle.
+`endpoint-models --repo . --group videos` also reports partial/L0-only and
+distributed variants; inventory is not qualification. No new model specs are needed.
+
+```bash
+python -m trtmc_aiperf_qual video-profile \
+  --environment environment.yaml --profile wan21-t2v-1.3b \
+  --bundle /path/to/validated.bundle --inputs prompts.jsonl \
+  --out artifacts/wan21-video --request-count 2 --warmup-request-count 1
+```
+
+Each input row has `text` and optional `extra` controls, for example
+`{"text":"A cat sitting on a beach watching the sunset"}`. Geometry, steps, seed
+and declared guidance come from the existing profile; omitted guidance keeps
+the public Task's default. `extra.initial_latents_b64` can replay the original
+owner's raw float32 latents when its public Task supports them. Never substitute
+a smaller clip or different precision for the selected full profile.
+
+The environment needs FFmpeg/ffprobe with `libx264rgb`, the native server and
+PyPI AIPerf 0.13.0 plus this repository's qualification plugins. Optional
+`video_worker`, `video_port`, and `video_request_timeout` select the server
+executable, port and timeout. The opt-in `trtmc_video_capture` transport extends
+only AIPerf's actual download hook: normal submission, polling, and download stay
+with the published client. It preserves the exact returned bytes by job ID,
+because AIPerf deliberately excludes binary downloads from raw JSON exports.
+The qualifier checks every decoded RGB frame, frame order, dimensions, file
+hash, native completion, fixed request controls and request/metric identity.
+It saves complete clips and decoded frames; these can be compared against the
+original owning reference with its unchanged quality criteria.
+
+Client latency includes polling, download and capture-file writing. It is
+reported separately from native Task time, without subtracting estimated
+overhead. Encoding FPS is presentation metadata; it never changes built frames.
+The [three-step usage guide](../../website/docs/user-guides/profile-videos-with-aiperf.md)
+also works with plain `pip install aiperf==0.13.0`, without an AIPerf checkout
+or the optional capture transport.
+
+### Pinned real prompts
+
+Copy `config/text/environment.yaml` and
+`config/text/qwen3-0.6b-real-prompts.yaml`, then set their existing interpreter,
+server, runtime and bundle paths. Use the already-built `qwen3-0.6b-fp16`
+full profile; the runner invokes its unchanged owning-family checks against
+that exact bundle before profiling. Build instructions remain in the website's
+[Build a Bundle](../../website/docs/user-guides/build-a-bundle.md) guide.
+
+```bash
+python -m trtmc_aiperf_qual text-profile \
+  --environment environment.yaml --config qwen3-0.6b-real-prompts.yaml \
+  --out artifacts/qwen-real-prompts
+```
+
+The workload pins the ShareGPT file revision and checksum and the model's
+existing tokenizer revision. It selects the first twelve distinct, nonempty first-human
+turns whose original text plus sixteen output tokens fits the bundle's recorded
+context limit. Selection does not rewrite, truncate or pad text. `corpus.json`
+records every considered source index, selected string, tokenizer length and
+rejection reason; unexamined rows are counted separately. Counts use the pinned
+tokenizer without special tokens; native input-token counts remain unavailable.
+
+The published AIPerf `single_turn` loader sends `inputs.jsonl`, with twelve
+measured requests, one separately retained warmup, concurrency one and greedy
+sampling. Every selected prompt must appear in the measured phase.
+`run-000/corpus-verification.json` joins the original strings to actual wire
+payloads and the native-dispatch input/output hashes by request ID.
+Server records contain hashes and byte counts, without storing raw text.
+`report.json` keeps client latency/throughput and native Task-call timings
+separate. Build, loading and warmup are excluded from measured requests.
+A selection failure or changed/missing input/output fails verification and
+preserves its ledger and request artifacts. Family quality criteria are unchanged;
+this workload verifies transport and reports performance, without adding a new
+numerical accuracy gate.

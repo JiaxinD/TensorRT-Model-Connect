@@ -39,8 +39,9 @@ from .protocol import chat_prompt, chat_image, extract_vision_result, extract_em
 from .records import RequestPolicy, RequestRecords
 from .registry import ModelRegistry
 from .schemas import ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerationRequest, RankingRequest, TranscriptionRequest, DetectionRequest
-from .uploads import UploadedInput, multipart_audio, wav_metadata, image_upload, create_uploaded_input, ImagePixelLimitError
+from .uploads import UploadedInput, multipart_audio, multipart_image, image_file, wav_metadata, image_upload, create_uploaded_input, ImagePixelLimitError
 from .worker import WorkerSession
+from .videos import VideoJobs
 from trtmc_perf_serving.images import png_response
 from trtmc_perf_serving.openai import image_generation
 from .protocol import extract_task_timing
@@ -58,6 +59,9 @@ class ServerConfig:
         records: Path | None = None,
         max_audio_seconds: float = 30.0,
         max_image_pixels: int = 16_000_000,
+        max_video_jobs: int = 8,
+        max_video_bytes: int = 4 * 1024**3,
+        video_ttl_seconds: float = 600,
     ) -> None:
         self.max_body_bytes = max_body_bytes
         self.max_prompt_bytes = max_prompt_bytes
@@ -69,6 +73,12 @@ class ServerConfig:
         if type(max_image_pixels) is not int or max_image_pixels <= 0:
             raise ValueError("max_image_pixels must be positive")
         self.max_image_pixels = max_image_pixels
+        if type(max_video_jobs) is not int or max_video_jobs < 1 or type(max_video_bytes) is not int or max_video_bytes < 1:
+            raise ValueError("video job and storage limits must be positive integers")
+        if not math.isfinite(video_ttl_seconds) or video_ttl_seconds <= 0:
+            raise ValueError("video TTL must be finite and positive")
+        self.max_video_jobs, self.max_video_bytes = max_video_jobs, max_video_bytes
+        self.video_ttl_seconds = video_ttl_seconds
 
 
 class _BodyLimitMiddleware:
@@ -87,6 +97,8 @@ class _BodyLimitMiddleware:
             "/v1/audio/transcriptions",
             "/v1/infer",
             "/v1/images/generations",
+            "/v1/images/edits",
+            "/v1/videos",
         }:
             await self.app(scope, receive, send)
             return
@@ -243,7 +255,9 @@ def create_app(registry: ModelRegistry, config: ServerConfig) -> FastAPI:
             await asyncio.to_thread(registry.start)
             yield
         finally:
+            videos.accepting = False
             await asyncio.to_thread(registry.close)
+            await videos.close()
             records.close()
 
     app = FastAPI(title="TensorRT-Model-Connect Server", version="0.1.0", lifespan=lifespan)
@@ -306,6 +320,8 @@ def create_app(registry: ModelRegistry, config: ServerConfig) -> FastAPI:
         chat_max_tokens: int | None = None,
     ) -> Any:
         context["model"] = request.model
+        context.update(prompt_sha256=hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                       prompt_bytes=len(prompt.encode("utf-8")))
         if request.n != 1:
             metrics.reject(route, 400)
             return error_response(400, "unsupported_parameter", "n must be 1", param="n")
@@ -444,6 +460,7 @@ def create_app(registry: ModelRegistry, config: ServerConfig) -> FastAPI:
 
         inference_seconds = time.monotonic() - inference_started
         context.update(timings, worker_roundtrip_ms=inference_seconds * 1000,
+                       completion_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
                        completion_tokens=completion_tokens, completion_token_source="native_task",
                        timing_scope=result.get("timing_scope", "unavailable"),
                        streaming="buffered" if request.stream else "none")
@@ -518,18 +535,23 @@ def create_app(registry: ModelRegistry, config: ServerConfig) -> FastAPI:
         http_request: Request, model: str, capability: str, operation: str,
         payload: dict[str, Any], validate: Callable[[Any], Any],
         release_input: Callable[[], None] | None = None,
+        acquired_session: WorkerSession | None = None,
+        task_context: dict[str, Any] | None = None,
     ) -> Any:
         route = http_request.url.path
-        context = http_request.state.timing
+        context = task_context if task_context is not None else http_request.state.timing
         context["model"] = model
         request_id = http_request.state.request_id
         admitted = time.monotonic()
-        session = None
+        session = acquired_session
+        admitted_ok = False
         try:
             if not registry.supports(model, capability):
                 metrics.reject(route, 400)
                 return error_response(400, "unsupported_task", "model does not support this endpoint", param="model")
-            session = registry.acquire(model)
+            if session is None:
+                session = registry.acquire(model)
+            admitted_ok = True
         except ModelNotFoundError as error:
             metrics.reject(route, 404)
             return error_response(404, error.code, str(error), param="model")
@@ -542,8 +564,11 @@ def create_app(registry: ModelRegistry, config: ServerConfig) -> FastAPI:
             metrics.reject(route, 503)
             return error_response(503, "server_draining", "server is not accepting requests")
         finally:
-            if session is None and release_input is not None:
-                release_input()
+            if not admitted_ok:
+                if session is not None:
+                    session.close()
+                if release_input is not None:
+                    release_input()
         queue_seconds = time.monotonic() - admitted
         context.update(replica=getattr(session, "replica_name", None),
                        admission_ms=queue_seconds * 1000, streaming="none")
@@ -572,8 +597,8 @@ def create_app(registry: ModelRegistry, config: ServerConfig) -> FastAPI:
             context["worker_roundtrip_ms"] = elapsed * 1000
             metrics.finish(route, status, queue_seconds=queue_seconds, inference_seconds=elapsed)
 
-    @app.post("/v1/images/generations")
-    async def images(http_request: Request, request: ImageGenerationRequest) -> Any:
+    async def render_image(http_request: Request, request: ImageGenerationRequest, *,
+                           reference: tuple[bytes, str, dict[str, Any]] | None = None) -> Any:
         context = http_request.state.timing
         context["model"] = request.model
         try:
@@ -589,12 +614,28 @@ def create_app(registry: ModelRegistry, config: ServerConfig) -> FastAPI:
             return error_response(400, "invalid_request", "invalid image generation options")
         # Reuse upload ownership: files survive cancellation until the native call ends.
         media = await create_uploaded_input(noise, ".f32")
+        source = None
+        try:
+            if reference is not None:
+                source = await create_uploaded_input(reference[0], reference[1])
+        except BaseException:
+            media.close()
+            raise
+
+        def release() -> None:
+            media.close()
+            if source is not None:
+                source.close()
+
         output = media.path.with_name("output.png")
         controls = {key: value for key, value in mapped.items()
                     if key not in {"prompt", "initial_latents_path"}}
         payload = {"prompt": request.prompt, "config": controls, "output_path": str(output)}
         if request.initial_latents_b64 is not None:
             payload["initial_latents_path"] = str(media.path)
+        if source is not None:
+            payload["image_path"] = str(source.path)
+            context.update(reference[2], image_sha256=hashlib.sha256(reference[0]).hexdigest())
         negative = controls.get("negative_prompt", "").encode("utf-8")
         context.update(prompt_sha256=hashlib.sha256(request.prompt.encode()).hexdigest(),
                        generation_config={key: value for key, value in controls.items() if key != "negative_prompt"},
@@ -620,15 +661,35 @@ def create_app(registry: ModelRegistry, config: ServerConfig) -> FastAPI:
                 raise WorkerProtocolError("worker image channels disagree with its PNG")
             if request.size and (image["width"], image["height"]) != (controls["width"], controls["height"]):
                 raise WorkerProtocolError("worker did not honor the requested image size")
+            if reference is not None and (value.get("image_width"), value.get("image_height")) != (
+                    reference[2]["image_width"], reference[2]["image_height"]):
+                raise WorkerProtocolError("worker reference dimensions disagree with the upload")
             encoded.update(image)
 
-        result = await execute_task(http_request, request.model, "image_generation", "generate_image",
-                                    payload, validate, release_input=media.close)
+        capability, operation = ("image_edit", "edit_image") if reference is not None else ("image_generation", "generate_image")
+        result = await execute_task(http_request, request.model, capability, operation,
+                                    payload, validate, release_input=release)
         if isinstance(result, JSONResponse):
             return result
         context.update(output_sha256=encoded["sha256"], output_width=encoded["width"],
                        output_height=encoded["height"], output_count=1)
         return {"created": int(time.time()), "data": [{"b64_json": encoded["b64_json"]}]}
+
+    @app.post("/v1/images/generations")
+    async def images(http_request: Request, request: ImageGenerationRequest) -> Any:
+        return await render_image(http_request, request)
+
+    @app.post("/v1/images/edits")
+    async def image_edits(http_request: Request) -> Any:
+        try:
+            fields, data = await multipart_image(http_request, config.max_body_bytes)
+            request = ImageGenerationRequest.from_form(fields)
+            reference = await asyncio.to_thread(image_file, data, config.max_image_pixels)
+        except ImagePixelLimitError:
+            return error_response(413, "content_too_large", "reference image exceeds the pixel limit")
+        except ValueError:
+            return error_response(400, "invalid_request", "expected one RGB PNG/JPEG image and valid image edit controls")
+        return await render_image(http_request, request, reference=reference)
 
     @app.post("/v1/embeddings")
     async def embeddings(http_request: Request, request: EmbeddingRequest) -> Any:
@@ -827,6 +888,8 @@ def create_app(registry: ModelRegistry, config: ServerConfig) -> FastAPI:
             chat_max_tokens=request.max_completion_tokens,
         )
 
+    videos = VideoJobs(registry, config, records, execute_task, error_response)
+    app.include_router(videos.router)
     return app
 
 
