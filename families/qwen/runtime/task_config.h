@@ -55,6 +55,21 @@ inline Span<const internal::ConfigField> text_config_fields() {
     return fields;
 }
 
+inline Span<const internal::ConfigField> conversation_config_fields() {
+    static const auto fields = [] {
+        std::vector<internal::ConfigField> result;
+        for (auto field : text_config_fields()) {
+            if (field.name == "use_chat_template" || field.name == "system_prompt")
+                continue;
+            if (field.name == "max_new_tokens")
+                field.description = "Maximum generated tokens; must be positive";
+            result.push_back(field);
+        }
+        return result;
+    }();
+    return {fields.data(), fields.size()};
+}
+
 inline TextGenerationConfig parse_text_config(internal::ConfigView supplied) {
     using namespace internal;
     const auto fields = text_config_fields();
@@ -99,6 +114,14 @@ inline TextGenerationConfig parse_text_config(internal::ConfigView supplied) {
     config.repetition_penalty = real("repetition_penalty");
     if (config.repetition_penalty != 1.0F)
         throw ConfigError("repetition_penalty supports only the neutral value 1");
+    return config;
+}
+
+inline TextGenerationConfig parse_conversation_config(internal::ConfigView supplied) {
+    internal::validate_config(conversation_config_fields(), supplied);
+    auto config = parse_text_config(supplied);
+    if (config.max_new_tokens == 0)
+        throw internal::ConfigError("Qwen conversation max_new_tokens must be positive");
     return config;
 }
 

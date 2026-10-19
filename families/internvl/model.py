@@ -463,6 +463,7 @@ def build(request: "BuildRequest", writer: "BundleWriter") -> None:
         parallel.validate()
         config.raw["_model_dir"] = str(model_dir)
         model = _InternVLModel()
+        model_vl = model.get_vl_config(config) or {}
         weights = model.load_weights(str(model_dir), config)
         writer.set_header(family="internvl", task=request.task, backend=request.backend)
         if parallel.enabled:
@@ -490,25 +491,36 @@ def build(request: "BuildRequest", writer: "BundleWriter") -> None:
                 verbose=request.verbose,
                 parallel_config=parallel,
             )
-            config.raw["_decoder_engine_role"] = "decode"
-            decode = model.build_engine(
-                config,
-                weights,
-                max_length,
-                precision=precision,
-                quant_ctx=None,
-                verbose=request.verbose,
-                parallel_config=parallel,
-            )
-            config.raw.pop("_decoder_engine_role", None)
-            writer.add_bytes("engine.plan", decode)
+            # Stage serialized plans on disk before building the next one.
             writer.add_bytes("prefill.plan", prefill)
+            if int(model_vl.get("max_image_tiles", 1)) > 1:
+                # The dynamic-Sq graph accepts both multi-token prefill and
+                # single-token decode. Use that same mathematical network for
+                # tiled inputs; each runtime module owns its execution state.
+                writer.add_bytes("engine.plan", prefill)
+            del prefill
+            if int(model_vl.get("max_image_tiles", 1)) == 1:
+                config.raw["_decoder_engine_role"] = "decode"
+                decode = model.build_engine(
+                    config,
+                    weights,
+                    max_length,
+                    precision=precision,
+                    quant_ctx=None,
+                    verbose=request.verbose,
+                    parallel_config=parallel,
+                )
+                writer.add_bytes("engine.plan", decode)
+                del decode
+            config.raw.pop("_decoder_engine_role", None)
         vision = model.build_vision_engine(
             str(model_dir), config, weights, precision=precision, verbose=request.verbose
         )
         if vision is None:
             raise RuntimeError("InternVL vision build returned no engine")
-        vl = model.get_vl_config(config) or {}
+        writer.add_bytes("vision.plan", vision)
+        del vision
+        vl = model_vl
         runtime = {
             "tensor_parallel_size": parallel.tp_size,
             "num_layers": config.num_hidden_layers,
@@ -532,7 +544,6 @@ def build(request: "BuildRequest", writer: "BundleWriter") -> None:
             # token cache; the tensor-parallel decoder keeps one tile until its
             # single-query attention avoids masked IAttention over >512 rows.
             runtime.update({"preprocessor_type": "simple_chw", "max_image_tiles": 1})
-        writer.add_bytes("vision.plan", vision)
         runtime.update(_tokenizer_runtime_contract(model_dir))
         writer.add_json("runtime.json", runtime)
         for filename in (

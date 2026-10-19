@@ -15,6 +15,7 @@
 #include "families/qwen/runtime/sampler.h"
 #include "families/qwen/runtime/task_config.h"
 #include "families/qwen/runtime/tokenizer.h"
+#include "trtmc/internal/language.h"
 #include "trtmc/internal/model.h"
 #include "trtmc/internal/stream.h"
 #include "trtmc/runtime/trt_module.h"
@@ -48,6 +49,7 @@ struct QwenTextGenConfig {
 
 class QwenTextGenerationPipeline final : public internal::IModel,
                                          public internal::ITextContinuation,
+                                         public internal::ITextConversation,
                                          public internal::IStreamingTextContinuation {
   public:
     QwenTextGenerationPipeline(std::unique_ptr<ITrtModule> decoder,
@@ -60,6 +62,8 @@ class QwenTextGenerationPipeline final : public internal::IModel,
     TextResult generate(const std::string& prompt, const TextGenerationConfig& cfg = {});
     std::vector<internal::TaskInstance> task_bindings() override;
     TextResult run(const internal::TextContinuationRequest&, internal::ConfigView) override;
+    internal::ConversationResult run(const internal::TextConversationRequest&,
+                                     internal::ConfigView) override;
     std::unique_ptr<internal::ITextStream> start(const internal::TextContinuationRequest&,
                                                  internal::ConfigView) override;
 

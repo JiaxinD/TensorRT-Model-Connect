@@ -103,9 +103,10 @@ int main() {
         };
         auto model = make();
         const auto bindings = model->task_bindings();
-        require(bindings.size() == 2);
+        require(bindings.size() == 3);
         require(bindings[0].key.id == ITextContinuation::kTask);
-        require(bindings[1].key.id == IStreamingTextContinuation::kTask);
+        require(bindings[1].key.id == ITextConversation::kTask);
+        require(bindings[2].key.id == IStreamingTextContinuation::kTask);
         const ConfigEntry zero[] = {{"max_new_tokens", std::int64_t{0}}};
         const auto text = model->run({std::string_view{"hello"}}, zero);
         require(text.text.empty() && text.token_ids.empty());
@@ -131,8 +132,56 @@ int main() {
         const ConfigEntry unknown[] = {{"unknown", true}};
         rejects<ConfigError>([&] { model->run({std::string_view{"hello"}}, unknown); });
         (void)model->run({std::string_view{"hello"}}, zero);
+        const ConversationPartView system_part[] = {TextPartView{"policy"}};
+        const ConversationPartView user_part[] = {TextPartView{"first"}};
+        const ConversationPartView assistant_part[] = {TextPartView{"answer"}};
+        const ConversationPartView final_part[] = {TextPartView{"follow-up"}};
+        const ConversationMessageView history[] = {{MessageRole::System, system_part},
+                                                   {MessageRole::User, user_part},
+                                                   {MessageRole::Assistant, assistant_part},
+                                                   {MessageRole::User, final_part}};
+        const TextConversationRequest conversation{history, {}};
+        const ConfigEntry conversation_config[] = {
+            {"max_new_tokens", std::int64_t{128}},       {"eos_token_id", std::int64_t{0}},
+            {"generation_mode", std::string_view{"ar"}}, {"stop_on_boxed_answer", true},
+            {"stop_check_interval", std::int64_t{3}},    {"repetition_penalty", 1.0}};
+        const auto calls_before_conversation = tokenizer->encode_calls;
+        bool reached_generation = false;
+        try {
+            model->run(conversation, conversation_config);
+        } catch (const std::runtime_error& error) {
+            reached_generation =
+                std::string_view(error.what()) == "Qwen generation requires QwenKvCache";
+        }
+        require(reached_generation);
+        require(tokenizer->encode_calls == calls_before_conversation + 1);
+        require(tokenizer->last_text ==
+                "<|im_start|>system\npolicy<|im_end|>\n"
+                "<|im_start|>user\nfirst<|im_end|>\n"
+                "<|im_start|>assistant\nanswer<|im_end|>\n"
+                "<|im_start|>user\nfollow-up<|im_end|>\n<|im_start|>assistant\n");
+        for (const ConfigEntry bad :
+             {ConfigEntry{"use_chat_template", true}, ConfigEntry{"use_chat_template", false},
+              ConfigEntry{"system_prompt", std::string_view{"policy"}},
+              ConfigEntry{"max_new_tokens", std::int64_t{0}},
+              ConfigEntry{"temperature", std::numeric_limits<double>::infinity()}})
+            rejects<ConfigError>([&] { model->run(conversation, {&bad, 1}); });
+        const ConversationPartView reasoning[] = {ReasoningPartView{"unsupported"}};
+        const ConversationMessageView invalid_part[] = {{MessageRole::User, reasoning}};
+        rejects<std::invalid_argument>(
+            [&] { model->run(TextConversationRequest{invalid_part, {}}, {}); });
+        const ConversationMessageView invalid_role[] = {{MessageRole::Tool, user_part}};
+        rejects<std::invalid_argument>(
+            [&] { model->run(TextConversationRequest{invalid_role, {}}, {}); });
+        const ToolDefinitionView tool{};
+        rejects<std::invalid_argument>(
+            [&] { model->run(TextConversationRequest{history, {&tool, 1}}, {}); });
+        require(tokenizer->encode_calls == calls_before_conversation + 1);
+        settings.chat_template_format.clear();
+        require(make()->task_bindings().size() == 2);
+        settings.chat_template_format = "chatml";
         auto tp = make(std::make_shared<int>(1));
-        require(tp->task_bindings().size() == 1);
+        require(tp->task_bindings().size() == 2);
         rejects<UnsupportedTask>([&] { tp->start({std::string_view{"hello"}}, zero); });
         return 0;
     } catch (const std::exception& error) {

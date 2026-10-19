@@ -108,6 +108,28 @@ int main() {
                  ConfigEntry{"system_prompt", std::string_view{"system"}},
              })
             rejects([&] { parse_text_config({&bad, 1}); });
+        using trtmc::qwen::parse_conversation_config;
+        const auto conversation_defaults = parse_conversation_config({});
+        require(conversation_defaults.max_new_tokens == defaults.max_new_tokens &&
+                !conversation_defaults.use_chat_template &&
+                conversation_defaults.system_prompt.empty());
+        const ConfigEntry conversation[] = {
+            {"max_new_tokens", std::int64_t{4}},         {"eos_token_id", std::int64_t{0}},
+            {"generation_mode", std::string_view{"ar"}}, {"stop_on_boxed_answer", true},
+            {"stop_check_interval", std::int64_t{3}},    {"enable_thinking", false}};
+        const auto parsed = parse_conversation_config(conversation);
+        require(parsed.max_new_tokens == 4 && parsed.eos_token_id == 0 &&
+                parsed.text_generation_mode == "ar" && parsed.stop_on_boxed_answer &&
+                parsed.stop_check_interval == 3 && !parsed.enable_thinking);
+        for (const ConfigEntry bad :
+             {ConfigEntry{"use_chat_template", false},
+              ConfigEntry{"system_prompt", std::string_view{}},
+              ConfigEntry{"max_new_tokens", std::int64_t{0}},
+              ConfigEntry{"max_new_tokens", std::int64_t{-1}},
+              ConfigEntry{"temperature", std::numeric_limits<double>::quiet_NaN()},
+              ConfigEntry{"repetition_penalty", 1.2}})
+            rejects([&] { parse_conversation_config({&bad, 1}); });
+        rejects([&] { parse_conversation_config(duplicate); });
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
