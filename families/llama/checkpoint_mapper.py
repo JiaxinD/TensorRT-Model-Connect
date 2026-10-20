@@ -229,8 +229,10 @@ def load_standard_weights(
     else:
         # Tied embeddings
         weights["w_out"] = _transpose_2d(
-            weights["embedding"].copy(), "embedding_tied", precision=precision
+            weights["embedding"], "embedding_tied", precision=precision
         )
+        if np.shares_memory(weights["w_out"], weights["embedding"]):
+            weights["w_out"] = weights["w_out"].copy()
 
     weights["_attention_size"] = attention_size  # type: ignore[assignment]
     weights["_kv_attention_size"] = kv_attention_size  # type: ignore[assignment]

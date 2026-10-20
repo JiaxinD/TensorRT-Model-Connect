@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import struct
 import sys
+import tracemalloc
 import types
 from types import SimpleNamespace
 import weakref
@@ -281,3 +282,69 @@ def test_quantized_placeholders_skip_projection_reads(tmp_path, precision, fp32_
         2,
         6,
     )
+
+
+def _write_tied_checkpoint(path, vocab, hidden):
+    config = ModelConfig(
+        model_type="llama",
+        hidden_size=hidden,
+        vocab_size=vocab,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        intermediate_size=hidden,
+    )
+    embedding = (np.arange(vocab * hidden, dtype=np.float32).reshape(vocab, hidden) % 29 - 14) / 7
+    tensors = {"model.embed_tokens.weight": embedding}
+    for norm in ("input_layernorm", "post_attention_layernorm"):
+        tensors[f"model.layers.0.{norm}.weight"] = np.ones(hidden, dtype=np.float32)
+    for projection in (
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.v_proj",
+        "self_attn.o_proj",
+        "mlp.gate_proj",
+        "mlp.up_proj",
+        "mlp.down_proj",
+    ):
+        tensors[f"model.layers.0.{projection}.weight"] = np.zeros(
+            (hidden, hidden), dtype=np.float32
+        )
+    save_file(tensors, path / "model.safetensors")
+    return config, embedding
+
+
+@pytest.mark.parametrize("precision", ["fp16", "bf16", "fp32"])
+@pytest.mark.parametrize("vocab,hidden", [(8, 4), (8, 1), (1, 4), (1, 1)])
+def test_tied_output_owns_contiguous_storage(tmp_path, precision, vocab, hidden):
+    config, source = _write_tied_checkpoint(tmp_path, vocab, hidden)
+    weights = checkpoint_mapper.load_standard_weights(tmp_path, config, precision=precision)
+    dtype = np.float32 if precision == "fp32" else np.float16
+    np.testing.assert_array_equal(weights["w_out"], source.astype(dtype).T)
+    assert weights["w_out"].dtype == dtype
+    assert weights["w_out"].flags.c_contiguous
+    assert not np.shares_memory(weights["w_out"], weights["embedding"])
+    original = weights["embedding"].copy()
+    weights["w_out"][0, 0] = 99
+    np.testing.assert_array_equal(weights["embedding"], original)
+
+
+def test_tied_output_allocation_does_not_copy_input(tmp_path, monkeypatch):
+    config, _ = _write_tied_checkpoint(tmp_path, 4096, 256)
+    has_tensor = checkpoint_mapper._has_tensor
+
+    def begin_tracking(readers, name):
+        found = has_tensor(readers, name)
+        if name == "lm_head.weight":
+            assert not found
+            tracemalloc.start()
+        return found
+
+    monkeypatch.setattr(checkpoint_mapper, "_has_tensor", begin_tracking)
+    try:
+        weights = checkpoint_mapper.load_standard_weights(tmp_path, config, precision="fp16")
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert weights["w_out"].nbytes == 2 * 4096 * 256
+    assert peak < weights["w_out"].nbytes * 1.5
