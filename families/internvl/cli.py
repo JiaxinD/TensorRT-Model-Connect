@@ -23,6 +23,7 @@ def build_bundle(request: BuildRequest, output: Path) -> None:
     from .model import build as build_model
 
     writer = BundleWriter(output)
+    writer.record_build(request)
     try:
         with graph_transform(request.graph_transform):
             build_model(request, writer)
@@ -35,7 +36,7 @@ def build(
     *, model: str, output: Path, revision: str | None = None,
     task: str = "vision_language_generation", precision: str = "fp32", backend: str = "trt",
     max_sequence_length: int | None = None, tensor_parallel_size: int = 1,
-    verbose: bool = False,
+    int4_gemm_plugin_version: int | None = None, verbose: bool = False,
 ) -> int:
     """Run the declared owner command; help never imports this handler."""
     model_dir = resolve_model(model, revision)
@@ -44,7 +45,7 @@ def build(
         model_dir=model_dir, output_path=output, family="internvl",
         task=task, precision=precision, backend=backend,
         max_sequence_length=max_sequence_length, tensor_parallel_size=tensor_parallel_size,
-        verbose=verbose,
+        int4_gemm_plugin_version=int4_gemm_plugin_version, verbose=verbose,
     )
     build_bundle(request, output)
     return 0

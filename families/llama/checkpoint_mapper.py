@@ -81,8 +81,13 @@ def load_standard_weights(
     embedding_key: str | None = None,
     final_norm_key: str | None = None,
     lm_head_key: str = "lm_head.weight",
+    quant_ctx=None,
 ) -> WeightDict:
-    """Load HF safetensors and map to standard weight dict."""
+    """Load HF safetensors and map to standard weight dict.
+
+    Projections owned by ``quant_ctx`` are not read: the engine consumes the
+    checkpoint's packed bytes directly, so only a shape-only placeholder is kept.
+    """
     model_dir = Path(model_dir)
     readers = _open_safetensors(model_dir)
 
@@ -130,23 +135,30 @@ def load_standard_weights(
         layer[f"{prefix}.input_norm"] = input_norm.astype(np.float32)
         layer[f"{prefix}.post_attn_norm"] = post_norm.astype(np.float32)
 
-        # Jiaxin Deng: release each FP32 source before loading the next projection.
-        for source, target in (
-            ("self_attn.q_proj", "w_q"),
-            ("self_attn.k_proj", "w_k"),
-            ("self_attn.v_proj", "w_v"),
-            ("self_attn.o_proj", "w_o"),
-            ("mlp.gate_proj", "w_gate"),
-            ("mlp.up_proj", "w_up"),
-            ("mlp.down_proj", "w_down"),
-        ):
-            raw = _load_tensor(readers, _layer_key(layer_idx, f"{source}.weight", model_prefix))
-            layer[f"{prefix}.{target}"] = _transpose_2d(raw, source, precision=layer_precision)
-            if target == "w_q":
-                q_hidden = raw.shape[0]
-            elif target == "w_gate":
-                layer_mlp_size = raw.shape[0]
-            del raw
+        def _projection(stem: str, hf_name: str) -> np.ndarray:
+            """Load one projection transposed to [in, out], or a quantized placeholder."""
+            name = f"{prefix}.{stem}"
+            if quant_ctx is not None and quant_ctx.should_quantize(name):
+                w = quant_ctx.scales[name].weight
+                zero = np.zeros((), dtype=layer_target_dtype)
+                return np.broadcast_to(zero, (w.in_features, w.out_features))
+            raw = _load_tensor(readers, _layer_key(layer_idx, hf_name, model_prefix))
+            return _transpose_2d(raw, hf_name, precision=layer_precision)
+
+        # Q/K/V/O projections, transposed [out, in] -> [in, out]
+        q_t = _projection("w_q", "self_attn.q_proj.weight")
+        k_t = _projection("w_k", "self_attn.k_proj.weight")
+        v_t = _projection("w_v", "self_attn.v_proj.weight")
+        o_t = _projection("w_o", "self_attn.o_proj.weight")
+
+        q_hidden = q_t.shape[1]
+        gate_t = _projection("w_gate", "mlp.gate_proj.weight")
+        layer_mlp_size = gate_t.shape[1]
+
+        layer[f"{prefix}.w_q"] = q_t
+        layer[f"{prefix}.w_k"] = k_t
+        layer[f"{prefix}.w_v"] = v_t
+        layer[f"{prefix}.w_o"] = o_t
 
         # Optional QKV biases (Qwen2 style)
         q_bias_key = _layer_key(layer_idx, "self_attn.q_proj.bias", model_prefix)
@@ -170,6 +182,11 @@ def load_standard_weights(
             layer[f"{prefix}.k_norm"] = _repeat_head_norm(
                 _load_tensor(readers, k_norm_key).astype(np.float32), num_kv_heads
             )
+
+        # MLP projections
+        layer[f"{prefix}.w_gate"] = gate_t
+        layer[f"{prefix}.w_up"] = _projection("w_up", "mlp.up_proj.weight")
+        layer[f"{prefix}.w_down"] = _projection("w_down", "mlp.down_proj.weight")
 
         return layer_idx, layer, q_hidden, layer_mlp_size
 
