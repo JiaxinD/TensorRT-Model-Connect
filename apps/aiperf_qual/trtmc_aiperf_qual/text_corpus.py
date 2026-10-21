@@ -43,14 +43,14 @@ def select_prompts(records: list[Any], count: int, context: int, output: int,
     return selected, ledger
 
 
-def prepare(config: dict[str, Any], capacity: int, output: int, out: Path) -> dict[str, Any]:
+def load_source(config: dict[str, Any]):
     from transformers import AutoTokenizer
     from .suites import _hf_file, _read_records
 
     spec = config["corpus"]
     source = spec["source"]
-    if spec.get("format") != "sharegpt" or not SHA.fullmatch(str(source.get("revision", ""))):
-        raise ConfigError("real prompts require ShareGPT format and an immutable dataset revision")
+    if not SHA.fullmatch(str(source.get("revision", ""))):
+        raise ConfigError("real prompts require an immutable dataset revision")
     path = _hf_file(source)
     source_hash = digest(path)
     if source.get("sha256") and source["sha256"] != source_hash:
@@ -60,6 +60,26 @@ def prepare(config: dict[str, Any], capacity: int, output: int, out: Path) -> di
         raise ConfigError("ShareGPT source must contain a list of conversations")
     tokenizer = AutoTokenizer.from_pretrained(config["tokenizer"]["name"],
         revision=config["tokenizer"]["revision"], trust_remote_code=False)
+    return source, source_hash, records, tokenizer
+
+
+def prepare(config: dict[str, Any], capacity: int, output: int, out: Path, *, repo: Path | None = None) -> dict[str, Any]:
+    if config["corpus"].get("format") == "spec_bench":
+        from .text_specbench import prepare as prepare_specbench
+        return prepare_specbench(config, capacity, output, out, repo=repo)
+    if config["corpus"].get("format") == "controlled_prefix":
+        from .text_prefix import prepare as prepare_prefix
+        return prepare_prefix(config, capacity, output, out, repo=repo)
+    if config["corpus"].get("format") == "azure_trace":
+        from .text_trace import prepare as prepare_trace
+        return prepare_trace(config, capacity, out)
+    if config["corpus"].get("format") == "sharegpt_multi_turn":
+        from .text_conversations import prepare as prepare_conversations
+        return prepare_conversations(config, capacity, output, out)
+    if config["corpus"].get("format") != "sharegpt":
+        raise ConfigError("unsupported real-prompt corpus format")
+    spec = config["corpus"]
+    source, source_hash, records, tokenizer = load_source(config)
     selected, ledger = select_prompts(records, spec["count"], capacity, output,
                                       lambda text: tokenizer.encode(text, add_special_tokens=False))
     prepared = out / "inputs.jsonl"
@@ -86,7 +106,8 @@ def verify(run, joined: list[dict[str, Any]], corpus: dict[str, Any]) -> dict[st
     for raw in run.raw_records(phase=None):
         request_id = raw["metadata"].get("x_request_id")
         payload = raw.get("payload")
-        prompt = payload.get("prompt") if isinstance(payload, dict) else None
+        from .text_responses import prompt_text
+        prompt = prompt_text(payload)
         if (not isinstance(request_id, str) or request_id in seen or request_id not in by_id
                 or not isinstance(prompt, str) or prompt not in expected):
             raise ConfigError("real-prompt request has unknown/duplicate identity or changed text")
@@ -113,7 +134,20 @@ def verify_and_record(run, joined: list[dict[str, Any]], corpus: dict[str, Any])
     """Preserve a verification verdict for missing, changed or malformed inputs."""
     path = run.directory / "corpus-verification.json"
     try:
-        verified = verify(run, joined, corpus)
+        if corpus.get("format") == "spec_bench":
+            from .text_specbench import verify as verify_specbench
+            verified = verify_specbench(run, joined, corpus)
+        elif corpus.get("format") == "controlled_prefix":
+            from .text_prefix import verify as verify_prefix
+            verified = verify_prefix(run, joined, corpus)
+        elif corpus.get("format") == "azure_trace":
+            from .text_trace import verify as verify_trace
+            verified = verify_trace(run, joined, corpus)
+        elif corpus.get("format") == "sharegpt_multi_turn":
+            from .text_conversations import verify as verify_conversations
+            verified = verify_conversations(run, joined, corpus)
+        else:
+            verified = verify(run, joined, corpus)
         try:
             unchanged = digest(Path(corpus["input_file"])) == corpus["input_file_sha256"]
         except OSError as error:

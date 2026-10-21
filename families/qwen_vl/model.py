@@ -20,6 +20,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -138,6 +139,8 @@ def _dynamic_vision_profile(
     if max_pixels <= 0:
         # Preserve the existing 448-square token budget while allowing the
         # checkpoint's smart-resize geometry within that declared build limit.
+        # A larger explicit max_pixels, such as the checkpoint's own limit,
+        # also enlarges the default text capacity below.
         max_pixels = _DEFAULT_FIXED_IMAGE_SIZE**2
     opt_pixels = int(options.get("opt_pixels", 200704))
     if not min_pixels <= opt_pixels <= max_pixels:
@@ -145,6 +148,21 @@ def _dynamic_vision_profile(
             "qwen_vl_vision pixel limits must satisfy min_pixels <= opt_pixels <= max_pixels"
         )
     return enabled, min_pixels, opt_pixels, max_pixels
+
+
+def _default_sequence_length(model_dir: str, config: ModelConfig) -> int:
+    """Reserve the largest image the dynamic vision profile admits plus text."""
+    from .qwen_vl_vision_builder import _smart_resize_max_profile_patches
+
+    length = 256
+    enabled, minimum, _, maximum = _dynamic_vision_profile(model_dir, config)
+    if enabled:
+        vision = config.raw.get("vision_config", {})
+        patch_size = int(vision.get("patch_size", 16 if _is_qwen3_vl(config) else 14))
+        merge_size = int(vision.get("spatial_merge_size", 2))
+        patches = _smart_resize_max_profile_patches(minimum, maximum, patch_size, merge_size)
+        length += patches // (merge_size * merge_size)
+    return min(config.max_position_embeddings, length)
 
 
 if TYPE_CHECKING:
@@ -410,10 +428,13 @@ class _QwenVLModel:
                     "vision_rope_theta": float(vision_config.get("rope_theta", 10000.0)),
                 }
             )
-            if _is_qwen3_vl(config):
-                vl_cfg["vision_position_grid_size"] = int(
-                    np.sqrt(vision_config.get("num_position_embeddings", 2304))
-                )
+
+        if dynamic_resolution and _is_qwen3_vl(config):
+            position_count = int(vision_config.get("num_position_embeddings", 2304))
+            position_side = math.isqrt(position_count)
+            if position_side * position_side != position_count:
+                raise ValueError("Qwen3-VL learned position table must have a square grid")
+            vl_cfg["vision_position_grid_size"] = position_side
 
         if _is_qwen3_vl(config):
             ds_indexes = vision_config.get("deepstack_visual_indexes", [])
@@ -1116,7 +1137,7 @@ def build(request: "BuildRequest", writer: "BundleWriter") -> None:
     if not ("qwen" in str(config.model_type).lower() and "vl" in str(config.model_type).lower()):
         raise ValueError(f"Qwen-VL does not support model_type={config.model_type!r}")
     precision = str(request.precision).lower()
-    max_length = int(request.max_sequence_length or min(config.max_position_embeddings, 256))
+    max_length = int(request.max_sequence_length or _default_sequence_length(str(model_dir), config))
     parallel = ParallelConfig(tp_size=int(request.tensor_parallel_size))
     parallel.validate()
     config.raw["_model_dir"] = str(model_dir)
