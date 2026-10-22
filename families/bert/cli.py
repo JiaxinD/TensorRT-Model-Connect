@@ -44,7 +44,7 @@ def coerce_request(request: object) -> BuildRequest:
         return request
     for name, default in (("dynamic_kv_cache", False), ("image_height", None),
                           ("image_width", None), ("video_num_frames", None),
-                          ("max_batch_size", 1)):
+                          ("max_batch_size", 1), ("mtp_seq_len", None)):
         if getattr(request, name, default) != default:
             raise NotImplementedError(f"bert does not support {name}")
     if getattr(request, "context_parallel_size", 1) != 1:
@@ -53,7 +53,8 @@ def coerce_request(request: object) -> BuildRequest:
         raise ValueError("BERT does not support quantization")
     fields = BuildRequest.__dataclass_fields__
     legacy = {"family", "output_path", "graph_transform", "dynamic_kv_cache", "image_height",
-              "image_width", "video_num_frames", "max_batch_size", "context_parallel_size", "quantization"}
+              "image_width", "video_num_frames", "max_batch_size", "context_parallel_size", "quantization",
+              "mtp_seq_len"}
     if unknown := set(vars(request)) - set(fields) - legacy:
         raise ValueError(f"unknown BERT build inputs: {sorted(unknown)}")
     return BuildRequest(**{name: getattr(request, name) for name in fields})
@@ -64,6 +65,7 @@ def build_bundle(request: BuildRequest, output: Path, *, transform: GraphTransfo
     from .model import build as build_model
 
     writer = BundleWriter(output)
+    writer.record_build(request)
     try:
         with graph_transform(transform):
             build_model(request, writer)
