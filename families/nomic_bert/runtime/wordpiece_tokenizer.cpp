@@ -174,6 +174,8 @@ inline bool is_cjk_char(char32_t cp) {
 }
 
 inline bool is_mn_category(char32_t cp) {
+    if (cp < 0x0300)
+        return false;
     const auto* begin = unicode_data::kNonspacingMarks;
     const auto* end = begin + sizeof(unicode_data::kNonspacingMarks) / sizeof(*begin);
     const auto* found = std::lower_bound(
@@ -182,6 +184,10 @@ inline bool is_mn_category(char32_t cp) {
 }
 
 inline void nfd_decompose(char32_t cp, std::vector<char32_t>& out) {
+    if (cp < 0x00C0) {
+        out.push_back(cp);
+        return;
+    }
     if (cp >= 0xAC00 && cp <= 0xD7A3) {
         const auto offset = cp - 0xAC00;
         out.push_back(0x1100 + offset / 588);
@@ -204,6 +210,8 @@ inline void nfd_decompose(char32_t cp, std::vector<char32_t>& out) {
 }
 
 inline char32_t to_lower(char32_t cp) {
+    if (cp < 0x80)
+        return cp >= 'A' && cp <= 'Z' ? cp + 32 : cp;
     const auto* begin = unicode_data::kLowercase;
     const auto* end = begin + sizeof(unicode_data::kLowercase) / sizeof(*begin);
     const auto* found = std::lower_bound(
