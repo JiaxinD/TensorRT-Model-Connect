@@ -36,7 +36,6 @@ from tools.ci.package import (
 from tools.ci.pipeline import CiPipeline
 from tools.ci.process import CiError
 from tools.ci.quality import SourceQualityChecks, UnitTestRunner
-from qualification_tests.benchmark_qualification.performance import matrix as perf_matrix
 
 
 class RecordingContext:
@@ -772,37 +771,6 @@ def test_community_activity_alert_uses_only_trusted_external_metadata() -> None:
     assert '"$SLACK_WEBHOOK_URL"' in script
 
 
-def test_performance_preflight_requires_executable_native_entrypoints(tmp_path: Path) -> None:
-    trtmc_bench = tmp_path / "trtmc-bench"
-    worker = tmp_path / "trtmc-worker"
-    hf_runner = tmp_path / "hf-runner.py"
-    task_runner = tmp_path / "task-runner.py"
-    for path in (trtmc_bench, worker, hf_runner, task_runner):
-        path.write_text("#!/bin/sh\n")
-    environment = perf_matrix.Environment(
-        name="test",
-        trtmc_bench=trtmc_bench,
-        worker=worker,
-        hf_runner=hf_runner,
-        task_runner=task_runner,
-        results_root=tmp_path / "results",
-        scratch_root=tmp_path / "scratch",
-        bundle_cache=tmp_path / "bundles",
-        bundle_roots=(),
-        runtime_root=tmp_path / "runtime",
-        bundle_retention="retain",
-        local_files_only=True,
-        timeout_seconds=1,
-        references={},
-    )
-
-    with pytest.raises(perf_matrix.PerfMatrixError, match="trtmc-bench is not executable"):
-        perf_matrix.preflight([], environment, require_runtime=False)
-
-    trtmc_bench.chmod(0o755)
-    assert perf_matrix.preflight([], environment, require_runtime=False) == []
-
-
 def test_dev_images_install_the_pinned_requirements_without_deleted_docs() -> None:
     repository = Path(__file__).resolve().parents[2]
     for name in ("Dockerfile.dev.aarch64", "Dockerfile.dev.x86"):
@@ -1043,6 +1011,7 @@ def test_wheel_validation_requires_exact_new_payload(tmp_path: Path, executor: s
             "Name: package\n"
             "Version: 0.1\n"
             "Provides-Extra: cutedsl\n"
+            "Provides-Extra: edgellm\n"
             "Provides-Extra: serve\n"
             "Provides-Extra: test\n",
         )
@@ -1312,3 +1281,56 @@ def test_installed_sdk_builds_plain_c_and_cpp_without_cuda(
             validate_installed_sdk(prefix)
     else:
         validate_installed_sdk(prefix)
+
+
+def test_family_staging_preserves_product_files_and_excludes_references(tmp_path: Path, monkeypatch) -> None:
+    import runpy
+    import sys
+
+    # The staging function uses only pathlib/shutil. CPU CI does not install
+    # Conan, so isolate the recipe's unrelated build-tool imports here.
+    with monkeypatch.context() as patch:
+        for name, module in {
+            "conan": SimpleNamespace(ConanFile=object),
+            "conan.errors": SimpleNamespace(ConanException=RuntimeError),
+            "conan.tools.cmake": SimpleNamespace(CMake=None, CMakeToolchain=None, cmake_layout=None),
+            "conan.tools.files": SimpleNamespace(copy=None),
+        }.items():
+            patch.setitem(sys.modules, name, module)
+        recipe = runpy.run_path(str(Path(__file__).resolve().parents[2] / "conanfile.py"))
+    _package_families = recipe["_package_families"]
+
+    source, package = tmp_path / "source", tmp_path / "package"
+    files = {
+        "__init__.py": "",
+        "alpha/model.py": "def build(): pass\n",
+        "alpha/requirements.txt": "numpy\n",
+        "alpha/native_plugins/kernel.cu": "// build input\n",
+        "alpha/tests/test_model.py": "def test_shape(): pass\n",
+        "alpha/tests/reference/adapter.py": "import torch\n",
+        "alpha/tests/requirements.txt": "torch>=2.6\n",
+        "alpha/__pycache__/model.pyc": "cache",
+    }
+    for name, text in files.items():
+        path = source / "families" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    _package_families(source, package)
+    actual = {p.relative_to(package / "families").as_posix()
+              for p in (package / "families").rglob("*") if p.is_file()}
+    assert actual == {"__init__.py", "alpha/model.py", "alpha/requirements.txt",
+                      "alpha/native_plugins/kernel.cu", "alpha/tests/test_model.py"}
+    for name in actual:
+        assert (package / "families" / name).read_text() == files[name]
+
+
+def test_wheel_validation_rejects_a_leaked_test_reference(tmp_path: Path) -> None:
+    family = tmp_path / "families/alpha"
+    family.mkdir(parents=True)
+    (family / "model.py").write_text("def build(): pass\n")
+    wheel = tmp_path / "leaked.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("families/alpha/tests/reference/adapter.py", "import torch\n")
+    validator = WheelArchiveValidator(SimpleNamespace(repository=tmp_path))
+    with pytest.raises(CiError, match="isolated test references are packaged"):
+        validator.validate([wheel])

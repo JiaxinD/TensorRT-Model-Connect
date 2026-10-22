@@ -45,6 +45,8 @@ def _serve_env(environment: Environment) -> dict[str, str]:
            "PYTHONPATH": f"{repo}/apps/perf_serving:{repo}/apps/benchmark:{repo}/core/builder:{repo}"}
     if environment.values.get("hf_hub_cache"):  # the cache that checkpoint retention manages
         env["HF_HUB_CACHE"] = str(environment["hf_hub_cache"])
+        # Remote-code modules are generated Python, separate from immutable checkpoint snapshots.
+        env.setdefault("HF_MODULES_CACHE", str(Path(environment["hf_hub_cache"]).parent / "hf-modules"))
     return env
 
 
@@ -138,6 +140,8 @@ def serving(environment: Environment, model: dict[str, Any], backend: str, out: 
                "--backend", backend, "--port", str(port), "--full-observations",
                "--records", str(out / "records.jsonl"), "--scratch", str(out / "scratch")]
     reference = model["reference"]
+    if reference.get("latent_adapter"):
+        command += ["--latent-replay-adapter", str(repo / reference["latent_adapter"])]
     if model["candidate"].get("revision"):  # the pinned checkpoint (tokenizer, latent replay, reference)
         command += ["--revision", str(model["candidate"]["revision"])]
     if backend == "trtmc":
@@ -159,6 +163,8 @@ def serving(environment: Environment, model: dict[str, Any], backend: str, out: 
             command += ["--reference-options", json.dumps(reference["options"])]
         if reference.get("adapter"):  # the family's own native pipeline
             command += ["--reference-adapter", str(repo / reference["adapter"])]
+    if environment.media_root() is not None:  # requests name their media by digest
+        command += ["--media-root", str(environment.media_root())]
     if keep_artifacts:  # checks that read output artifacts (audio, images) after the run
         command.append("--keep-artifacts")
     if memory_probe:  # peak GPU memory per call; only meaningful while this server is alone on the GPU
@@ -549,6 +555,8 @@ def text_serving(environment: Environment, settings: Mapping[str, Any], out: Pat
         command += ["--runtime-root", str(settings["runtime_root"])]
     if settings.get("cuda_graphs"):
         command.append("--cuda-graphs")
+    if settings.get("max_body_bytes") is not None:
+        command += ["--max-body-bytes", str(settings["max_body_bytes"])]
     env = {**_serve_env(environment), **dict(extra_env or {})}
     env["PYTHONPATH"] = f"{repo}/apps/server/python:" + env["PYTHONPATH"]
     (out / "command.json").write_text(json.dumps(command, indent=2) + "\n")

@@ -30,10 +30,13 @@ RecurrentPipeline::RecurrentPipeline(std::unique_ptr<ITrtModule> decoder,
                                      RecurrentGenConfig config, cudaStream_t stream,
                                      const char* name, std::shared_ptr<ITokenizer> tokenizer,
                                      std::string model_id_str,
-                                     std::unique_ptr<Qwen38ISampler> sampler)
+                                     std::unique_ptr<Qwen38ISampler> sampler,
+                                     std::unique_ptr<Qwen38MtpScheduler> mtp_scheduler,
+                                     std::unique_ptr<Qwen38PrefillRunner> prefill_runner)
     : decoder_(std::move(decoder)), state_(std::move(state)), config_(config), stream_(stream),
       name_(name), tokenizer_(std::move(tokenizer)), model_id_(std::move(model_id_str)),
-      sampler_(std::move(sampler)) {
+      sampler_(std::move(sampler)), mtp_scheduler_(std::move(mtp_scheduler)),
+      prefill_runner_(std::move(prefill_runner)) {
     if (!decoder_ || !decoder_->ok())
         throw std::runtime_error(std::string(name_) + ": invalid decoder module");
 }
@@ -88,6 +91,9 @@ std::vector<int32_t> RecurrentPipeline::generate_from_ids(const std::vector<int3
     if (max_new_tokens == 0 || input_ids.empty())
         return input_ids;
 
+    if (mtp_scheduler_)
+        return generate_from_ids_speculative(input_ids, max_new_tokens);
+
     // Create a per-call sampler if none was injected at construction time.
     Qwen38ISampler* active_sampler = sampler_.get();
     std::unique_ptr<Qwen38ISampler> local_sampler;
@@ -107,10 +113,12 @@ std::vector<int32_t> RecurrentPipeline::generate_from_ids(const std::vector<int3
 
     // ── Prefill phase ──
     auto t_prefill_start = SteadyClock::now();
-    for (std::size_t i = 0; i + 1 < input_ids.size(); ++i)
-        run_step(input_ids[i], logits);
-
-    run_step(input_ids.back(), logits);
+    // Multi-token engine first; whatever it could not take (prompt longer than
+    // the KV cache) goes through the single-token decoder, which shifts the
+    // cache as it fills.
+    std::size_t consumed = prefill_chunks(input_ids, logits, nullptr);
+    for (; consumed < input_ids.size(); ++consumed)
+        run_step(input_ids[consumed], logits);
     auto t_prefill_end = SteadyClock::now();
 
     // ── Decode phase ──
@@ -127,6 +135,217 @@ std::vector<int32_t> RecurrentPipeline::generate_from_ids(const std::vector<int3
             break;
         run_step(result.token_id, logits);
         ++decode_steps;
+    }
+    auto t_decode_end = SteadyClock::now();
+
+    report_timing(t_prefill_start, t_prefill_end, t_decode_start, t_decode_end,
+                  static_cast<int>(input_ids.size()), decode_steps);
+
+    return output;
+}
+
+std::size_t RecurrentPipeline::prefill_chunks(const std::vector<int32_t>& input_ids,
+                                              std::vector<float>& logits,
+                                              std::vector<float>* hidden) {
+    if (!prefill_runner_)
+        return 0;
+    prefill_runner_->bind_state();
+
+    const int32_t chunk = prefill_runner_->chunk_len();
+    std::vector<float> rows;
+    std::vector<float> warm_hidden;
+    std::vector<float> prev_hidden; // hidden state of the token just before the chunk
+    std::size_t consumed = 0;
+    while (consumed < input_ids.size()) {
+        const int32_t n = static_cast<int32_t>(
+            std::min<std::size_t>(static_cast<std::size_t>(chunk), input_ids.size() - consumed));
+        if (!prefill_runner_->fits(n))
+            break;
+        prefill_runner_->run_chunk(input_ids.data() + consumed, n, logits,
+                                   hidden != nullptr ? &rows : nullptr);
+        if (hidden != nullptr) {
+            const std::size_t hs = rows.size() / static_cast<std::size_t>(n);
+            // MTP warm-up pairs each token with the hidden state of the one before it;
+            // position 0 has no predecessor and gets no entry.
+            const int32_t first = (consumed == 0) ? 1 : 0;
+            if (mtp_scheduler_->has_prefill()) {
+                const int32_t m = n - first;
+                if (m > 0) {
+                    warm_hidden.resize(static_cast<std::size_t>(m) * hs);
+                    for (int32_t r = 0; r < m; ++r) {
+                        const int32_t j = first + r;
+                        const float* prev =
+                            (j == 0) ? prev_hidden.data()
+                                     : rows.data() + static_cast<std::size_t>(j - 1) * hs;
+                        std::copy(prev, prev + hs,
+                                  warm_hidden.begin() + static_cast<std::ptrdiff_t>(r * hs));
+                    }
+                    const std::size_t pos0 = consumed + static_cast<std::size_t>(first);
+                    mtp_scheduler_->prefill_warmup(
+                        input_ids.data() + pos0, static_cast<int32_t>(pos0), warm_hidden.data(), m);
+                }
+            } else {
+                for (int32_t j = first; j < n; ++j) {
+                    const std::size_t pos = consumed + static_cast<std::size_t>(j);
+                    const float* prev = (j == 0)
+                                            ? prev_hidden.data()
+                                            : rows.data() + static_cast<std::size_t>(j - 1) * hs;
+                    mtp_scheduler_->draft(input_ids[pos], static_cast<int32_t>(pos), prev);
+                }
+            }
+            prev_hidden.assign(rows.end() - static_cast<std::ptrdiff_t>(hs), rows.end());
+        }
+        consumed += static_cast<std::size_t>(n);
+    }
+    if (hidden != nullptr && consumed > 0)
+        *hidden = std::move(prev_hidden);
+    return consumed;
+}
+
+bool RecurrentPipeline::is_eos(int32_t token) const {
+    for (auto id : config_.id_eos_ids) {
+        if (id == token)
+            return true;
+    }
+    return false;
+}
+
+std::vector<int32_t>
+RecurrentPipeline::generate_from_ids_speculative(const std::vector<int32_t>& input_ids,
+                                                 int32_t max_new_tokens) {
+    state_->reset();
+    state_->bind_to(*decoder_);
+    mtp_scheduler_->reset();
+    mtp_scheduler_->bind_state();
+
+    prof_prepare_ms_ = prof_forward_ms_ = prof_logits_copy_ms_ = prof_advance_ms_ = 0;
+    prof_steps_ = 0;
+
+    std::vector<float> logits;
+    std::vector<float> hidden;
+
+    // -- Prefill: process position 0, then every subsequent prompt
+    // position, warming up MTP's cache along the way using the hidden
+    // state from the PREVIOUS main-engine call paired with the real
+    // (known) token at the current position -- mirrors the decode loop
+    // below exactly, just with known tokens instead of sampled ones. --
+    auto t_prefill_start = SteadyClock::now();
+    std::size_t consumed = prefill_chunks(input_ids, logits, &hidden);
+    if (consumed == 0) {
+        run_step(input_ids[0], logits, &hidden);
+        consumed = 1;
+    }
+    for (std::size_t i = consumed; i < input_ids.size(); ++i) {
+        mtp_scheduler_->draft(input_ids[i], static_cast<int32_t>(i), hidden.data());
+        run_step(input_ids[i], logits, &hidden);
+    }
+    auto t_prefill_end = SteadyClock::now();
+
+    // Committed through the LAST prompt position. Its logits predict the
+    // first GENERATED token (not a re-prediction of a known prompt token).
+    int32_t real_next = argmax(logits);
+    int32_t step = static_cast<int32_t>(input_ids.size()) - 1; // last committed index
+    // draft_chain() must run BEFORE the companion draft() call below: it
+    // only READS mtp_cache_ (via bind_cache_inputs), expecting it to still
+    // reflect history strictly BEFORE real_next's own position (same
+    // invariant draft() itself asserts: cache position == position - 1).
+    // draft() advances mtp_cache_ past real_next afterward -- the old
+    // single-draft-per-round design got this update "for free" as a side
+    // effect of its own draft() call; draft_chain() deliberately never
+    // touches mtp_cache_ (see mtp_scheduler.h), so it has to be done here
+    // explicitly, with draft()'s own return value discarded.
+    auto draft_result = mtp_scheduler_->draft_chain(real_next, step + 1, hidden.data());
+    mtp_scheduler_->draft(real_next, step + 1, hidden.data());
+
+    std::vector<int32_t> output = input_ids;
+    int32_t decode_steps = 0;
+    const int32_t hidden_size = mtp_scheduler_->hidden_size();
+    int32_t round_num = 0;
+
+    auto t_decode_start = SteadyClock::now();
+    while (decode_steps < max_new_tokens) {
+        auto verify =
+            mtp_scheduler_->verify_and_maybe_commit(real_next, draft_result.token_ids, step);
+
+        ++round_num;
+        std::cerr << "[trtmc-mtp-round] round=" << round_num << " base_step=" << step
+                  << " real_next=" << real_next << " drafts=[";
+        for (std::size_t i = 0; i < draft_result.token_ids.size(); ++i) {
+            if (i > 0)
+                std::cerr << ",";
+            std::cerr << draft_result.token_ids[i];
+        }
+        std::cerr << "] accepted_length=" << verify.accepted_length
+                  << " full_accept=" << (verify.full_accept ? "true" : "false")
+                  << " accepted_tokens=[";
+        for (std::size_t i = 0; i < verify.accepted_tokens.size(); ++i) {
+            if (i > 0)
+                std::cerr << ",";
+            std::cerr << verify.accepted_tokens[i];
+        }
+        std::cerr << "] next_real_candidate=" << verify.next_real_candidate << "\n";
+
+        bool stop = false;
+        for (int32_t i = 0; i < verify.accepted_length; ++i) {
+            output.push_back(verify.accepted_tokens[static_cast<std::size_t>(i)]);
+            ++decode_steps;
+            ++prof_steps_;
+            if (is_eos(verify.accepted_tokens[static_cast<std::size_t>(i)]) ||
+                decode_steps >= max_new_tokens) {
+                stop = true;
+                break;
+            }
+        }
+        if (stop)
+            break;
+
+        if (verify.full_accept) {
+            // Full accept: commit already happened inside
+            // verify_and_maybe_commit(). Catch up MTP's own cache for
+            // every newly-confirmed draft using the verify engine's REAL
+            // per-row hidden states (rows [0, num_draft_tokens) -- never
+            // draft_chain()'s self-chained approximations, see
+            // mtp_scheduler.h), then seed the next round from the last row.
+            for (int32_t i = 0; i < mtp_scheduler_->num_draft_tokens(); ++i) {
+                mtp_scheduler_->draft(
+                    verify.accepted_tokens[static_cast<std::size_t>(i) + 1], step + 2 + i,
+                    verify.hidden_states.data() + static_cast<std::size_t>(i) * hidden_size);
+            }
+            const int32_t last_row = verify.accepted_length - 1;
+            step += verify.accepted_length;
+            real_next = verify.next_real_candidate;
+            // See the comment at this function's first draft_chain() call:
+            // draft_chain() must run before the companion draft() resync.
+            draft_result = mtp_scheduler_->draft_chain(
+                real_next, step + 1,
+                verify.hidden_states.data() + static_cast<std::size_t>(last_row) * hidden_size);
+            mtp_scheduler_->draft(real_next, step + 1,
+                                  verify.hidden_states.data() +
+                                      static_cast<std::size_t>(last_row) * hidden_size);
+        } else {
+            // Partial (including zero drafts accepted): shared state was
+            // left untouched by verify_and_maybe_commit() -- DeltaNet's
+            // recurrent state only ever exposes its FINAL post-all-
+            // substeps value, so there is no safe way to commit a partial
+            // prefix of that call's own state (see mtp_scheduler.h).
+            // Re-run the confirmed prefix as sequential single-token steps
+            // to rebuild state safely, catching up MTP's cache for each
+            // NEWLY-confirmed draft along the way -- real_next itself
+            // already has an MTP cache entry from a prior round, only
+            // accepted_tokens[1..] are new.
+            for (int32_t i = 0; i < verify.accepted_length; ++i) {
+                const int32_t tok = verify.accepted_tokens[static_cast<std::size_t>(i)];
+                run_step(tok, logits, &hidden);
+                if (i >= 1)
+                    mtp_scheduler_->draft(tok, step + 1 + i, hidden.data());
+            }
+            step += verify.accepted_length;
+            real_next = verify.next_real_candidate;
+            // See the comment at this function's first draft_chain() call:
+            // draft_chain() must run before the companion draft() resync.
+            draft_result = mtp_scheduler_->draft_chain(real_next, step + 1, hidden.data());
+            mtp_scheduler_->draft(real_next, step + 1, hidden.data());
+        }
     }
     auto t_decode_end = SteadyClock::now();
 
@@ -158,8 +377,8 @@ void RecurrentPipeline::report_timing(SteadyClock::time_point t_prefill_start,
                   << " tok/s, " << std::setprecision(2) << (decode_ms / decode_steps) << " ms/tok)";
     std::cerr << "\n";
 
-    std::cerr << "[trtmc-perf] Total generation: " << total_ms << " ms"
-              << " (" << (prefill_tokens + decode_steps) << " tokens)\n";
+    std::cerr << "[trtmc-perf] Total generation: " << total_ms << " ms" << " ("
+              << (prefill_tokens + decode_steps) << " tokens)\n";
 
     if (prof_steps_ > 0) {
         std::cerr << std::setprecision(2);
@@ -187,7 +406,8 @@ void RecurrentPipeline::report_timing(SteadyClock::time_point t_prefill_start,
     }
 }
 
-void RecurrentPipeline::run_step(int32_t token_id, std::vector<float>& logits) {
+void RecurrentPipeline::run_step(int32_t token_id, std::vector<float>& logits,
+                                 std::vector<float>* hidden_state_out) {
     auto t0 = SteadyClock::now();
 
     TensorMap inputs;
@@ -240,6 +460,34 @@ void RecurrentPipeline::run_step(int32_t token_id, std::vector<float>& logits) {
     if (logits_copy != cudaSuccess)
         throw std::runtime_error(std::string(name_) + ": failed to copy logits to host: " +
                                  cudaGetErrorString(logits_copy));
+
+    if (hidden_state_out != nullptr) {
+        if (!hidden_state_device_ptr_) {
+            hidden_state_device_ptr_ = decoder_->device_ptr("hidden_state");
+            if (!hidden_state_device_ptr_)
+                throw std::runtime_error(std::string(name_) + ": no 'hidden_state' output");
+            for (const auto& info : decoder_->output_info()) {
+                if (info.name == "hidden_state") {
+                    hidden_state_numel_ = 1;
+                    for (auto d : info.shape)
+                        hidden_state_numel_ *= static_cast<std::size_t>(d);
+                    break;
+                }
+            }
+            if (hidden_state_numel_ == 0)
+                throw std::runtime_error(std::string(name_) +
+                                         ": hidden_state tensor has zero size");
+        }
+        hidden_state_out->resize(hidden_state_numel_);
+        const cudaError_t hidden_copy =
+            cudaMemcpy(hidden_state_out->data(), hidden_state_device_ptr_,
+                       hidden_state_numel_ * sizeof(float), cudaMemcpyDeviceToHost);
+        if (hidden_copy != cudaSuccess) {
+            throw std::runtime_error(
+                std::string(name_) +
+                ": failed to copy hidden_state to host: " + cudaGetErrorString(hidden_copy));
+        }
+    }
 
     auto t3 = SteadyClock::now();
 

@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
-from .config import ConfigError, load_environment
+from .config import ConfigError, Environment, load_environment
 
 
 def doctor(fix: bool) -> int:
@@ -113,10 +113,14 @@ def recheck_reports(outs: Sequence[Path], environment, only: Sequence[str] = (),
     """Run the Task's whole-output checks (``supplementary``) again on finished results and replace
     their report entries, then rejudge; the rest of the result is kept. Generations that sent the
     same requests are reused unless ``regenerate``."""
-    from . import compat, models
-    from .runner import SUPPLEMENTARY_SUITES, applies, supplementary
-    from .services import reference_python
+    from . import aiperf_metrics, compat, execution, models
+    from .runner import SUPPLEMENTARY_SUITES, applies, execution_session, supplementary
+    from .artifacts import recorded_path, work_directory
+    from .services import gpu_exclusive, reference_python
 
+    environment = Environment({**environment.values, "native_replicas": 1, "candidate_replicas": 1,
+                               "acc_mps": False, "acc_overlap": False})
+    pending = []
     for out in outs:
         path = out / "report.json"
         if not path.is_file():
@@ -129,19 +133,64 @@ def recheck_reports(outs: Sequence[Path], environment, only: Sequence[str] = (),
                   if (not only or check["check"] in only) and applies(check, model)]
         if not checks:
             continue
+        retention = out / "retention.json"
+        cleaned = (json.loads(retention.read_text()).get("temporary_files") or {}) if retention.is_file() else {}
+        if regenerate or cleaned.get("media_recheck") == "regenerate":
+            from .bundles import bundle_path
+            from .config import ConfigError
+
+            if not bundle_path(environment, model).is_file():
+                raise ConfigError(f"{out}: generated files were removed or regeneration was requested, but the "
+                                  "candidate bundle is missing; run the model again before recheck")
         python = reference_python(environment, model)
-        entries, suites = [], set()
-        for check in checks:
-            suites.update(SUPPLEMENTARY_SUITES.get(check["check"], ()))
-            try:
-                entries += supplementary(environment, model, check, python, out)
-            except Exception as error:  # noqa: BLE001 - recorded like a run's phase error
-                entries.append({"suite": SUPPLEMENTARY_SUITES[check["check"]][0], "source": "task", "status": "error",
-                                "samples": 0, "passed": None, "required_passes": None,
-                                "error": f"{type(error).__name__}: {str(error)[-800:]}"})
+        pending.append((out, path, model, checks, python))
+    # A later missing prerequisite must not leave earlier reports updated but unjudged.
+    for out, path, model, checks, python in pending:
         result = compat.report(json.loads(path.read_text()))
+        recorded = out / Path((result.get("execution") or {}).get("records", "execution.jsonl")).name
+        batches = execution.read_batches(recorded) if recorded.is_file() else []
+        for index, batch in enumerate(batches):
+            batch["batch_id"] = index
+        temporary = out / "execution.recheck.tmp.jsonl"
+        temporary.unlink(missing_ok=True)
+        evidence = execution_session(model, environment, out, batches=batches, records_name=temporary.name)
+        previous_count = len(batches)
+        entries, suites = [], set()
+        informational_attempts = set()
+        with execution.session(evidence), gpu_exclusive(environment):
+            for check in checks:
+                start = len(evidence.batches)
+                attempts = set(evidence.attempts)
+                suites.update(SUPPLEMENTARY_SUITES.get(check["check"], ()))
+                try:
+                    entries += supplementary(environment, model, check, python, work_directory(out))
+                except Exception as error:  # noqa: BLE001 - recorded like a run's phase error
+                    entries.append({"suite": SUPPLEMENTARY_SUITES[check["check"]][0], "source": "task", "status": "error",
+                                    "samples": 0, "passed": None, "required_passes": None,
+                                    "error": f"{type(error).__name__}: {str(error)[-800:]}"})
+                if check.get("informational"):
+                    informational_attempts.update(evidence.attempts - attempts)
+                    evidence.attempts = attempts
+                    for batch in evidence.batches[start:]:
+                        batch.update(informational=True, role="quality")
+        for batch in evidence.batches[:previous_count]:
+            replaced = informational_attempts if batch.get("informational") else evidence.attempts
+            if (batch["workload"], batch["identity"].get("side")) in replaced:
+                batch["superseded"] = True
         result["accuracy"] = [item for item in result.get("accuracy", []) if item.get("suite") not in suites] + entries
+        measured = evidence.natural_performance(result["accuracy"])
+        names = {item["request"] for item in measured}
+        result["performance"] = [item for item in result.get("performance", [])
+                                 if item.get("kind") != "natural_dataset" or item.get("request") not in names] + measured
+        result["aiperf_metrics"] = aiperf_metrics.entries(evidence.batches)
+        temporary.write_text("".join(json.dumps(batch, default=str) + "\n" for batch in evidence.batches))
         preserve_original(out)
+        recorded = out / "execution.rechecked.jsonl"
+        temporary.replace(recorded)
+        result["execution"] = {**result.get("execution", {}), "records": recorded_path(out, recorded),
+                               "timing_contract": execution.TIMING_CONTRACT, "quality_outputs_reused": True,
+                               "workloads": [{"name": batch["workload"], "role": batch["role"]}
+                                             for batch in evidence.batches if not batch.get("superseded")]}
         path.write_text(json.dumps(result, indent=2, default=str))
         (out / "model.json").write_text(json.dumps(model, indent=2, default=str))
     return rejudge_reports(outs, environment)
@@ -183,6 +232,28 @@ def rejudge_reports(outs: Sequence[Path], environment=None, *, selection_cache: 
             continue
         result = compat.report(json.loads(path.read_text()))
         model = compat.configuration(json.loads((out / "model.json").read_text()))
+        if selection_cache is None and environment is None and result.get("performance_source") == "quality":
+            from .benchmark_perf import refresh
+
+            result = refresh(out, result)
+            # Conversion comparison no longer rejects a low absolute native
+            # score. Preserve scores and statistical margins during replay.
+            changed = False
+            for entry in result.get("accuracy", []):
+                removed_floor = (entry.get("gate") or {}).pop("min_native", None) is not None
+                changed |= removed_floor
+                if ((entry.get("source") == "absolute" or removed_floor)
+                        and (entry.get("metrics") or {}).get("test") and entry.get("status") != "error"):
+                    status, reasons = absolute.status(entry)
+                    changed |= status != entry.get("status")
+                    entry.update(status=status, reasons=reasons)
+            result["verdict"] = judge.verdict(result, expected_suites=list(expected_suites(model)), expected_modes=0)
+            preserve_original(out)
+            result["rejudged"] = {"time": time.time(), "original": ORIGINAL_REPORT,
+                                  "benchmark_timings_refreshed": True, "accuracy_contract_preserved": not changed}
+            write_report(out, result)
+            print(json.dumps({"out": str(out), **result["verdict"]}))
+            continue
         if selection_cache is not None:
             preserve_original(out)
             result = recover(out, model, result, archive)
@@ -357,8 +428,58 @@ def main(argv: Sequence[str] | None = None) -> int:
     text.add_argument("--environment", type=Path, required=True)
     text.add_argument("--config", type=Path, required=True)
     text.add_argument("--out", type=Path, required=True)
+    endpoints = commands.add_parser("endpoint-models", help="inventory every checkpoint for a native endpoint group")
+    endpoints.add_argument("--repo", type=Path, required=True)
+    endpoints.add_argument("--group", choices=("embeddings", "reranking", "transcription", "detection", "vision", "images", "image-edit", "videos"), required=True)
+    for name, description in (("image-profile", "text-to-image"), ("image-edit-profile", "image editing"), ("video-profile", "text-to-video")):
+        images = commands.add_parser(name, help=f"verify and profile one existing {description} bundle")
+        images.add_argument("--environment", type=Path, required=True)
+        images.add_argument("--profile", required=True)
+        images.add_argument("--bundle", type=Path, required=True)
+        images.add_argument("--inputs", type=Path, required=True)
+        images.add_argument("--out", type=Path, required=True)
+        images.add_argument("--request-count", type=int, default=5)
+        images.add_argument("--warmup-request-count", type=int, default=1)
+    endpoint_run = commands.add_parser("endpoint-profile", help="verify and profile one built native endpoint model")
+    endpoint_run.add_argument("--environment", type=Path, required=True)
+    endpoint_run.add_argument("--profile", required=True)
+    endpoint_run.add_argument("--bundle", type=Path, required=True)
+    endpoint_run.add_argument("--inputs", type=Path, required=True)
+    endpoint_run.add_argument("--out", type=Path, required=True)
+    endpoint_run.add_argument("--max-output-tokens", type=int, default=120)
+    endpoint_run.add_argument("--tokenizer", help="AIPerf client tokenizer name or prepared local directory")
+    endpoint_run.add_argument("--tokenizer-revision", help="revision of an explicitly selected client tokenizer")
     arguments = parser.parse_args(argv)
     try:
+        if arguments.command == "video-profile":
+            from .video_profile import profile as video_profile
+
+            print(json.dumps(video_profile(load_environment(arguments.environment), arguments.profile,
+                arguments.bundle, arguments.inputs, arguments.out, requests=arguments.request_count,
+                warmup=arguments.warmup_request_count), indent=2))
+            return 0
+        if arguments.command in {"image-profile", "image-edit-profile"}:
+            from .image_profile import profile as image_profile
+
+            print(json.dumps(image_profile(load_environment(arguments.environment), arguments.profile,
+                arguments.bundle, arguments.inputs, arguments.out, requests=arguments.request_count,
+                warmup=arguments.warmup_request_count,
+                group="image-edit" if arguments.command == "image-edit-profile" else "images"), indent=2))
+            return 0
+        if arguments.command == "endpoint-profile":
+            from .endpoint_profile import profile as endpoint_profile
+
+            result = endpoint_profile(load_environment(arguments.environment), arguments.profile,
+                                      arguments.bundle, arguments.inputs, arguments.out,
+                                      token_limit=arguments.max_output_tokens, tokenizer=arguments.tokenizer,
+                                      tokenizer_revision=arguments.tokenizer_revision)
+            print(json.dumps(result, indent=2))
+            return 0
+        if arguments.command == "endpoint-models":
+            from .endpoint_catalog import print_inventory
+
+            print_inventory(arguments.repo, arguments.group)
+            return 0
         if arguments.command == "text-profile":
             from .text_profile import profile
 

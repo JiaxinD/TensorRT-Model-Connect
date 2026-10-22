@@ -12,8 +12,8 @@ problems, and each side is scored against the gold answers:
 
 Each entry is a paired non-inferiority decision (``noninferiority``): pass when
 TRTMC's regression against the native model is shown to be below the benchmark's margin, fail when it
-is shown to exceed it, inconclusive otherwise; ``not-comparable`` when the native score is below the
-benchmark's suitability floor ``min_native``. A sampled model answers once per seed on each side and
+is shown to exceed it, inconclusive otherwise. Native absolute capability does not veto the comparison.
+A sampled model answers once per seed on each side and
 is judged on the per-problem seed means.
 """
 
@@ -39,29 +39,18 @@ from .suites import SELECTION_SEED, build_suite, request_sha
 WORKLOAD_MARGIN_PERCENT = 5.0
 # A request answers within seconds; whole-benchmark runs of large native models take hours.
 RUN_TIMEOUT_S = 12 * 3600
-# A run's deadline is three times the run's ledger time (``run-all --ledger``), at least ten minutes.
-DEADLINE_FACTOR, MIN_DEADLINE_S = 3, 600
-
-
-@functools.lru_cache(maxsize=None)
-def _ledger(path: str) -> dict[str, float]:
-    return {name: float(seconds) for name, seconds in json.loads(Path(path).read_text()).items()}
 
 
 def run_timeout(environment: Environment, model: Mapping[str, Any]) -> float:
-    """An AIPerf run's deadline: the profile's in the environment's ``deadlines``, else three times its time in the
-    run's ledger (``run-all --ledger``: predicted seconds per profile, kept with the run's records), at least ten
-    minutes, else RUN_TIMEOUT_S. Every run of a profile gets its whole-profile deadline, so no single run is cut
-    short."""
+    """An explicit per-profile deadline, else the whole-benchmark default.
+
+    Scheduling ledgers may come from rescoring recorded outputs and omit inference time. They cannot
+    safely bound a fresh Native run, so they affect assignment only.
+    """
     profile = model.get("catalog_profile")
     deadline = (environment.values.get("deadlines") or {}).get(profile)
     if deadline:
         return float(deadline)
-    ledger = environment.values.get("run_ledger")
-    if ledger:
-        seconds = _ledger(str(ledger)).get(str(profile))
-        if seconds is not None:
-            return max(MIN_DEADLINE_S, DEADLINE_FACTOR * seconds)
     return RUN_TIMEOUT_S
 
 
@@ -198,7 +187,9 @@ def _candidate_tokenizer(model: Mapping[str, Any]) -> Any:
     from transformers import AutoTokenizer
 
     name, revision = tokenizer_source(model)
-    return AutoTokenizer.from_pretrained(name, revision=revision,
+    options = ({"subfolder": model["candidate"]["tokenizer_subfolder"]}
+               if model["candidate"].get("tokenizer_subfolder") else {})
+    return AutoTokenizer.from_pretrained(name, revision=revision, **options,
                                          trust_remote_code=bool(model["reference"].get("trust_remote_code")))
 
 
@@ -304,6 +295,8 @@ def _suite_side(environment: Environment, service: Mapping[str, Any], model: Map
         body = json.loads(record["responses"][-1]["text"])
         key = request_sha(record["payload"]["request"])
         by_request[key] = body.get("trtmc_observation") or {}
+        if item.get("postprocess"):
+            by_request[key]["artifact_directory"] = str(Path(service["records"]).parent / "scratch" / body["id"])
         timing_by_request[key] = {"model_call_ms": float((body.get("trtmc_timing") or {}).get("model_call_ms", 0)),
                                   "completion_tokens": by_request[key].get("output_tokens")}
     observations = {index: by_request[problem["request_sha"]] for index, problem in enumerate(problems)
@@ -317,7 +310,34 @@ def _suite_side(environment: Environment, service: Mapping[str, Any], model: Map
         side["rejected"] = {"greedy": out_of_capacity}
     if failing:
         side["failed"] = {"greedy": failed_reason(failing, len(failing))}
+    if item.get("postprocess"):
+        from .services import reference_python
+
+        postprocess(environment, item, observations, out, python=reference_python(environment, model))
     return side
+
+
+def postprocess(environment: Environment, item: Mapping[str, Any], observations: dict[int, Any], out: Path, *,
+                python: str | None = None) -> None:
+    """Augment saved outputs after profiling; a separate process releases its model on exit."""
+    import subprocess
+
+    config = item["postprocess"]
+    source, target = out.parent / f"{out.name}.postprocess-input.json", out.parent / f"{out.name}.postprocess-output.json"
+    source.write_text(json.dumps(observations))
+    command = [str(environment.values.get("scoring_python") or python or environment["serve_python"]),
+               str(environment.path("repo") / config["script"]), "--input", str(source), "--output", str(target),
+               *config.get("arguments", [])]
+    with (out.parent / f"{out.name}.postprocess.log").open("w") as log:
+        subprocess.run(command, check=True, stdout=log, stderr=subprocess.STDOUT,
+                       timeout=float(config.get("timeout_s", 14400)))
+    updated = {int(index): value for index, value in json.loads(target.read_text()).items()}
+    if set(updated) != set(observations):
+        raise ValueError("output postprocessing changed the sample identities")
+    for index, original in observations.items():
+        if any(updated[index].get(key) != value for key, value in original.items()):
+            raise ValueError("output postprocessing changed original evidence")
+    observations.update(updated)
 
 
 def run_side(environment: Environment, service: Mapping[str, Any], model: Mapping[str, Any],
@@ -428,7 +448,9 @@ def capacity_rejection(record: Mapping[str, Any]) -> str | None:
         body = json.loads(error.get("message") or "")["error"]
     except (TypeError, ValueError, KeyError):
         return None
-    message = str(body.get("message") or "") if isinstance(body, Mapping) else ""
+    if not isinstance(body, Mapping):
+        return None
+    message = str(body.get("message") or "")
     if body.get("code") != "backend_rejected_request" or not CAPACITY_LIMIT.search(message):
         return None
     return message[:300]
@@ -534,20 +556,17 @@ def _paired(problems: Sequence[Mapping[str, Any]], candidate: Mapping[int, Any],
 
 
 def status(entry: Mapping[str, Any]) -> tuple[str, list[str]]:
-    """pass / fail / inconclusive / not-comparable / error of a scored entry (also when re-judging a
-    report): every expected problem answered on both sides, a native score above the suitability
-    floor, then the entry's non-inferiority outcome under its gate."""
+    """Compare the conversion's scored difference, regardless of native absolute capability.
+
+    Old reports may carry ``min_native``; it no longer overrides the difference
+    test. Missing answers and statistical uncertainty retain their own outcomes.
+    """
     metrics, gate = entry.get("metrics") or {}, entry.get("gate") or {}
     expected, paired = int(entry.get("expected_samples") or 0), int(entry.get("samples") or 0)
     if paired < expected:
         return "error", [f"{expected - paired} of {expected} problems lack a graded answer on one side"
                          + (f" ({metrics['failed']})" if metrics.get("failed") else "")]
     native = metrics.get("native_score")
-    if native is not None and gate.get("min_native") is not None and native < float(gate["min_native"]):
-        # Too few right answers from the native model (at or near chance): the benchmark does not
-        # discriminate for this model, so it says nothing about TRTMC.
-        return "not-comparable", [f"the native model scores {native:g} (< {gate['min_native']:g}): the benchmark "
-                                  "does not fit this model"]
     test = metrics.get("test") or {}
     if test.get("outcome") is None:
         return "error", ["no non-inferiority outcome"]
@@ -792,7 +811,8 @@ def _probe(service: Mapping[str, Any], operation: str, request: Mapping[str, Any
 
 def keeps_artifacts(model: Mapping[str, Any]) -> bool:
     """A benchmark reads the output files the servers write (their scratch is then kept)."""
-    return any(item.get("metric") in gold_metrics.ARTIFACT_METRICS for item in model.get("absolute", []))
+    return any(item.get("postprocess") or item.get("metric") in gold_metrics.ARTIFACT_METRICS
+               for item in model.get("absolute", []))
 
 
 def run_native(environment: Environment, model: Mapping[str, Any], python: str, plans: Mapping[str, Sequence],
@@ -824,6 +844,11 @@ def run_native(environment: Environment, model: Mapping[str, Any], python: str, 
                     runs = {item["suite"]: run_side(environment, service, model, item, plans[item["suite"]],
                                                     out / f"absolute-native-{precision}")
                             for item in model["absolute"]}
+                    for name, side in runs.items():
+                        answers = side.get("observations") or side.get("records") or {}
+                        if side.get("failed") and not any(answers.values()):
+                            raise RuntimeError(f"{name}: no successful native responses "
+                                               f"({next(iter(side['failed'].values()))})")
                 finally:  # sharing an MPS daemon, no copy leaves while the other side's copies still answer
                     if finished is not None:
                         finished.set()

@@ -679,7 +679,7 @@ class _DeepseekOcrModel:
             "num_image_pad_tokens": 145,  # 144 projected + 1 view_separator
             "prefill_max_length": MAX_SEQUENCE_PREFILL_LENGTH,
             "vision_output_dim": hidden,
-            "preprocessor_type": "simple_chw",
+            "preprocessor_type": "pad_center_chw",
             "image_mean": [0.5, 0.5, 0.5],
             "image_std": [0.5, 0.5, 0.5],
             "interpolation": "bicubic",
@@ -1991,6 +1991,8 @@ def _build_deepseek_ocr_vision_engine(
 
 def build(request: "BuildRequest", writer: "BundleWriter") -> None:
     """Build one DeepSeek-OCR vision-language bundle."""
+    if request.mtp_seq_len is not None:
+        raise NotImplementedError("DeepSeek-OCR does not support MTP speculative decoding")
     if request.dynamic_kv_cache:
         raise NotImplementedError("deepseek_ocr does not support dynamic_kv_cache")
 

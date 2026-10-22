@@ -10,9 +10,11 @@ pairs): each side's units are scored, and a paired bootstrap over independent cl
 
 from __future__ import annotations
 
+import importlib
 import math
 import os
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -37,6 +39,39 @@ def choice(gold: Any, observation: Mapping[str, Any] | None, task: str | None = 
     match = _LETTER.search(_text(observation))
     answer = match.group(1) if match else ""
     return bool(answer) and answer == str(gold).strip().upper(), answer
+
+
+def spoken_choice(gold: Any, observation: Mapping[str, Any] | None,
+                  task: str | None = None) -> tuple[bool, str]:
+    """Score a transcribed MCQ reply by an explicit letter or unique complete option text.
+
+    Missing, ambiguous and unparsable answers are wrong. Never guess a letter.
+    """
+    text = _text(observation).strip().lower()
+    def affirmative(start: int) -> bool:
+        clause = re.split(r"[.,;:!?]", text[:start])[-1]
+        return not re.search(r"\b(?:not|never|don't|doesn't|isn't|aren't|can't|cannot|won't)\b", clause)
+
+    patterns = (
+        r"\b(?:option|choice)\s+([a-d])\b",
+        r"\b(?:the\s+)?(?:correct\s+)?answer\s+(?:is|would be)\s+([a-d])(?=\s*(?:[.,:;!?]|$))",
+        r"\b([a-d])\s+is\s+(?:the\s+)?(?:correct\s+)?answer\b",
+        r"\b(?:i|you|we)(?:'d| would)?\s+(?:say|choose|pick)\s+([a-d])(?=\s*(?:[.,:;!?]|$))",
+    )
+    letters = {match.group(1) for pattern in patterns for match in re.finditer(pattern, text)
+               if affirmative(match.start())}
+    direct = re.fullmatch(r"(?:the (?:correct )?answer is\s+)?([a-d])[.!]?", text)
+    if direct:
+        letters.add(direct.group(1))
+    if not letters:
+        for letter, option in re.findall(r"(?m)^([A-D])\.\s*(.+)$", gold["prompt"]):
+            option = " ".join(re.findall(r"\w+", option.lower()))
+            raw = re.escape(option).replace(r"\ ", r"\W+")
+            positive = any(affirmative(match.start()) for match in re.finditer(r"(?<!\w)" + raw + r"(?!\w)", text))
+            if len(option) >= 3 and positive:
+                letters.add(letter.lower())
+    answer = next(iter(letters)).upper() if len(letters) == 1 else ""
+    return bool(answer) and answer == str(gold["answer"]).strip().upper(), answer
 
 
 def _squash(text: str) -> str:
@@ -204,7 +239,7 @@ def box_iou50(gold: Any, observation: Mapping[str, Any] | None, task: str | None
     return _iou(predicted, target) >= 0.5, match.group(0)
 
 
-BINARY: dict[str, Callable[..., tuple[bool, str]]] = {"choice": choice, "contains": contains, "code_pass": code_pass,
+BINARY: dict[str, Callable[..., tuple[bool, str]]] = {"choice": choice, "spoken_choice": spoken_choice, "contains": contains, "code_pass": code_pass,
                                                       "top1": top1, "box_iou50": box_iou50}
 
 
@@ -228,6 +263,32 @@ def vector_parity(candidate: Mapping[str, Any] | None, native: Mapping[str, Any]
     relative = math.sqrt(sum((a - b) ** 2 for a, b in zip(mine, theirs))) / norm
     ok = cosine >= float(gate.get("min_cosine", 0.999)) and relative <= float(gate.get("max_relative_l2", 0.02))
     return ok, f"cosine {cosine:.5f}, relative L2 {relative:.4f}"
+
+
+def mask_parity(candidate: Mapping[str, Any] | None, native: Mapping[str, Any] | None,
+                gate: Mapping[str, Any]) -> tuple[bool | None, str]:
+    """Binary masks: equal source geometry, labels in {0, 1}, and foreground IoU within the gate."""
+    import numpy as np
+
+    shapes, masks = [], []
+    try:
+        for side in (candidate, native):
+            height, width = int((side or {}).get("height") or 0), int((side or {}).get("width") or 0)
+            values = np.asarray((side or {}).get("mask"))
+            if height <= 0 or width <= 0 or values.size != height * width:
+                return None, "missing mask or inconsistent source dimensions"
+            shapes.append((height, width))
+            masks.append(values.reshape(height, width))
+    except (TypeError, ValueError):
+        return None, "unreadable binary mask"
+    if any(not np.isin(mask, (0, 1)).all() for mask in masks):
+        return False, "mask labels outside {0, 1}"
+    if shapes[0] != shapes[1]:
+        return False, f"mask size differs: {shapes[0]} vs {shapes[1]}"
+    mine, theirs = (mask == 1 for mask in masks)
+    union = int(np.logical_or(mine, theirs).sum())
+    iou = float(np.logical_and(mine, theirs).sum()) / union if union else 1.0
+    return iou >= float(gate["min_mask_iou"]), f"mask IoU {iou:.5f}"
 
 
 def geometry_parity(candidate: Mapping[str, Any] | None, native: Mapping[str, Any] | None,
@@ -310,7 +371,26 @@ def audio_parity(candidate: Mapping[str, Any] | None, native: Mapping[str, Any] 
     return match, reason
 
 
-PARITY: dict[str, Callable[..., tuple[bool | None, str]]] = {"vector_parity": vector_parity, "geometry_parity": geometry_parity,
+@lru_cache(maxsize=None)
+def _family_checker(entrypoint: str) -> Callable:
+    module, separator, name = entrypoint.partition(":")
+    if not separator or not module.startswith("families.") or not name.isidentifier():
+        raise ValueError("family parity checker must be a families.<family>.<module>:<function> entrypoint")
+    checker = getattr(importlib.import_module(module), name)
+    if not callable(checker):
+        raise ValueError(f"family parity checker is not callable: {entrypoint}")
+    return checker
+
+
+def family_parity(candidate: Mapping[str, Any] | None, native: Mapping[str, Any] | None,
+                  gate: Mapping[str, Any]) -> tuple[bool | None, str]:
+    """Delegate a paired output check to its owning family; retain the ordinary all-sample parity decision."""
+    return _family_checker(str(gate["checker"]))(candidate, native, gate)
+
+
+PARITY: dict[str, Callable[..., tuple[bool | None, str]]] = {"family_parity": family_parity,
+                                                      "vector_parity": vector_parity, "mask_parity": mask_parity,
+                                                      "geometry_parity": geometry_parity,
                                                       "action_parity": action_parity, "disparity_parity": disparity_parity,
                                                       "audio_parity": audio_parity}
 # Parity metrics that read the output files the servers write (their artifacts are kept).
