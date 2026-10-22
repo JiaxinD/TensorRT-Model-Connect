@@ -95,6 +95,19 @@ def test_shared_build_dispatch_keeps_family_bounds(tmp_path):
             coerce_request(replace(request, **change))
 
 
+def test_shared_build_rejects_mtp_before_loading_weights(tmp_path):
+    request = SharedRequest(
+        tmp_path,
+        tmp_path / "n.bundle",
+        "nomic_bert",
+        "text_to_embedding",
+        "fp32",
+        mtp_seq_len=2,
+    )
+    with pytest.raises(ValueError, match="Nomic does not support mtp_seq_len"):
+        coerce_request(request)
+
+
 @pytest.mark.parametrize(
     "change",
     [

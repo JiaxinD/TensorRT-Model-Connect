@@ -59,6 +59,7 @@ def coerce_request(request):
         ("image_height", None),
         ("image_width", None),
         ("video_num_frames", None),
+        ("mtp_seq_len", None),
     ):
         if getattr(request, name, default) != default:
             raise ValueError(f"Nomic does not support {name}")
@@ -76,6 +77,7 @@ def coerce_request(request):
         "image_height",
         "image_width",
         "video_num_frames",
+        "mtp_seq_len",
     }
     if unknown := set(vars(request)) - set(fields) - legacy:
         raise ValueError(f"unknown Nomic build inputs: {sorted(unknown)}")
