@@ -28,3 +28,13 @@ The builder requires `config.json`, FP32 `model.safetensors` and `tokenizer.json
 No custom publisher code executes during the build or native inference. The
 family owns its graph, checkpoint mapping, WordPiece tokenizer and native DSO;
 TensorRT lowers and executes the graph.
+
+The native tokenizer keeps its Unicode normalization data family-local, with no
+new runtime dependency. `runtime/unicode_data.h` derives its nonspacing-mark
+ranges, canonical decompositions and simple lowercase mappings from fields 2,
+5 and 13 of [UnicodeData 8.0.0](https://www.unicode.org/Public/8.0.0/ucd/UnicodeData.txt)
+(SHA256 `38b17e1118206489a7e0ab5d29d7932212d38838df7d3ec025ecb58e8798ec20`).
+The category version matches the pinned Tokenizers 0.22.2 oracle; newer mark
+categories must not be silently substituted. Hangul decomposition is algorithmic.
+The Unicode data notice is in `UNICODE_LICENSE.txt`. This is not a claim of
+exhaustive compatibility with later Unicode versions or every normalization sequence.

@@ -46,7 +46,7 @@ int main() {
           "〃": 51, "｡": 52, "hello〆world": 53, "hello々world": 54,
           "hello﹢world": 55, "hello＋world": 56, "hello＄world": 57,
           "hello｀world": 58, "hello〱world": 59, "hello⁄world": 60,
-          "hello〿world": 61
+          "hello〿world": 61, "viet": 62, "nam": 63, "عربي": 64, "שלום": 65, "क": 66, "a": 67, "b": 68, "ạ": 69, "Ệ": 70, "ω": 71, "k": 72, "աբգ": 73, "한글": 74, "عَرَبِيّ": 75, "a\u093eb": 76, "a\u20ddb": 77, "a\u08d4b": 78
         }
       },
       "normalizer": {"type": "BertNormalizer", "clean_text": true,
@@ -97,6 +97,14 @@ int main() {
         check("ʹ", {43}, "Greek singleton canonical decomposition");
         check("CAF\xc3\x89 [MASK] playing", {16, 4, 17, 18}, "normalization on both sides");
         check("playing", {17, 18}, "ordinary wordpieces");
+        check("Ω K Å", {71, 72, 67}, "canonical normalization precedes lowercasing");
+        check("ԱԲԳ 한글", {73, 74}, "Armenian lowercase and Hangul canonical decomposition");
+        check("VIỆT NAM", {62, 63}, "Vietnamese canonical accents and lowercase");
+        check("عَرَبِيّ שָׁלוֹם क़", {64, 65, 66}, "nonspacing marks across scripts");
+        check("a\u05b0", {67}, "Hebrew mark stripped outside combining diacritic blocks");
+        check("a\u093eb", {76}, "spacing mark is preserved");
+        check("a\u20ddb", {77}, "enclosing mark is preserved");
+        check("a\u08d4b", {78}, "post Unicode 8 mark remains for the pinned oracle");
         check("hello¡world", {5, 45, 6}, "Latin punctuation splits words");
         check("hello،world", {5, 46, 6}, "Arabic punctuation splits words");
         check("hello।world", {5, 47, 6}, "Devanagari punctuation splits words");
@@ -148,6 +156,8 @@ int main() {
                           "\"strip_accents\": false");
     auto accented = trtmc::nomic_bert::CreateWordPieceTokenizer(accented_json.data(),
                                                                 accented_json.size(), false);
+    check_ids(accented->encode("عَرَبِيّ"), {75}, "nonspacing marks remain without stripping");
+    check_ids(accented->encode("Ạ"), {69}, "Vietnamese lowercase without stripping");
     check_ids(accented->encode("İ HĒLLŌ"), {24, 25},
               "lowercase preserves accents when stripping is disabled");
 
