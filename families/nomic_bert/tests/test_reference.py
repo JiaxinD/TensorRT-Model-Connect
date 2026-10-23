@@ -77,7 +77,7 @@ def _exercise_reference(tmp_path):
     tokenizer.pre_tokenizer = BertPreTokenizer()
     tokenizer.save(str(model_dir / "tokenizer.json"))
     (model_dir / "tokenizer_config.json").write_text(
-        json.dumps({"tokenizer_class": "BertTokenizer"})
+        json.dumps({"tokenizer_class": "BertTokenizer", "do_lower_case": True})
     )
     actual_tokenizer, reloaded = _load_reference(model_dir)
     assert actual_tokenizer("HELLO world", add_special_tokens=False)["input_ids"] == [1, 2]
