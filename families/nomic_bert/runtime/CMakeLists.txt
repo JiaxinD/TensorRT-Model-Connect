@@ -22,4 +22,5 @@ if(TRTMC_BUILD_TESTS)
   add_executable(nomic_embedding_consumer
     ${PROJECT_SOURCE_DIR}/families/nomic_bert/tests/cpp/embedding_consumer.cpp)
   target_link_libraries(nomic_embedding_consumer PRIVATE trtmc_c)
+  add_dependencies(test_nomic_bert_tokenizer nomic_embedding_consumer)
 endif()

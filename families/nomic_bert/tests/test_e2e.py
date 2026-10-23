@@ -21,6 +21,25 @@ MANIFEST = json.loads(
 CASES = {case["name"]: case for case in MANIFEST["testcases"]}
 
 
+def _load_reference(model_dir):
+    import torch
+    from transformers import BertTokenizerFast
+
+    from families.nomic_bert.tests.reference.configuration_hf_nomic_bert import NomicBertConfig
+    from families.nomic_bert.tests.reference.modeling_hf_nomic_bert import NomicBertModel
+
+    assert MANIFEST["code_revision"] == "7710840340a098cfb869c4f65e87cf2b1b70caca"
+    tokenizer = BertTokenizerFast.from_pretrained(model_dir, local_files_only=True)
+    config = NomicBertConfig.from_pretrained(model_dir, local_files_only=True)
+    model = NomicBertModel.from_pretrained(
+        str(model_dir),
+        config=config,
+        local_files_only=True,
+        torch_dtype=torch.float32,
+    ).eval()
+    return tokenizer, model
+
+
 def pytest_generate_tests(metafunc):
     if "case_name" not in metafunc.fixturenames:
         return
@@ -59,7 +78,6 @@ def pytest_generate_tests(metafunc):
 def runtime(tmp_path_factory):
     import torch
     from huggingface_hub import snapshot_download
-    from transformers import AutoModel, AutoTokenizer
 
     assert torch.cuda.is_available() and torch.cuda.device_count() >= 1
     assert MANIFEST["tensor_parallel_size"] == 1
@@ -85,23 +103,8 @@ def runtime(tmp_path_factory):
             ),
             bundle,
         )
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_dir,
-        local_files_only=True,
-        trust_remote_code=True,
-        code_revision=MANIFEST["code_revision"],
-    )
-    model = (
-        AutoModel.from_pretrained(
-            model_dir,
-            trust_remote_code=True,
-            code_revision=MANIFEST["code_revision"],
-            local_files_only=True,
-            torch_dtype=torch.float32,
-        )
-        .eval()
-        .to("cuda")
-    )
+    tokenizer, model = _load_reference(model_dir)
+    model = model.to("cuda")
     torch.backends.cuda.matmul.allow_tf32 = False
     return bundle, root, consumer, binary, tokenizer, model
 
