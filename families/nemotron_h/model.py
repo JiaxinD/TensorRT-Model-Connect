@@ -84,7 +84,7 @@ def _parse_layer_types(pattern: str) -> list[str]:
 def _config_layer_types(raw: dict, num_layers: int) -> list[str]:
     forms = []
     pattern = raw.get("hybrid_override_pattern")
-    if pattern:
+    if pattern is not None:
         if not isinstance(pattern, str) or any(ch not in "M-*E" for ch in pattern):
             raise ValueError("Unsupported Nemotron-H hybrid layer marker")
         forms.append(_parse_layer_types(pattern))

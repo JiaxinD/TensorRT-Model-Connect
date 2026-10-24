@@ -42,7 +42,7 @@ def test_valid_hybrid_pattern_preserves_every_layer(optimize):
 
 
 @pytest.mark.parametrize("optimize", [0, 2])
-@pytest.mark.parametrize("pattern,layers", [("M-", 3), ("M?*", 2), ("M?", 2)])
+@pytest.mark.parametrize("pattern,layers", [("M-", 3), ("M?*", 2), ("M?", 2), ("", 2)])
 def test_loader_rejects_bad_raw_pattern_before_tensor_access(optimize, pattern, layers):
     def unexpected_tensor(*_):
         pytest.fail("malformed pattern reached checkpoint tensor loading")
@@ -53,6 +53,7 @@ def test_loader_rejects_bad_raw_pattern_before_tensor_access(optimize, pattern, 
         _open_safetensors=lambda _: [],
         _load_tensor=unexpected_tensor,
         NemotronHQuantContext=type("QuantContext", (), {}),
+        WeightDict=dict,
     )
     config = SimpleNamespace(
         hidden_size=8,
@@ -60,6 +61,7 @@ def test_loader_rejects_bad_raw_pattern_before_tensor_access(optimize, pattern, 
         num_hidden_layers=layers,
         num_attention_heads=2,
         head_dim=4,
+        intermediate_size=16,
         raw={"hybrid_override_pattern": pattern},
     )
     with pytest.raises(ValueError, match="[Pp]attern|layer marker"):
@@ -84,6 +86,7 @@ def test_layer_forms_preserve_default_and_reject_conflicting_layouts(optimize):
         "_config_layer_types"
     ]
     assert parse({}, 2) == ["mamba2", "mamba2"]
+    assert parse({"hybrid_override_pattern": None}, 2) == ["mamba2", "mamba2"]
     assert parse({"hybrid_override_pattern": "ME", "layer_types": ["mamba", "moe"]}, 2) == [
         "mamba2",
         "moe",
