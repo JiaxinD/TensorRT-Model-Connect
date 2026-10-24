@@ -23,6 +23,9 @@ _BUNDLE_FILES = (
 )
 
 
+_DEFAULT_PREFILL_SEQ_LEN = 128
+
+
 def _positive_int(value: object, name: str) -> int:
     if isinstance(value, bool):
         raise ValueError(f"{name} must be a positive integer")
@@ -75,6 +78,7 @@ def _runtime_config(model_dir: Path, config: ModelConfig, model: Qwen38Model, **
         "decoder_engine_layout",
         "has_mtp",
         "mtp_num_draft_tokens",
+        "prefill_chunk_len",
     }
     missing = fields - runtime.keys()
     if missing:
@@ -96,6 +100,15 @@ def build(request, writer) -> None:
         return
     from .edge_llm.dispatch import build as edge_build
     edge_build(request, writer, _build_native)
+
+
+def _mtp_enabled(request, weights) -> bool:
+    """MTP engines are built only when the user asks for them with `--mtp-seq-len`."""
+    if request.mtp_seq_len is None:
+        return False
+    if "mtp_layer.fc" not in weights:
+        raise ValueError("--mtp-seq-len was given but the checkpoint has no MTP weights")
+    return True
 
 
 def _build_native(request, writer) -> None:
@@ -172,11 +185,30 @@ def _build_native(request, writer) -> None:
         debug_layer_outputs=False,
     )
 
-    has_mtp = "mtp_layer.fc" in weights
+    # Prompt tokens per multi-token prefill call. 0 keeps the old
+    # one-decode-step-per-prompt-token prefill (no prefill_engine.plan).
+    prefill_chunk_len = (
+        int(request.prefill_chunk_len) if request.prefill_chunk_len is not None
+        else _DEFAULT_PREFILL_SEQ_LEN)
+    if prefill_chunk_len > max_sequence_length:
+        # Largest valid chunk that still fits the cache.
+        prefill_chunk_len = (
+            (max_sequence_length // 64) * 64 if max_sequence_length >= 64
+            else 1 << (max_sequence_length.bit_length() - 1))
+    prefill_plan = None
+    if prefill_chunk_len >= 2:
+        prefill_plan = model.build_engine_prefill(
+            config, weights, max_sequence_length, prefill_chunk_len,
+            precision=precision, quant_ctx=quant_ctx, verbose=bool(request.verbose),
+        )
+    else:
+        prefill_chunk_len = 0
+
+    has_mtp = _mtp_enabled(request, weights)
     mtp_plan = None
     draft_chain_plan = None
     multi_token_plan = None
-    # mtp_seq_len = 1 real token + (mtp_seq_len-1) drafted tokens verified
+    # Built only with --mtp-seq-len. mtp_seq_len = 1 real token + (mtp_seq_len-1) drafted tokens verified
     # per speculative-decode round. Default of 2 (1 draft) matches the
     # only configuration validated end-to-end on real hardware so far;
     # larger values draft more tokens per round via build_mtp_draft_chain_engine's
@@ -184,6 +216,12 @@ def _build_native(request, writer) -> None:
     # a more expensive recovery path on any non-full-accept round (see
     # Qwen38MtpScheduler's class-level comment in mtp_scheduler.h).
     mtp_seq_len = int(request.mtp_seq_len) if request.mtp_seq_len is not None else 2
+    mtp_prefill_plan = None
+    if has_mtp and prefill_chunk_len >= 2:
+        mtp_prefill_plan = model.build_mtp_prefill_engine(
+            config, weights, max_sequence_length, prefill_chunk_len,
+            precision=precision, quant_ctx=quant_ctx, verbose=bool(request.verbose),
+        )
     if has_mtp:
         mtp_plan = model.build_mtp_engine(
             config, weights, max_sequence_length,
@@ -200,6 +238,10 @@ def _build_native(request, writer) -> None:
 
     writer.set_header(family="qwen3_8", task=request.task, backend=request.backend)
     writer.add_bytes("engine.plan", plan)
+    if prefill_plan is not None:
+        writer.add_bytes("prefill_engine.plan", prefill_plan)
+    if mtp_prefill_plan is not None:
+        writer.add_bytes("mtp_prefill_engine.plan", mtp_prefill_plan)
     if mtp_plan is not None:
         writer.add_bytes("mtp_engine.plan", mtp_plan)
     if draft_chain_plan is not None:
@@ -217,6 +259,7 @@ def _build_native(request, writer) -> None:
             decoder_engine_layout="single",
             has_mtp=has_mtp,
             mtp_num_draft_tokens=(mtp_seq_len - 1) if has_mtp else 0,
+            prefill_chunk_len=prefill_chunk_len,
         ),
     )
     for filename in _BUNDLE_FILES:

@@ -104,6 +104,13 @@ use the existing [family CLI protocol](../extend/family-cli.md), not shared
 parser extensions. For a pair, add `--execution-variant dspark` or `dflash` and
 `--companion draft=/path/to/draft`.
 
+An ordinary build (no `--execution-variant`) of a checkpoint that carries MTP
+weights builds only the base engine. Add `--mtp-seq-len N` (N >= 2: one real
+token plus N-1 drafted tokens verified per round) to also build the embedded MTP
+engines and add them to the bundle; this option is separate from
+`--execution-variant mtp`. Without it the bundle holds no MTP engines and is
+about half the size, because every engine embeds its own copy of the weights.
+
 The adapter additionally maps uniform NVFP4/INT4-AWQ embedded MTP and INT4-AWQ
 DFlash2. These have Python/native contract-test coverage, not local model-engine
 or accuracy qualification. For MTP, use `--execution-variant mtp` without an
@@ -123,6 +130,22 @@ See the [owning recipe](https://github.com/NVIDIA/TensorRT-Model-Connect/blob/ma
 for exact checkpoints, commands, platform limits, and evidence scope. Local
 profile results do not imply registered CI or catalog-wide qualification.
 
+
+### Qwen3.8 native multi-token prefill
+
+A native Qwen3.8 bundle ships a multi-token prefill engine
+(`prefill_engine.plan`) next to the one-token decode engine. The runtime feeds
+the prompt `--prefill-chunk-len` tokens per call (default 128; the last chunk may
+be partial) instead of running one decoder step per prompt token. Projections,
+norms and MLPs run as GEMMs over the chunk, Gated DeltaNet layers use the chunked
+delta rule, and full-attention layers use one masked attention over the chunk.
+Bundles with an embedded MTP head also ship `mtp_prefill_engine.plan`, which
+warms the MTP cache for a whole chunk in one call.
+
+`--prefill-chunk-len 0` builds the previous token-by-token prefill. Valid values
+are 0, a power of two below 64, or a multiple of 64. Each extra engine carries
+its own copy of the weights, so it adds to the bundle size and build time.
+Bundles built before this engine existed still load and prefill token by token.
 
 ### Nemotron-H Edge-LLM execution
 
@@ -206,13 +229,33 @@ a checkpoint or GPU imports. This uses the existing
 [family CLI protocol](../extend/family-cli.md), not an extension to the shared parser.
 
 The Qwen3.5 family maps the recorded original-source dense 0.8B/2B/4B/9B
-configurations (Instruct and Base) and explicit 4B/9B DFlash pairs to the pinned
-Edge-LLM 0.10.1 SDK on native x86 SM80, FP16, batch one. Historical local
-build/public/direct/HF receipts are documented separately from current-head
-checks. Qwen3 or older, MoE, 27B, quantized sources, and other platforms are not
-qualified by this route. Existing quality gates are unchanged.
+configurations (Instruct and Base), embedded MTP, and explicit 4B/9B DFlash
+pairs to the pinned Edge-LLM 0.11.0 SDK on native x86 SM80/SM120, FP16 compute,
+batch one. Dense 27B uses TP2 for its LLM and TP1 for its visual component.
+The SM120 route preserves admitted ModelOpt weight formats; the recorded 2B
+FP8-KV and NVFP4 LM-head component flows are checkpoint-driven.
+Compatible PyPI Python tools are discovered automatically, with the source-built
+SDK interpreter as fallback; a matching native C++ SDK is still required.
+Execution admission is not a blanket accuracy claim: recorded quality-only
+failures remain runnable and existing gates are unchanged. Qwen3 or older,
+MoE, Qwen3.6/3.8 and speculative TP2 are outside this owner.
 See the [family recipe](https://github.com/NVIDIA/TensorRT-Model-Connect/blob/main/families/qwen3_5/edge_llm/README.md)
-for exact revisions, paired execution, and replay gaps.
+for commands, paired execution, validation boundaries and known quality issues.
+
+Visual bundles expose the existing typed video and mixed image/video APIs;
+decoded frame order and optional timestamps are preserved. The recorded 2B
+two-frame appearance case passed Model Connect/direct parity and independent
+FP32 NED0.0; it is not a motion-quality or all-configuration qualification.
+The generic image CLI is unchanged. See the owning recipe for API boundaries.
+
+When Edge offload is unavailable or fails, this family builds with the TensorRT
+Python API and executes with the Model Connect C++ runtime. Native execution
+owns the prepared projections, FP8 KV storage, visual processing, TP2 and
+speculative orchestration; it does not require an Edge installation or ONNX.
+The existing TP1 image premerge case accepts this native fallback without
+changing its reference or accuracy checks. Prepared and speculative mappings
+are not blanket accuracy qualifications; the family recipe separates local
+results from unexecuted combinations and known quality limitations.
 
 ## Optional Llama Edge execution
 

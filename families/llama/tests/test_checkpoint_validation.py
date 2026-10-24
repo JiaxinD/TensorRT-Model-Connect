@@ -13,8 +13,10 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 @pytest.mark.parametrize("flags", [[], ["-O"]])
-def test_llama_rejects_bad_embedding_shape_under_optimized_python(tmp_path: Path, flags) -> None:
-    """Malformed checkpoint tensors must be rejected when assertions are stripped."""
+@pytest.mark.parametrize("malformed", [False, True])
+def test_llama_embedding_validation_preserves_valid_mapping(
+    tmp_path: Path, flags, malformed
+) -> None:
     script = textwrap.dedent(
         """
         import sys
@@ -29,8 +31,10 @@ def test_llama_rejects_bad_embedding_shape_under_optimized_python(tmp_path: Path
         )
 
         model_dir = Path(sys.argv[1])
+        rows = 64 if sys.argv[2] == "True" else 32
+        embedding = np.arange(rows * 16, dtype=np.float32).reshape(rows, 16)
         save_file(
-            {"model.embed_tokens.weight": np.zeros((64, 16), dtype=np.float32)},
+            {"model.embed_tokens.weight": embedding},
             model_dir / "model.safetensors",
         )
         config = SimpleNamespace(
@@ -40,7 +44,10 @@ def test_llama_rejects_bad_embedding_shape_under_optimized_python(tmp_path: Path
             num_attention_heads=1,
             num_key_value_heads=1,
         )
-        load_standard_weights(model_dir, config)
+        weights = load_standard_weights(model_dir, config)
+        np.testing.assert_array_equal(weights["embedding"], embedding)
+        np.testing.assert_array_equal(weights["w_out"], embedding.T)
+        np.testing.assert_array_equal(weights["final_norm"], np.ones(16, dtype=np.float32))
         """
     )
     env = os.environ.copy()
@@ -50,7 +57,7 @@ def test_llama_rejects_bad_embedding_shape_under_optimized_python(tmp_path: Path
     env["PYTHONPATH"] = python_path
 
     result = subprocess.run(
-        [sys.executable, *flags, "-c", script, str(tmp_path)],
+        [sys.executable, *flags, "-c", script, str(tmp_path), str(malformed)],
         cwd=REPO_ROOT,
         env=env,
         capture_output=True,
@@ -58,5 +65,8 @@ def test_llama_rejects_bad_embedding_shape_under_optimized_python(tmp_path: Path
         check=False,
     )
 
-    assert result.returncode != 0, "optimized Python accepted a malformed embedding"
-    assert "ValueError: Embedding shape (64, 16) != (32, 16)" in result.stderr
+    if malformed:
+        assert result.returncode != 0, "optimized Python accepted a malformed embedding"
+        assert "ValueError: Embedding shape (64, 16) != (32, 16)" in result.stderr
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr

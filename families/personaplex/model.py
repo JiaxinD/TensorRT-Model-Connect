@@ -383,7 +383,11 @@ class _PersonaPlexModel:
         # the official Mimi codec numerics in FP32, so an FP16 model build must
         # not accidentally request an unsupported encoder engine.
         mimi_encoder_precision = "fp32"
-        mimi_decoder_precision = _component_precision(config, _MIMI_DECODER_COMPONENT, precision)
+        # The official pipeline also decodes with the FP32 Mimi codec
+        # (loaders.get_mimi), whatever the language model's precision. An FP16
+        # decoder changes the waveform enough to fail the reference's spectral
+        # parity, so the decoder follows the codec, not the bundle precision.
+        mimi_decoder_precision = "fp32"
         mimi_frame_capacity = _mimi_frame_capacity(max_cache_length)
 
         # --- Per-codebook Depth Transformer engines ---
@@ -1415,10 +1419,21 @@ def build(request: "BuildRequest", writer: "BundleWriter") -> None:
     parallel = ParallelConfig(tp_size=int(request.tensor_parallel_size))
     parallel.validate()
     max_length = int(request.max_sequence_length or 512)
+    max_length = max(max_length, int(config.raw.get("personaplex_benchmark_capacity", 0)))
     config.raw["_model_dir"] = str(model_dir)
     config.raw["_fp32_layers"] = tuple(request.fp32_layers)
     model = _PersonaPlexModel()
     weights = model.load_weights(str(model_dir), config)
+
+    system_prompt = None
+    if prompt_path := config.raw.get("personaplex_system_prompt"):
+        from .system_prompt import load
+
+        prompt_file = Path(prompt_path)
+        if not prompt_file.is_absolute():
+            prompt_file = model_dir / prompt_file
+        system_prompt = load(prompt_file, _component_precision(config, _TEMPORAL_COMPONENT, request.precision),
+                             int(weights["_hidden_size"]), max_length)
 
     writer.set_header(family="personaplex", task=request.task, backend=request.backend)
     if parallel.enabled:
@@ -1492,4 +1507,8 @@ def build(request: "BuildRequest", writer: "BundleWriter") -> None:
         "delays": [0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1],
         "text_prompt_ids": [],
     }
+    if system_prompt is not None:
+        runtime["system_prompt"], embeddings = system_prompt
+        runtime["listen_before_answer"] = bool(config.raw.get("personaplex_listen_before_answer", False))
+        writer.add_bytes("system_prompt.embeddings", embeddings)
     writer.add_json("runtime.json", runtime)

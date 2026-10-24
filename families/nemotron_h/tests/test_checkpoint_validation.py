@@ -38,7 +38,7 @@ def test_unknown_hybrid_symbols_are_rejected(optimize, pattern):
 @pytest.mark.parametrize("optimize", [0, 2])
 def test_valid_hybrid_pattern_preserves_every_layer(optimize):
     parser = _load_source(["_parse_layer_types"], optimize)["_parse_layer_types"]
-    assert parser("M-*M") == ["mamba2", "mlp", "attention", "mamba2"]
+    assert parser("M-*ME") == ["mamba2", "mlp", "attention", "mamba2", "moe"]
 
 
 @pytest.mark.parametrize("optimize", [0, 2])
@@ -48,10 +48,11 @@ def test_loader_rejects_bad_raw_pattern_before_tensor_access(optimize, pattern, 
         pytest.fail("malformed pattern reached checkpoint tensor loading")
 
     env = _load_source(
-        ["_parse_layer_types", "_NemotronHModel"],
+        ["_parse_layer_types", "_config_layer_types", "_NemotronHModel"],
         optimize,
         _open_safetensors=lambda _: [],
         _load_tensor=unexpected_tensor,
+        NemotronHQuantContext=type("QuantContext", (), {}),
     )
     config = SimpleNamespace(
         hidden_size=8,
@@ -61,5 +62,31 @@ def test_loader_rejects_bad_raw_pattern_before_tensor_access(optimize, pattern, 
         head_dim=4,
         raw={"hybrid_override_pattern": pattern},
     )
-    with pytest.raises(ValueError, match="[Pp]attern"):
+    with pytest.raises(ValueError, match="[Pp]attern|layer marker"):
         env["_NemotronHModel"]().load_weights("unused", config)
+
+
+@pytest.mark.parametrize("optimize", [0, 2])
+@pytest.mark.parametrize("field", ["hybrid_override_pattern", "layer_types", "layers_block_type"])
+def test_explicit_layer_count_is_validated_under_optimized_python(optimize, field):
+    parse = _load_source(["_parse_layer_types", "_config_layer_types"], optimize)[
+        "_config_layer_types"
+    ]
+    value = "ME" if field == "hybrid_override_pattern" else ["mamba", "moe"]
+    with pytest.raises(ValueError, match="Pattern length 2 != num_hidden_layers 3"):
+        parse({field: value}, 3)
+    assert parse({field: value}, 2) == ["mamba2", "moe"]
+
+
+@pytest.mark.parametrize("optimize", [0, 2])
+def test_layer_forms_preserve_default_and_reject_conflicting_layouts(optimize):
+    parse = _load_source(["_parse_layer_types", "_config_layer_types"], optimize)[
+        "_config_layer_types"
+    ]
+    assert parse({}, 2) == ["mamba2", "mamba2"]
+    assert parse({"hybrid_override_pattern": "ME", "layer_types": ["mamba", "moe"]}, 2) == [
+        "mamba2",
+        "moe",
+    ]
+    with pytest.raises(ValueError, match="Conflicting"):
+        parse({"hybrid_override_pattern": "ME", "layer_types": ["mamba", "mlp"]}, 2)
