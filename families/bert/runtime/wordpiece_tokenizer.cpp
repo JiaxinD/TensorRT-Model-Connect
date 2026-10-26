@@ -194,6 +194,10 @@ inline bool is_mn_category(char32_t cp) {
 inline void nfd_decompose(char32_t cp, std::vector<char32_t>& out) {
     if (cp == 0x0374)
         cp = 0x02B9;
+    else if (cp == 0x037E)
+        cp = 0x003B;
+    else if (cp == 0x0387)
+        cp = 0x00B7;
     if (cp < 0x00C0) {
         out.push_back(cp);
         return;

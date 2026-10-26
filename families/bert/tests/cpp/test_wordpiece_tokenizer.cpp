@@ -46,7 +46,7 @@ int main() {
           "〃": 51, "｡": 52, "hello〆world": 53, "hello々world": 54,
           "hello﹢world": 55, "hello＋world": 56, "hello＄world": 57,
           "hello｀world": 58, "hello〱world": 59, "hello⁄world": 60,
-          "hello〿world": 61
+          "hello〿world": 61, ";": 62, "·": 63, ";": 64, "·": 65
         }
       },
       "normalizer": {"type": "BertNormalizer", "clean_text": true,
@@ -95,6 +95,7 @@ int main() {
               "Greek and Cyrillic around preserved special tokens");
         check("ΐ ΰ", {39, 40}, "recursive Greek canonical decomposition");
         check("ʹ", {43}, "Greek singleton canonical decomposition");
+        check("; ·", {62, 63}, "Greek punctuation canonical singleton decomposition");
         check("CAF\xc3\x89 [MASK] playing", {16, 4, 17, 18}, "normalization on both sides");
         check("playing", {17, 18}, "ordinary wordpieces");
         check("hello¡world", {5, 45, 6}, "Latin punctuation splits words");
@@ -158,6 +159,7 @@ int main() {
               "recursive Greek accents remain when stripping is disabled");
 
     check_ids(accented->encode("ʹ"), {44}, "Greek singleton remains without NFD stripping");
+    check_ids(accented->encode("; ·"), {64, 65}, "Greek punctuation remains without NFD stripping");
 
     std::string cased_json = tokenizer_json;
     cased_json.replace(cased_json.find("\"lowercase\": true"),
@@ -170,6 +172,8 @@ int main() {
 
     check_ids(cased->encode("ΑΘΉΝΑ МОСКВА ЙОГА ЁЛКА"), {35, 36, 37, 38},
               "Greek and Cyrillic accent stripping preserves uppercase");
+    check_ids(cased->encode("; ·"), {62, 63},
+              "Greek punctuation decomposes with explicit accent stripping");
 
     return failures == 0 ? 0 : 1;
 }
