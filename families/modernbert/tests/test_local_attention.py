@@ -130,6 +130,22 @@ class _Network:
     def add_dist_collective(self, tensor, *args):
         return _layer(tensor)
 
+    def add_attention(self, q, k, v, normalization, causal):
+        assert normalization == "softmax" and not causal
+        layer = SimpleNamespace(mask=None)
+
+        def output(index):
+            scores = q.values @ k.values.swapaxes(-1, -2)
+            if layer.mask is not None:
+                assert q.dtype == k.dtype == v.dtype == layer.mask.dtype
+                scores += layer.mask.values
+            probabilities = np.exp(scores - scores.max(-1, keepdims=True))
+            probabilities /= probabilities.sum(-1, keepdims=True)
+            return _Tensor(probabilities @ v.values, q.dtype)
+
+        layer.get_output = output
+        return layer
+
     def add_unary(self, tensor, operation):
         if operation == "abs":
             return _layer(_Tensor(np.abs(tensor.values), tensor.dtype))
@@ -171,7 +187,7 @@ def _source_functions(path, namespace):
 
 @pytest.fixture
 def graph():
-    def create(sequence_length):
+    def create(sequence_length, native_attention=False):
         network = _Network(sequence_length)
         logger = type(
             "Logger", (), {"VERBOSE": 1, "WARNING": 2, "__init__": lambda self, level: None}
@@ -201,6 +217,7 @@ def graph():
             CollectiveOperation=SimpleNamespace(ALL_REDUCE="allreduce"),
             ReduceOperation=SimpleNamespace(SUM="sum"),
             UnaryOperation=SimpleNamespace(ERF="erf", ABS="abs"),
+            AttentionNormalizationOp=SimpleNamespace(SOFTMAX="softmax"),
         )
         owner = Path(__file__).resolve().parents[1]
         ops = _source_functions(owner / "graph/model.py", {"np": np, "trt": trt})
@@ -224,7 +241,8 @@ def graph():
             assert q.dtype == k.dtype == v.dtype == kwargs["mask"].dtype
             return q
 
-        ops.add_attention_from_rows = attention
+        if not native_attention:
+            ops.add_attention_from_rows = attention
         encoder = _source_functions(
             owner / "model.py",
             {
@@ -328,3 +346,44 @@ def test_window_mask_dtype_and_inclusive_boundary(graph, dtype, window):
     allowed = mask.values[0, 0] == 0
     expected = np.array([[abs(q - k) <= window and k != 6 for k in range(7)] for q in range(7)])
     np.testing.assert_array_equal(allowed, expected)
+
+
+@pytest.mark.parametrize("dtype", ["fp32", "fp16", "bf16"])
+@pytest.mark.parametrize("sequence_length", [None, 7])
+def test_attention_values_exclude_distant_and_padded_tokens(graph, dtype, sequence_length):
+    network, _, _, ops = graph(7, native_attention=True)
+    q = k = _Tensor(np.ones((7, 4)), dtype)
+    values = np.arange(28, dtype=np.float32).reshape(7, 4)
+    padding = _Tensor([[[[0, 0, 0, 0, 0, 0, -10000]]]], dtype)
+    local_mask = ops.add_bidirectional_window_mask(
+        network, _Tensor(np.arange(7), "int32"), padding, 2
+    )
+
+    def context(v, mask):
+        return ops.add_attention_from_rows(
+            network,
+            q,
+            k,
+            _Tensor(v, dtype),
+            num_heads=2,
+            head_dim=2,
+            q_seq=sequence_length,
+            kv_seq=sequence_length,
+            mask=mask,
+        ).values
+
+    local = context(values, local_mask)
+    full = context(values, padding)
+    for query in range(7):
+        neighbors = [key for key in range(6) if abs(query - key) <= 2]
+        np.testing.assert_allclose(local[query], values[neighbors].mean(0), atol=0.02)
+        np.testing.assert_allclose(full[query], values[:6].mean(0), atol=0.02)
+    distant = values.copy()
+    distant[5] += 12
+    np.testing.assert_array_equal(context(distant, local_mask)[0], local[0])
+    np.testing.assert_allclose(context(distant, padding)[0], full[0] + 2, atol=0.02)
+    assert not np.array_equal(context(distant, local_mask)[4], local[4])
+    padded = values.copy()
+    padded[6] += 100
+    np.testing.assert_array_equal(context(padded, local_mask), local)
+    np.testing.assert_array_equal(context(padded, padding), full)

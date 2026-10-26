@@ -10,6 +10,12 @@
       "name": "modernbert-base-tp4",
       "prompt": "A man is slicing open a fish.",
       "reference_precision": "fp32"
+    },
+    {
+      "name": "modernbert-base-tp4-local-window",
+      "reference_precision": "fp32",
+      "exercise_local_window": true,
+      "prompt": "The river flows through the quiet forest while bright birds gather near the old bridge. The river flows through the quiet forest while bright birds gather near the old bridge. The river flows through the quiet forest while bright birds gather near the old bridge. The river flows through the quiet forest while bright birds gather near the old bridge. The river flows through the quiet forest while bright birds gather near the old bridge. The river flows through the quiet forest while bright birds gather near the old bridge. The river flows through the quiet forest while bright birds gather near the old bridge. The river flows through the quiet forest while bright birds gather near the old bridge. The river flows through the quiet forest while bright birds gather near the old bridge. The river flows through the quiet forest while bright birds gather near the old bridge."
     }
   ],
   "tensor_parallel_size": 4,
