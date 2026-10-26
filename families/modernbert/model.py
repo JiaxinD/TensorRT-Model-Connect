@@ -247,6 +247,11 @@ class _ModernBertModel:
         pos_slice = network.add_slice(all_pos_indices, start=(0,), shape=(1,), stride=(1,))
         pos_slice.set_input(2, sequence_shape)
         pos_indices = pos_slice.get_output(0)
+        sliding_mask = None
+        if any(layer in {"sliding_attention", "local_attention"} for layer in layer_types):
+            sliding_mask = graph_ops.add_bidirectional_window_mask(
+                network, pos_indices, pad_mask_4d.get_output(0), attention_contract.sliding_window
+            )
 
         # Embedding
         embed_table = graph_ops.add_constant(
@@ -270,8 +275,10 @@ class _ModernBertModel:
             lt = layer_types[layer_idx]
             if lt in ("full_attention", "global_attention"):
                 theta = full_theta
+                layer_mask = pad_mask_4d.get_output(0)
             else:
                 theta = sliding_theta
+                layer_mask = sliding_mask
             cos_table, sin_table = rope_tables[theta]
 
             # Pre-norm attention
@@ -332,7 +339,7 @@ class _ModernBertModel:
                 head_dim=head_dim,
                 q_seq=None,
                 kv_seq=None,
-                mask=pad_mask_4d.get_output(0),
+                mask=layer_mask,
             )
 
             attn_out = graph_ops.add_matmul_rhs_constant(
