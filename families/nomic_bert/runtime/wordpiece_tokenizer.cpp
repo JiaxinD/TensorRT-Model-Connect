@@ -275,17 +275,33 @@ std::string bert_lowercase(const std::string& text) {
 }
 
 std::string bert_strip_accents(const std::string& text) {
-    std::string result;
+    std::vector<char32_t> decomposed;
     size_t pos = 0;
     while (pos < text.size()) {
         char32_t cp = utf8_to_char32(text, pos);
-        std::vector<char32_t> decomposed;
         nfd_decompose(cp, decomposed);
-        for (char32_t dcp : decomposed) {
-            if (!is_mn_category(dcp)) {
-                result += char32_to_utf8(dcp);
-            }
+    }
+    const auto combining_class = [](char32_t cp) {
+        const auto* begin = nomic_bert::unicode_data::kCombiningClasses;
+        const auto* end =
+            begin + sizeof(nomic_bert::unicode_data::kCombiningClasses) / sizeof(*begin);
+        const auto* found = std::lower_bound(
+            begin, end, cp, [](const auto& entry, char32_t value) { return entry.hi < value; });
+        return found != end && found->lo <= cp ? found->value : 0;
+    };
+    size_t segment_begin = 0;
+    for (size_t i = 0; i <= decomposed.size(); ++i) {
+        if (i == decomposed.size() || combining_class(decomposed[i]) == 0) {
+            std::stable_sort(
+                decomposed.begin() + segment_begin, decomposed.begin() + i,
+                [&](char32_t a, char32_t b) { return combining_class(a) < combining_class(b); });
+            segment_begin = i + 1;
         }
+    }
+    std::string result;
+    for (char32_t cp : decomposed) {
+        if (!is_mn_category(cp))
+            result += char32_to_utf8(cp);
     }
     return result;
 }

@@ -64,7 +64,9 @@ void test_unicode_normalization() {
           "〃": 51, "｡": 52, "hello〆world": 53, "hello々world": 54,
           "hello﹢world": 55, "hello＋world": 56, "hello＄world": 57,
           "hello｀world": 58, "hello〱world": 59, "hello⁄world": 60,
-          "hello〿world": 61, "viet": 62, "nam": 63, "عربي": 64, "שלום": 65, "क": 66, "a": 67, "b": 68, "ạ": 69, "Ệ": 70, "ω": 71, "k": 72, "աբգ": 73, "한글": 74, "عَرَبِيّ": 75, "a\u093eb": 76, "a\u20ddb": 77, "a\u08d4b": 78
+          "hello〿world": 61, "viet": 62, "nam": 63, "عربي": 64, "שלום": 65, "क": 66, "a": 67, "b": 68, "ạ": 69, "Ệ": 70, "ω": 71, "k": 72, "աբգ": 73, "한글": 74, "عَرَبِيّ": 75, "a\u093eb": 76, "a\u20ddb": 77, "a\u08d4b": 78, "ა": 79, "𞤢": 80, "𐓘": 81, "𐖗": 82, "ɤ": 83, "𖺻": 84, "a\u1b44\u302e": 85, "A\u1b44\u302e": 86, "a\u302e\u1b44": 87, "A\u302e\u1b44": 88,
+          "a\u1b44\u08d4": 89, "a\u08d4\u1b44": 90, "a\u302f\u302e": 91,
+          "\u1b44\u302e": 92, "a\u302eb\u1b44": 93
         }
       },
       "normalizer": {"type": "BertNormalizer", "clean_text": true,
@@ -122,6 +124,17 @@ void test_unicode_normalization() {
         check_normalized("Ω K Å", {71, 72, 67}, "canonical normalization precedes lowercasing");
         check_normalized("ԱԲԳ 한글", {73, 74},
                          "Armenian lowercase and Hangul canonical decomposition");
+        check_normalized("Ა 𞤀 𐒰 𐕰 Ɤ 𖺠", {79, 80, 81, 82, 83, 84},
+                         "lowercase mappings added after Unicode 8");
+        check_normalized("A\u302e\u1b44", {85}, "NFD reorders retained spacing marks");
+        check_normalized("A\u1b44\u302e", {85}, "NFD preserves ordered spacing marks");
+        check_normalized("A\u08d4\u1b44", {89},
+                         "Unicode 9 ordering retains a mark outside Unicode 8 categories");
+        check_normalized("A\u302f\u302e", {91}, "equal combining classes retain input order");
+        check_normalized("\u302e\u1b44", {92}, "NFD reorders leading combining marks");
+        check_normalized("A\u302eB\u1b44", {93}, "NFD ordering stops at the next starter");
+        check_normalized("[MASK]A\u302e\u1b44[MASK]", {4, 85, 4},
+                         "NFD ordering preserves special token boundaries");
         check_normalized("VIỆT NAM", {62, 63}, "Vietnamese canonical accents and lowercase");
         check_normalized("عَرَبِيّ שָׁלוֹם क़", {64, 65, 66}, "nonspacing marks across scripts");
         check_normalized("a\u05b0", {67},
@@ -181,6 +194,11 @@ void test_unicode_normalization() {
                           "\"strip_accents\": false");
     auto accented =
         trtmc::CreateWordPieceTokenizer(accented_json.data(), accented_json.size(), false);
+    check(accented->encode("Ა 𞤀 𐒰 𐕰 Ɤ 𖺠"), {79, 80, 81, 82, 83, 84},
+          "modern lowercase without accent stripping");
+    check(accented->encode("A\u302e\u1b44"), {87}, "strip_accents false preserves mark order");
+    check(accented->encode("A\u08d4\u1b44"), {90},
+          "strip_accents false preserves Unicode 9 mark order");
     check(accented->encode("عَرَبِيّ"), {75}, "nonspacing marks remain without stripping");
     check(accented->encode("Ạ"), {69}, "Vietnamese lowercase without stripping");
     check(accented->encode("İ HĒLLŌ"), {24, 25},
@@ -200,6 +218,7 @@ void test_unicode_normalization() {
     cased_json.replace(cased_json.find("\"strip_accents\": null"),
                        std::string("\"strip_accents\": null").size(), "\"strip_accents\": true");
     auto cased = trtmc::CreateWordPieceTokenizer(cased_json.data(), cased_json.size(), false);
+    check(cased->encode("A\u302e\u1b44"), {86}, "NFD ordering does not require lowercase");
     check(cased->encode("HĒLLŌ İ"), {26, 27},
           "accent stripping preserves case when lowercasing is disabled");
 
