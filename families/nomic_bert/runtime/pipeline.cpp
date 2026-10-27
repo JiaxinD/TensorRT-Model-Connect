@@ -2,73 +2,139 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
+
 #include "families/nomic_bert/runtime/pipeline.h"
 
-#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <string>
+#include <utility>
 
-namespace trtmc::nomic_bert {
+namespace trtmc {
 
-Pipeline::Pipeline(std::unique_ptr<ITrtModule> engine, std::unique_ptr<ITokenizer> tokenizer,
-                   int32_t length, int32_t vocab_size, std::string embedding_space)
-    : engine_(std::move(engine)), tokenizer_(std::move(tokenizer)), length_(length),
-      vocab_size_(vocab_size), embedding_space_(std::move(embedding_space)) {
-    if (!engine_ || !engine_->ok() || !tokenizer_ || length < 2 || length > 2048 ||
-        vocab_size < 103)
-        throw std::invalid_argument("invalid Nomic runtime configuration");
-    if (engine_->tensor_shape("input_ids") != std::vector<int64_t>{length} ||
-        engine_->tensor_dtype("input_ids") != DType::kInt32 ||
-        engine_->tensor_shape("attention_mask") != std::vector<int64_t>{length} ||
-        engine_->tensor_dtype("attention_mask") != DType::kFloat32 ||
-        engine_->tensor_shape("embedding") != std::vector<int64_t>{1, 768} ||
-        engine_->tensor_dtype("embedding") != DType::kFloat32)
-        throw std::invalid_argument("Nomic engine does not match its bundle contract");
-}
+namespace {
 
-internal::SemanticEmbeddingResult Pipeline::run(const internal::TextToEmbeddingRequest& request,
-                                                internal::ConfigView config) {
-    internal::validate_config({}, config);
-    if (request.text.size() > static_cast<size_t>(length_) * 1024)
-        throw std::invalid_argument("Nomic input exceeds the text byte limit");
-    std::string text;
-    switch (request.role) {
+// This checkpoint is trained with a task prefix on every input, and the two
+// prefixes put a query and a document into comparable positions. They are
+// part of the model, not a convention the caller may vary, so they live here
+// rather than being left for the caller to remember.
+constexpr const char* kQueryPrefix = "search_query: ";
+constexpr const char* kDocumentPrefix = "search_document: ";
+
+std::string prefix_for(internal::EmbeddingRole role) {
+    switch (role) {
+    case internal::EmbeddingRole::Query:
+        return kQueryPrefix;
+    case internal::EmbeddingRole::Document:
+        return kDocumentPrefix;
     case internal::EmbeddingRole::Default:
         break;
-    case internal::EmbeddingRole::Query:
-        text = "search_query: ";
-        break;
-    case internal::EmbeddingRole::Document:
-        text = "search_document: ";
-        break;
-    default:
-        throw std::invalid_argument("invalid Nomic embedding role");
     }
-    if (!request.text.empty())
-        text.append(request.text.data(), request.text.size());
-    auto ids = tokenizer_->encode(text);
-    if (ids.size() < 2 || ids.size() > static_cast<size_t>(length_))
-        throw std::invalid_argument("Nomic input exceeds the engine token limit");
-    if (std::any_of(ids.begin(), ids.end(),
-                    [this](int32_t id) { return id < 0 || id >= vocab_size_; }))
-        throw std::invalid_argument("Nomic tokenizer produced an invalid token ID");
-    std::vector<float> mask(static_cast<size_t>(length_), 0.0f);
-    std::fill_n(mask.begin(), ids.size(), 1.0f);
-    ids.resize(static_cast<size_t>(length_), 0);
-    Tensor id_tensor{ids.data(), {length_}, DType::kInt32};
-    Tensor mask_tensor{mask.data(), {length_}, DType::kFloat32};
-    auto outputs = engine_->forward({{"input_ids", id_tensor}, {"attention_mask", mask_tensor}});
-    const auto found = outputs.find("embedding");
-    if (found == outputs.end() || found->second.dtype != DType::kFloat32 ||
-        found->second.shape != std::vector<int64_t>{1, 768} || !found->second.data)
-        throw std::runtime_error("invalid Nomic embedding output");
+    // There is no unprefixed mode. Embedding without a prefix returns a
+    // vector that is neither a query nor a document and is not comparable
+    // with either, so the caller is asked which one it meant instead of
+    // being handed a plausible wrong answer.
+    throw std::invalid_argument(
+        "nomic_bert needs a role: this checkpoint embeds queries and documents differently");
+}
+
+const Tensor& require_rows(const TensorMap& outputs, std::int32_t seq_len, std::int32_t hidden) {
+    const auto found = outputs.find("last_hidden_state");
+    if (found == outputs.end())
+        throw std::runtime_error("nomic_bert engine did not return last_hidden_state");
+    const auto& tensor = found->second;
+    const auto expected = static_cast<std::size_t>(seq_len) * static_cast<std::size_t>(hidden);
+    if (tensor.data == nullptr || tensor.dtype != DType::kFloat32 || tensor.numel() != expected)
+        throw std::runtime_error("nomic_bert engine returned unusable rows");
+    return tensor;
+}
+
+} // namespace
+
+NomicBertPipeline::NomicBertPipeline(std::unique_ptr<ITrtModule> encoder,
+                                     std::shared_ptr<ITokenizer> tokenizer,
+                                     NomicBertRuntimeConfig config, std::string primary_task)
+    : encoder_(std::move(encoder)), tokenizer_(std::move(tokenizer)), config_(config),
+      primary_task_(std::move(primary_task)) {
+    if (!encoder_ || !encoder_->ok())
+        throw std::runtime_error("NomicBertPipeline: invalid model");
+    if (!tokenizer_)
+        throw std::runtime_error("NomicBertPipeline: missing tokenizer");
+    if (config_.max_sequence_length < 2 || config_.hidden_size <= 0 || config_.pad_token_id < 0)
+        throw std::runtime_error("nomic_bert runtime config has invalid dimensions");
+}
+
+std::vector<internal::TaskInstance> NomicBertPipeline::task_bindings() {
+    return {internal::bind<internal::ITextToEmbedding>(*this)};
+}
+
+std::vector<float> NomicBertPipeline::embed(std::string_view text, internal::EmbeddingRole role) {
+    auto ids = tokenizer_->encode(prefix_for(role) + std::string(text));
+    if (ids.empty())
+        throw std::runtime_error("nomic_bert tokenizer returned no tokens");
+
+    const auto limit = static_cast<std::size_t>(config_.max_sequence_length);
+    const auto separator = ids.back();
+    if (ids.size() > limit) {
+        // Keep the closing [SEP]: the encoder is bidirectional, so dropping
+        // it changes every row rather than only the tail.
+        ids.resize(limit);
+        ids.back() = separator;
+    }
+    const auto real = static_cast<std::int32_t>(ids.size());
+    std::vector<std::int32_t> mask(ids.size(), 1);
+    ids.resize(limit, config_.pad_token_id);
+    mask.resize(limit, 0);
+
+    Tensor input_ids;
+    input_ids.data = ids.data();
+    input_ids.shape = {config_.max_sequence_length};
+    input_ids.dtype = DType::kInt32;
+    Tensor attention_mask;
+    attention_mask.data = mask.data();
+    attention_mask.shape = {config_.max_sequence_length};
+    attention_mask.dtype = DType::kInt32;
+
+    auto outputs =
+        encoder_->forward({{"input_ids", input_ids}, {"attention_mask", attention_mask}});
+    const auto& rows = require_rows(outputs, config_.max_sequence_length, config_.hidden_size);
+    const auto* data = static_cast<const float*>(rows.data);
+
+    // Mean over the real rows only. The padded rows are masked out of the
+    // attention, so they carry no information, but they are not zero and
+    // averaging them in would still move the result.
+    const auto hidden = static_cast<std::size_t>(config_.hidden_size);
+    std::vector<double> total(hidden, 0.0);
+    for (std::int32_t row = 0; row < real; ++row) {
+        const auto* source = data + static_cast<std::size_t>(row) * hidden;
+        for (std::size_t column = 0; column < hidden; ++column)
+            total[column] += source[column];
+    }
+    std::vector<float> pooled(hidden);
+    for (std::size_t column = 0; column < hidden; ++column)
+        pooled[column] = static_cast<float>(total[column] / static_cast<double>(real));
+    return pooled;
+}
+
+internal::SemanticEmbeddingResult
+NomicBertPipeline::run(const internal::TextToEmbeddingRequest& request,
+                       internal::ConfigView config) {
+    if (!config.empty())
+        throw internal::ConfigError("nomic_bert has no runtime configuration");
     internal::SemanticEmbeddingResult result;
-    result.values.resize(768);
-    std::memcpy(result.values.data(), found->second.data, 768 * sizeof(float));
-    result.embedding_space = embedding_space_;
+    result.values = embed(request.text, request.role);
+    // Left empty on purpose. Two nomic-embed checkpoints share this family
+    // and do not share a space, and nothing in either checkpoint names the
+    // one it belongs to. A name here would claim their vectors can be
+    // compared with each other.
+    result.embedding_space = "";
     result.pooling = "mean";
-    result.normalization = "l2";
+    // The published module list for this checkpoint is Transformer then
+    // Pooling, with no Normalize step, so the vector is returned with its
+    // length intact and the caller normalises if it wants to.
+    result.normalization = "none";
     return result;
 }
 
-} // namespace trtmc::nomic_bert
+} // namespace trtmc

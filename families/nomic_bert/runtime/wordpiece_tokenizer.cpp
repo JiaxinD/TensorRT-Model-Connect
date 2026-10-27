@@ -16,8 +16,10 @@
 #include <unordered_set>
 #include <vector>
 
-namespace trtmc::nomic_bert {
+namespace trtmc {
 namespace {
+
+// ─── UTF-8 helpers ───
 
 inline char32_t utf8_to_char32(const std::string& s, size_t& pos) {
     unsigned char c = static_cast<unsigned char>(s[pos]);
@@ -176,8 +178,8 @@ inline bool is_cjk_char(char32_t cp) {
 inline bool is_mn_category(char32_t cp) {
     if (cp < 0x0300)
         return false;
-    const auto* begin = unicode_data::kNonspacingMarks;
-    const auto* end = begin + sizeof(unicode_data::kNonspacingMarks) / sizeof(*begin);
+    const auto* begin = nomic_bert::unicode_data::kNonspacingMarks;
+    const auto* end = begin + sizeof(nomic_bert::unicode_data::kNonspacingMarks) / sizeof(*begin);
     const auto* found = std::lower_bound(
         begin, end, cp, [](const auto& range, char32_t value) { return range.hi < value; });
     return found != end && found->lo <= cp;
@@ -196,8 +198,8 @@ inline void nfd_decompose(char32_t cp, std::vector<char32_t>& out) {
             out.push_back(0x11A7 + offset % 28);
         return;
     }
-    const auto* begin = unicode_data::kDecompositions;
-    const auto* end = begin + sizeof(unicode_data::kDecompositions) / sizeof(*begin);
+    const auto* begin = nomic_bert::unicode_data::kDecompositions;
+    const auto* end = begin + sizeof(nomic_bert::unicode_data::kDecompositions) / sizeof(*begin);
     const auto* found = std::lower_bound(
         begin, end, cp, [](const auto& entry, char32_t value) { return entry.composed < value; });
     if (found == end || found->composed != cp) {
@@ -212,8 +214,8 @@ inline void nfd_decompose(char32_t cp, std::vector<char32_t>& out) {
 inline char32_t to_lower(char32_t cp) {
     if (cp < 0x80)
         return cp >= 'A' && cp <= 'Z' ? cp + 32 : cp;
-    const auto* begin = unicode_data::kLowercase;
-    const auto* end = begin + sizeof(unicode_data::kLowercase) / sizeof(*begin);
+    const auto* begin = nomic_bert::unicode_data::kLowercase;
+    const auto* end = begin + sizeof(nomic_bert::unicode_data::kLowercase) / sizeof(*begin);
     const auto* found = std::lower_bound(
         begin, end, cp, [](const auto& entry, char32_t value) { return entry.upper < value; });
     return found != end && found->upper == cp ? found->lower : cp;
@@ -338,6 +340,8 @@ std::vector<std::string> bert_pre_tokenize(const std::string& text) {
     return tokens;
 }
 
+// ─── WordPieceTokenizer ───
+
 class WordPieceTokenizer final : public ITokenizer {
   public:
     static std::unique_ptr<WordPieceTokenizer> Create(const char* json_data, std::size_t json_size,
@@ -419,6 +423,8 @@ class WordPieceTokenizer final : public ITokenizer {
   private:
     WordPieceTokenizer() = default;
 
+    // ─── Greedy longest-match WordPiece encoding ───
+
     void encode_text(const std::string& text, std::vector<int32_t>& ids) const {
         auto words = bert_pre_tokenize(bert_normalize(text, mNormConfig));
         for (const auto& word : words)
@@ -429,6 +435,7 @@ class WordPieceTokenizer final : public ITokenizer {
         if (word.empty())
             return;
 
+        // Count UTF-8 codepoints for max_input_chars_per_word check
         size_t char_count = 0;
         {
             size_t p = 0;
@@ -462,6 +469,7 @@ class WordPieceTokenizer final : public ITokenizer {
                     break;
                 }
 
+                // Shrink by one UTF-8 codepoint from the end
                 end = shrink_utf8(word, start, end);
             }
 
@@ -474,9 +482,11 @@ class WordPieceTokenizer final : public ITokenizer {
         ids.insert(ids.end(), sub_ids.begin(), sub_ids.end());
     }
 
+    // Shrink end position by one UTF-8 codepoint
     static size_t shrink_utf8(const std::string& s, size_t start, size_t end) {
         if (end <= start)
             return start;
+        // Walk backwards to find the start of the last codepoint
         size_t pos = end - 1;
         while (pos > start && (static_cast<unsigned char>(s[pos]) & 0xC0) == 0x80) {
             --pos;
@@ -493,6 +503,8 @@ class WordPieceTokenizer final : public ITokenizer {
             result.push_back(mSepId);
         return result;
     }
+
+    // ─── JSON parsing ───
 
     void parse_tokenizer_json(const char* json_data, std::size_t json_size) {
         nlohmann::json j;
@@ -551,6 +563,7 @@ class WordPieceTokenizer final : public ITokenizer {
             return;
 
         if (norm_type == "Sequence") {
+            // Some models wrap normalizer in a Sequence
             parse_sequence_normalizer(norm);
             return;
         }
@@ -598,6 +611,7 @@ class WordPieceTokenizer final : public ITokenizer {
 
             if (tok.value("special", false)) {
                 mSpecialIds.insert(id);
+                // BERT's raw special tokens must bypass lowercasing and punctuation splitting.
                 if (id >= 0 && !content.empty() && !tok.value("normalized", false) &&
                     !tok.value("single_word", false))
                     mRawSpecialIds.push_back(id);
@@ -613,21 +627,25 @@ class WordPieceTokenizer final : public ITokenizer {
 
         mUnkId = find_id(mUnkToken);
 
+        // All special tokens (for general use)
         if (mUnkId >= 0)
             mSpecialIds.insert(mUnkId);
     }
 
+    // Extract ID from a post_processor cls/sep array: ["<token>", id]
     static int32_t extract_pp_id(const nlohmann::json& pp, const char* key) {
         if (pp.contains(key) && pp[key].is_array() && pp[key].size() >= 2)
             return pp[key][1].get<int32_t>();
         return -1;
     }
 
+    // Try to find CLS/SEP from post_processor (BERT, RoBERTa, Template styles)
     void parse_cls_sep_from_post_processor(const nlohmann::json& j) {
         if (!j.contains("post_processor") || j["post_processor"].is_null())
             return;
         auto& pp = j["post_processor"];
         std::string pp_type = pp.value("type", "");
+        // All known styles use the same cls/sep array format
         if (pp_type == "TemplateProcessing" || pp_type == "BertProcessing" ||
             pp_type == "RobertaProcessing") {
             mClsId = extract_pp_id(pp, "cls");
@@ -635,6 +653,7 @@ class WordPieceTokenizer final : public ITokenizer {
         }
     }
 
+    // Resolve remaining special token IDs and build skip sets
     void resolve_pad_mask_and_skip_sets() {
         auto find_id = [this](const std::string& a, const std::string& b) -> int32_t {
             auto it = mTokenToId.find(a);
@@ -666,6 +685,8 @@ class WordPieceTokenizer final : public ITokenizer {
         resolve_pad_mask_and_skip_sets();
     }
 
+    // ─── Data members ───
+
     std::vector<std::string> mIdToToken;
     std::unordered_map<std::string, int32_t> mTokenToId;
     std::unordered_set<int32_t> mSpecialIds;
@@ -694,4 +715,4 @@ std::unique_ptr<ITokenizer> CreateWordPieceTokenizer(const char* tokenizer_json_
     return WordPieceTokenizer::Create(tokenizer_json_data, tokenizer_json_size, add_special_tokens);
 }
 
-} // namespace trtmc::nomic_bert
+} // namespace trtmc

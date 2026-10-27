@@ -2,6 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
+
 #pragma once
 
 #include "families/nomic_bert/runtime/tokenizer.h"
@@ -9,25 +10,39 @@
 #include "trtmc/internal/model.h"
 #include "trtmc/runtime/trt_module.h"
 
-namespace trtmc::nomic_bert {
+#include <memory>
+#include <string>
+#include <vector>
 
-class Pipeline final : public internal::IModel, public internal::ITextToEmbedding {
-  public:
-    Pipeline(std::unique_ptr<ITrtModule> engine, std::unique_ptr<ITokenizer> tokenizer,
-             int32_t length, int32_t vocab_size, std::string embedding_space);
-    const char* task() const noexcept override { return "text_to_embedding"; }
-    std::vector<internal::TaskInstance> task_bindings() override {
-        return {internal::bind<internal::ITextToEmbedding>(*this)};
-    }
-    internal::SemanticEmbeddingResult run(const internal::TextToEmbeddingRequest&,
-                                          internal::ConfigView) override;
+namespace trtmc {
 
-  private:
-    std::unique_ptr<ITrtModule> engine_;
-    std::unique_ptr<ITokenizer> tokenizer_;
-    int32_t length_;
-    int32_t vocab_size_;
-    std::string embedding_space_;
+struct NomicBertRuntimeConfig {
+    std::int32_t max_sequence_length{512};
+    std::int32_t hidden_size{768};
+    std::int32_t pad_token_id{0};
 };
 
-} // namespace trtmc::nomic_bert
+// One encoder, one task. The engine returns the final rows and the pooling
+// happens here, because pooling needs to know how many of the padded rows
+// are real and the engine is built at a fixed length.
+class NomicBertPipeline final : public internal::IModel, public internal::ITextToEmbedding {
+  public:
+    NomicBertPipeline(std::unique_ptr<ITrtModule> encoder, std::shared_ptr<ITokenizer> tokenizer,
+                      NomicBertRuntimeConfig config, std::string primary_task);
+
+    const char* task() const noexcept override { return primary_task_.c_str(); }
+    std::vector<internal::TaskInstance> task_bindings() override;
+
+    internal::SemanticEmbeddingResult run(const internal::TextToEmbeddingRequest& request,
+                                          internal::ConfigView config) override;
+
+  private:
+    std::vector<float> embed(std::string_view text, internal::EmbeddingRole role);
+
+    std::unique_ptr<ITrtModule> encoder_;
+    std::shared_ptr<ITokenizer> tokenizer_;
+    NomicBertRuntimeConfig config_;
+    std::string primary_task_;
+};
+
+} // namespace trtmc

@@ -2,50 +2,67 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
+
 #include "families/nomic_bert/runtime/pipeline.h"
 #include "trtmc/runtime/family_factory.h"
 #include "trtmc/runtime/trt_backend.h"
 
 #include <nlohmann/json.hpp>
 #include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
+namespace trtmc::nomic_bert {
 namespace {
 
-std::vector<char> section(const trtmc::BundleReader& reader, const char* name) {
-    const auto* info = reader.find_section(name);
-    if (!info || !info->length)
-        throw std::runtime_error("missing Nomic bundle section: " + std::string(name));
-    return reader.read_section(name);
+std::vector<char> require_section(const BundleReader& bundle, const char* name) {
+    const auto* section = bundle.find_section(name);
+    if (section == nullptr || section->length == 0)
+        throw std::runtime_error("bundle section is missing or empty: " + std::string(name));
+    return bundle.read_section(name);
 }
 
-int32_t integer(const nlohmann::json& config, const char* name, int32_t low, int32_t high) {
-    const auto& value = config.at(name);
-    if (!value.is_number_integer())
-        throw std::invalid_argument("Nomic runtime field must be an integer: " + std::string(name));
-    const auto number = value.get<int64_t>();
-    if (number < low || number > high)
-        throw std::invalid_argument("invalid Nomic runtime field: " + std::string(name));
-    return static_cast<int32_t>(number);
+NomicBertRuntimeConfig parse_config(const std::vector<char>& data) {
+    const auto json = nlohmann::json::parse(data.begin(), data.end());
+    NomicBertRuntimeConfig config;
+    config.max_sequence_length = json.at("max_sequence_length").get<std::int32_t>();
+    config.hidden_size = json.at("hidden_size").get<std::int32_t>();
+    config.pad_token_id = json.at("pad_token_id").get<std::int32_t>();
+    if (config.max_sequence_length < 2 || config.hidden_size <= 0 || config.pad_token_id < 0)
+        throw std::runtime_error("nomic_bert runtime.json does not match its runtime contract");
+    return config;
+}
+
+std::string require_task(const BundleReader& bundle) {
+    const auto& task = bundle.info().task;
+    if (task != internal::ITextToEmbedding::kTask)
+        throw std::runtime_error("nomic_bert bundle declares an unsupported task: " + task);
+    return task;
 }
 
 } // namespace
+} // namespace trtmc::nomic_bert
 
 extern "C" trtmc::ITask* trtmc_create_family(const trtmc::FamilyContext& context) {
-    if (context.kv_cache_size_bytes)
+    if (context.kv_cache_size_bytes != 0)
         throw std::invalid_argument("nomic_bert does not support --kv-cache-size");
-    if (context.reader.info().task != "text_to_embedding")
-        throw std::invalid_argument("Nomic supports only text_to_embedding");
-    const auto data = section(context.reader, "runtime.json");
-    const auto config = nlohmann::json::parse(data.begin(), data.end());
-    const auto length = integer(config, "max_sequence_length", 2, 2048);
-    const auto vocab = integer(config, "vocab_size", 103, 1000000);
-    integer(config, "hidden_size", 768, 768);
-    const auto embedding_space = config.at("embedding_space").get<std::string>();
-    auto tokenizer_data = section(context.reader, "tokenizer.json");
-    auto tokenizer =
-        trtmc::nomic_bert::CreateWordPieceTokenizer(tokenizer_data.data(), tokenizer_data.size());
-    const auto plan = section(context.reader, "engine.plan");
-    auto engine = context.backend.create_module(plan.data(), plan.size(), {});
-    return new trtmc::nomic_bert::Pipeline(std::move(engine), std::move(tokenizer), length, vocab,
-                                           embedding_space);
+    const auto config_data = trtmc::nomic_bert::require_section(context.reader, "runtime.json");
+    const auto plan = trtmc::nomic_bert::require_section(context.reader, "model.plan");
+    const auto tokenizer_data =
+        trtmc::nomic_bert::require_section(context.reader, "tokenizer.json");
+
+    auto config = trtmc::nomic_bert::parse_config(config_data);
+    auto primary_task = trtmc::nomic_bert::require_task(context.reader);
+    auto tokenizer = trtmc::CreateWordPieceTokenizer(tokenizer_data.data(), tokenizer_data.size(),
+                                                     /*add_special_tokens=*/true);
+    if (!tokenizer)
+        throw std::runtime_error("nomic_bert tokenizer failed to load");
+    trtmc::ModuleCreateOptions options{};
+    auto encoder = context.backend.create_module(plan.data(), plan.size(), options);
+    if (!encoder || !encoder->ok())
+        throw std::runtime_error("nomic_bert engine failed to load");
+    return new trtmc::NomicBertPipeline(std::move(encoder),
+                                        std::shared_ptr<trtmc::ITokenizer>(std::move(tokenizer)),
+                                        std::move(config), std::move(primary_task));
 }

@@ -12,7 +12,7 @@
 #include <string_view>
 #include <vector>
 
-namespace trtmc::nomic_bert {
+namespace trtmc {
 
 class ITokenizer {
   public:
@@ -27,4 +27,4 @@ std::unique_ptr<ITokenizer> CreateWordPieceTokenizer(const char* tokenizer_json_
                                                      std::size_t tokenizer_json_size,
                                                      bool add_special_tokens = true);
 
-} // namespace trtmc::nomic_bert
+} // namespace trtmc
