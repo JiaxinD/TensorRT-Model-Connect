@@ -25,3 +25,5 @@ The existing FP32 TP1 and TP4 E2E cases retain their official CLS reference and
 cosine thresholds. They execute the CLI and public C/C++ consumers against the
 same bundle. Native CPU contracts cover bindings, masks, pooling, unsupported relevance rejection,
 invalid inputs and engine failures; CPU results do not establish GPU model parity.
+Set `TRTMC_NATIVE_BUILD_DIR` to the CMake build root containing both SDK consumers,
+including when `TRTMC_BINARY` points to a CLI installed from a wheel.

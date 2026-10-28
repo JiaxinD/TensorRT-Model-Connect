@@ -246,12 +246,13 @@ def _native(
     case: dict,
     tmp_path: Path,
 ):
+    native_build = _required_path(os.environ.get("TRTMC_NATIVE_BUILD_DIR"), "TRTMC_NATIVE_BUILD_DIR")
     cli = _run_json(
         binary, runtime_root, bundle, manifest, case, "encode", "--text", _case_text(case)
     )
     for language in ("c", "cpp"):
         consumer = _required_path(
-            str(binary.parent / f"test_modernbert_sdk_{language}"),
+            str(native_build / f"test_modernbert_sdk_{language}"),
             f"ModernBERT public {language} consumer",
         )
         result = _run_json(consumer, runtime_root, bundle, manifest, case, "", _case_text(case))
