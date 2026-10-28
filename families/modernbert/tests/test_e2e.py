@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 import numpy as np
 from tensorrt_model_connect import BuildRequest, build
+from families.modernbert.config import ModelConfig, resolve_attention_contract
 
 FAMILY = "modernbert"
 TASKS = frozenset({"text_to_pooled_features"})
@@ -267,8 +268,18 @@ def _official_reference(model_dir: Path, manifest: dict, case: dict, tmp_path: P
     from transformers import AutoModel, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+    encoded = tokenizer(_case_text(case), return_tensors="pt", truncation=False)
+    if case.get("exercise_local_window"):
+        contract = resolve_attention_contract(ModelConfig.from_dir(model_dir))
+        assert any(layer in {"sliding_attention", "local_attention"} for layer in contract.layer_types)
+        length = int(encoded["input_ids"].shape[-1])
+        assert length > 2 * contract.sliding_window + 1, (
+            "local-window E2E input must span both sides of the local window"
+        )
+        assert length <= manifest["max_sequence_length"], (
+            "local-window E2E input exceeds the native profile"
+        )
     device = torch.device("cuda")
-    encoded = tokenizer(_case_text(case), return_tensors="pt", truncation=True)
     model = (
         AutoModel.from_pretrained(
             model_dir, trust_remote_code=True, torch_dtype=_torch_dtype(case["reference_precision"])

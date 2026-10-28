@@ -404,7 +404,65 @@ PYTHONPATH=apps/aiperf_qual:apps/benchmark:core/builder:. \
   python -m trtmc_aiperf_qual endpoint-models --repo . --group embeddings
 ```
 
-Groups are `embeddings`, `reranking`, `transcription`, and `detection`.
+Groups are `embeddings`, `reranking`, `transcription`, `detection`, `vision`,
+`images`, and `image-edit`.
+The image group excludes legacy video profiles even when their Task string is
+`image_generation`.
+
+For an already-built image bundle that passed its owning family's unchanged
+correctness checks, use `image-profile` with the same environment file shown
+below. Inputs are AIPerf single-turn JSONL (`{"text":"a prompt"}`); catalog
+dimensions, steps, guidance and seed are applied explicitly. Per-row `extra`
+may carry supported controls or `initial_latents_b64` in the family's existing
+raw float32 layout for matched-noise replay.
+
+```bash
+PYTHONPATH=apps/aiperf_qual:apps/benchmark:apps/perf_serving:core/builder:. \
+  python -m trtmc_aiperf_qual image-profile \
+    --environment /path/to/local-environment.yaml \
+    --profile stable-diffusion-v1-5 --bundle /path/to/stable-diffusion-v1-5.bundle \
+    --inputs /path/to/image-prompts.jsonl --request-count 5 --warmup-request-count 1 \
+    --out /path/to/new-image-results
+```
+
+This uses pip-installed AIPerf `image_generation` through `trtmc-server`.
+It joins every client response and metric to its native request record, checks
+the complete decoded PNG against that invocation's native artifact SHA-256,
+and saves measured and warmup images separately by request identity in
+`images.json`. `summary.json` separates HTTP latency, Task time and images/sec.
+Transport identity does not replace the family's model-quality gate.
+The command checks the bundle's recorded checkpoint, revision and build controls
+against the selected existing profile, and retains the actual build provenance.
+Use a current-builder bundle with that provenance for qualification.
+See [Profile Image Generation with AIPerf](../../website/docs/user-guides/profile-images-with-aiperf.md)
+for the three-step interactive example.
+
+For one reference image plus instruction, use `image-edit-profile` instead:
+
+```bash
+PYTHONPATH=apps/aiperf_qual:apps/benchmark:apps/perf_serving:core/builder:. \
+  python -m trtmc_aiperf_qual image-edit-profile \
+    --environment /path/to/local-environment.yaml \
+    --profile qwen-image-edit-2511 --bundle /path/to/qwen-image-edit-2511.bundle \
+    --inputs /path/to/image-edits.jsonl --request-count 5 --warmup-request-count 1 \
+    --out /path/to/new-edit-results
+```
+
+Each JSONL row supplies `text`, one local `image` path (relative to the dataset
+file or absolute) or an embedded image data URL, and optional `extra` controls.
+The qualifier pins decoded RGB pixels in lossless PNG uploads, preserving the
+original source hash and avoiding AIPerf's lossy re-encoding of local JPEGs.
+It reuses the image-generation server/qualifier, with AIPerf `image_edit` and
+multipart `/v1/images/edits`. Each input image/instruction pair, native controls,
+replay noise and complete edited output is checked by request identity. Saved
+inputs accompany their outputs in `images.json`. Build geometry is recorded
+separately from actual conditioning and requested output geometry: an edit
+builder may use its image dimensions for the input. Checkpoint, Task, precision
+and other build provenance checks remain mandatory. Quality still requires the
+owning family's unchanged correctness criteria on the exact served bundle.
+See [Profile Image Editing with AIPerf](../../website/docs/user-guides/profile-image-edits-with-aiperf.md)
+for the three-step Qwen example.
+
 The inventory selects a normal full-model profile when one is available, with
 precision and parallel variants listed separately. Checkpoints without one
 remain explicit gaps. Discovery reports `unverified`; it does not claim
@@ -437,16 +495,40 @@ PYTHONPATH=apps/aiperf_qual:apps/benchmark:apps/perf_serving:core/builder:. \
     --out /path/to/new-result-directory
 ```
 
+The default client tokenizer uses the profile's pinned checkpoint revision.
+Use `--tokenizer /path/to/prepared-tokenizer` when its files live separately;
+`--tokenizer-revision` pins an explicitly selected Hugging Face tokenizer.
+Hub overrides require a full commit SHA. Local tokenizer directories are
+fingerprinted before and after profiling, including their file contents.
+Lance and Phi4 provide `families/<family>/tests/aiperf/prepare_tokenizer.py`
+to export their existing tokenizers into a standalone client directory.
+Source identity is captured after acquiring the GPU lock, including content
+fingerprints for tracked changes and untracked files. Generated run output is
+excluded. Changes to source, tokenizer, bundle or inputs between the snapshots
+preserve raw evidence and prevent a success summary.
+
 Use the existing sentence/ranking examples or prepared audio/image JSONL from
 the guides below. The command verifies every corpus input against native output,
 then checks all 55 complete responses from five warmups and 50 measured requests,
-including SHA-256 hashes of media bytes, complete vectors/transcripts/boxes,
+including SHA-256 hashes of media bytes, complete vectors/transcripts/boxes/answers,
 native class IDs or passage indices, and every request/timing join. Results
 separate HTTP latency from public Task time. Build/load/startup, native/HTTP verification and
 warmup are excluded from measured throughput. This transport verification is
 separate from the owning family's numerical/quality criteria. It establishes
 no capacity or performance regression gate. The client is AIPerf 0.13.0 from
 PyPI; an AIPerf source checkout is unnecessary.
+
+DeepSeek-OCR-2 preserves aspect ratio with mean-color padding in its existing
+768-pixel, 145-visual-token single-view profile. Rebuild older square-warping
+bundles with the current family runtime. Its unchanged owning reference uses
+1024-pixel crop-mode inference; record that different visual budget when
+interpreting conversion parity. This endpoint run measures the native Task
+and does not claim a reference-relative speedup.
+
+Native InternVL3 retains one 448-pixel, 256-visual-token view. Its unchanged
+owning reference may tile one image into multiple views. Record that visual
+budget difference alongside conversion parity; serving one original image
+does not establish identical internal view counts.
 
 ## Native endpoint pilot coverage
 
@@ -494,7 +576,8 @@ through AIPerf. This qualifies object detection; document/table layout remains p
 Use [Profile Embeddings with AIPerf](../../website/docs/user-guides/profile-embeddings-with-aiperf.md),
 [Profile Reranking with AIPerf](../../website/docs/user-guides/profile-reranking-with-aiperf.md),
 [Profile Transcription with AIPerf](../../website/docs/user-guides/profile-transcription-with-aiperf.md),
-or [Profile Object Detection with AIPerf](../../website/docs/user-guides/profile-detection-with-aiperf.md)
+[Profile Object Detection with AIPerf](../../website/docs/user-guides/profile-detection-with-aiperf.md),
+or [Profile Image Understanding with AIPerf](../../website/docs/user-guides/profile-vision-with-aiperf.md)
 for the short recipes. Native Task-call wall time stays separate from client
 HTTP latency; these small runs are integration examples, not performance gates.
 
@@ -585,3 +668,306 @@ wall ratio. Mismatched work is reported as noncomparable.
 The normal qualification commands keep the existing perf-serving service and
 its raw Task/observation protocol. `services.serving(service="trtmc-server")`
 is an explicit text candidate option; callers must use the public text endpoints.
+
+### Complete text-to-video clips
+
+Use the existing full `minimax-h3-768p`, `wan21-t2v-1.3b` or `wan22-ti2v-5b`
+profile after its unchanged family correctness case passes on the exact bundle.
+`endpoint-models --repo . --group videos` also reports partial/L0-only and
+distributed variants; inventory is not qualification. No new model specs are needed.
+
+```bash
+python -m trtmc_aiperf_qual video-profile \
+  --environment environment.yaml --profile wan21-t2v-1.3b \
+  --bundle /path/to/validated.bundle --inputs prompts.jsonl \
+  --out artifacts/wan21-video --request-count 2 --warmup-request-count 1
+```
+
+Each input row has `text` and optional `extra` controls, for example
+`{"text":"A cat sitting on a beach watching the sunset"}`. Geometry, steps, seed
+and declared guidance come from the existing profile; omitted guidance keeps
+the public Task's default. `extra.initial_latents_b64` can replay the original
+owner's raw float32 latents when its public Task supports them. Never substitute
+a smaller clip or different precision for the selected full profile.
+
+The environment needs FFmpeg/ffprobe with `libx264rgb`, the native server and
+PyPI AIPerf 0.13.0 plus this repository's qualification plugins. Optional
+`video_worker`, `video_port`, and `video_request_timeout` select the server
+executable, port and timeout. The opt-in `trtmc_video_capture` transport extends
+only AIPerf's actual download hook: normal submission, polling, and download stay
+with the published client. It preserves the exact returned bytes by job ID,
+because AIPerf deliberately excludes binary downloads from raw JSON exports.
+The qualifier checks every decoded RGB frame, frame order, dimensions, file
+hash, native completion, fixed request controls and request/metric identity.
+It saves complete clips and decoded frames; these can be compared against the
+original owning reference with its unchanged quality criteria.
+
+Client latency includes polling, download and capture-file writing. It is
+reported separately from native Task time, without subtracting estimated
+overhead. Encoding FPS is presentation metadata; it never changes built frames.
+The [three-step usage guide](../../website/docs/user-guides/profile-videos-with-aiperf.md)
+also works with plain `pip install aiperf==0.13.0`, without an AIPerf checkout
+or the optional capture transport.
+
+### Pinned real prompts
+
+Copy `config/text/environment.yaml` and
+`config/text/qwen3-0.6b-real-prompts.yaml`, then set their existing interpreter,
+server, runtime and bundle paths. Use the already-built `qwen3-0.6b-fp16`
+full profile; the runner invokes its unchanged owning-family checks against
+that exact bundle before profiling. Build instructions remain in the website's
+[Build a Bundle](../../website/docs/user-guides/build-a-bundle.md) guide.
+
+```bash
+python -m trtmc_aiperf_qual text-profile \
+  --environment environment.yaml --config qwen3-0.6b-real-prompts.yaml \
+  --out artifacts/qwen-real-prompts
+```
+
+The workload pins the ShareGPT file revision and checksum and the model's
+existing tokenizer revision. It selects the first twelve distinct, nonempty first-human
+turns whose original text plus sixteen output tokens fits the bundle's recorded
+context limit. Selection does not rewrite, truncate or pad text. `corpus.json`
+records every considered source index, selected string, tokenizer length and
+rejection reason; unexamined rows are counted separately. Counts use the pinned
+tokenizer without special tokens; native input-token counts remain unavailable.
+
+The published AIPerf `single_turn` loader sends `inputs.jsonl`, with twelve
+measured requests, one separately retained warmup, concurrency one and greedy
+sampling. Every selected prompt must appear in the measured phase.
+`run-000/corpus-verification.json` joins the original strings to actual wire
+payloads and the native-dispatch input/output hashes by request ID.
+Server records contain hashes and byte counts, without storing raw text.
+`report.json` keeps client latency/throughput and native Task-call timings
+separate. Build, loading and warmup are excluded from measured requests.
+A selection failure or changed/missing input/output fails verification and
+preserves its ledger and request artifacts. Family quality criteria are unchanged;
+this workload verifies transport and reports performance, without adding a new
+numerical accuracy gate.
+
+### Pinned conversations
+
+Use the same environment and already-built Qwen3-0.6B FP16 bundle with
+`config/text/qwen3-0.6b-conversations.yaml`:
+
+```bash
+python -m trtmc_aiperf_qual text-profile \
+  --environment environment.yaml --config qwen3-0.6b-conversations.yaml \
+  --out artifacts/qwen-conversations
+```
+
+The current Qwen family library implements the existing native
+`TextConversation` contract for supported ChatML templates. The server forwards
+typed roles and text; Qwen owns template rendering and tokenization. Existing
+single-turn generation and its correctness criteria remain unchanged. Rebuild
+the server/runtime libraries for history support; existing engine bundles can
+be reused. This profile uses nonstreaming chat; history streaming, tools and
+non-text messages are unsupported.
+
+The profile pins the same ShareGPT file and tokenizer as the single-turn
+example. It selects six distinct fitting human/assistant/human prefixes and
+sends their first two original human strings through AIPerf's existing
+`multi_turn` loader. AIPerf captures actual native answers for subsequent
+history (`deltas_without_responses`); source assistant answers are not replayed.
+The second turn has 50 ms of think time. Twelve measured requests cover both
+turns of all six conversations, with two separate warmup requests.
+
+`corpus.json` preserves source indices, original user strings, considered
+rejections, the selection budget and the exact delay policy. The run's
+`corpus-verification.json` checks roles/order, original text, retained actual
+assistant output, native dispatch hashes, and every measured turn by request
+and conversation identity. Actual wire histories are counted with the pinned
+tokenizer and checked against the bundle context plus requested output;
+native input-token counts remain unavailable. Configured and observed
+between-turn gaps are recorded separately, without claiming exact scheduler
+precision. `report.json` includes client and native Task-call timings for each
+turn as well as the full workload. Startup/build/load/warmup are excluded from
+measured requests. No TTFT/ITL or cross-request cache acceleration is claimed.
+
+### Pinned production trace
+
+Use the same environment and already-built Qwen3-0.6B FP16 bundle with
+`config/text/qwen3-0.6b-trace.yaml`:
+
+```bash
+python -m trtmc_aiperf_qual text-profile \
+  --environment environment.yaml --config qwen3-0.6b-trace.yaml \
+  --out artifacts/qwen-trace
+```
+
+The source is the CC-BY [Azure 2023 conversational inference trace](https://github.com/Azure/AzurePublicDataset/blob/790921015d50dd6aae7f7e47f39ba0e235ad6b08/AzureLLMInferenceDataset2023.md)
+from Patel et al., *Splitwise* (ISCA 2024). The configuration pins the CSV
+revision and checksum. Selection keeps the first twelve source rows with
+positive input/output targets whose sum plus a sixteen-token safety margin
+fits the existing bundle. `corpus.json` retains original rows, source indices,
+selection/rejection reasons and unexamined counts. Targets are never shortened.
+
+Source timestamps have no declared timezone. Preparation subtracts the earliest
+selected timestamp using decimal arithmetic, multiplies by `corpus.time_scale`
+(default `1`), then writes relative milliseconds for AIPerf's existing
+`mooncake_trace` loader and `--fixed-schedule`. There is no concurrency or
+request-rate override. Run each time scale separately with a fresh output
+directory. Scaling changes offered load; it is always recorded.
+
+This trace contains token lengths, not original prompts. AIPerf synthesizes
+input text. The verifier records its actual pinned-tokenizer length and checks
+the context bound without truncation. Original output lengths become native
+generation caps; EOS can produce fewer tokens, and actual native output counts
+remain visible. These token targets do not establish a numerical accuracy test.
+The unchanged owning-family checks run on the exact served bundle first.
+
+All twelve arrivals are measured, including the first request. There is no
+AIPerf warmup or implicit retry; full validation and server startup precede the
+trace window. One replica provides one execution lane. Overload can return
+`429`, which is retained as a rejection rather than silently dropped.
+`run-000/trace-accounting.json` accounts for completed, rejected and failed
+requests by source/request identity, checks input/output hashes and generation
+caps, and reports offered/achieved rates. It checks relative scheduler credit
+offsets against the recorded `arrival_tolerance_ms` (default 100 ms); actual
+HTTP send offsets are reported separately. This tolerance describes replay
+timing, without changing model correctness criteria. Startup jitter and client
+scheduling can affect send timing; submillisecond replay accuracy is not claimed.
+
+The ordinary AIPerf exports retain client timing and replay metrics.
+`report.json` separately reports server admission and `public_task_call_wall`
+timing for completed requests. A profile needs native completions, full request
+accounting and no unexpected failures. Rejected requests and their client
+errors remain visible. Nonstreaming trace replay provides no TTFT/ITL samples.
+
+### Controlled shared prefixes
+
+Use `config/text/qwen3-0.6b-shared-prefix.yaml` with the same environment and
+existing full Qwen bundle. Keep exactly one workload case per invocation.
+Run each configuration separately so it starts its own server process.
+First leave `workload.warmup_requests: 0`:
+
+```bash
+python -m trtmc_aiperf_qual text-profile \
+  --environment environment.yaml --config qwen3-0.6b-shared-prefix.yaml \
+  --out artifacts/qwen-prefix-fresh
+```
+
+Copy the configuration, change only `workload.warmup_requests` to `12`, and
+run it again with `--out artifacts/qwen-prefix-warm`. Each invocation starts a
+new server process and runs unchanged family correctness on its exact bundle.
+Both runs measure the same twelve prompts, concurrency one and sixteen-token
+generation caps. The second run first sends twelve separate warmup requests
+from that same corpus. Startup, validation and warmup are excluded from the
+measured request metrics. This is a process-warmup comparison; the fresh run
+can still benefit from shared host/system caches.
+
+The layout consists of one literal prefix and twelve distinct suffixes.
+`corpus.json` retains each complete original concatenation, UTF-8 hash, actual
+pinned-tokenizer length, shared token-prefix length and overlap fraction.
+Overlap is counted on complete prompt token IDs, so tokenization at the
+prefix/suffix boundary is included. Any over-limit prompt fails selection
+with a rejection ledger; prompts are never shortened. AIPerf's existing
+`single_turn` loader sends these exact strings. The verification report checks
+every measured prompt, native input/output hashes and fresh/warm phase counts.
+
+The qualified Qwen implementation clears generation state in
+`reset_generation_context` before each request. It exposes no cross-request
+prefix-cache control or cache-hit telemetry. `cache_audit` records this manual
+source audit, its source-file hash and repository revision, separately from
+observations. Per-generation KV state does not establish reuse across requests.
+Cache-hit telemetry is explicitly unavailable. Latency/throughput differences
+in `report.json` are descriptive; neither common input text nor a faster warm
+run proves a cache hit. No cache implementation or model spec is added.
+
+### Stateless Responses
+
+Use `config/text/qwen3-0.6b-responses.yaml` with the same environment and
+already-built full Qwen3-0.6B FP16 bundle:
+
+```bash
+python -m trtmc_aiperf_qual text-profile \
+  --environment environment.yaml --config qwen3-0.6b-responses.yaml \
+  --out artifacts/qwen-responses
+```
+
+The existing server accepts nonstreaming `/v1/responses` with one input string
+or one user message containing string/`input_text` parts, plus optional string
+`instructions`. It maps these onto the same public native generation Task,
+admission, limits, errors and timing records as text generation. Model-specific
+chat formatting stays in the family. One successful native Task call produces
+one typed assistant `message` with `output_text` content, `resp_`/`msg_` IDs and
+completed status. Native EOS-versus-cap termination metadata is unavailable.
+Input/total token usage is unavailable, so `usage` is null; actual native output
+counts remain in the server records. AIPerf uses its default client tokenizer
+estimates. Do not request `--use-server-token-count`.
+
+This subset is stateless: `store` defaults to false. Storage, response-ID
+continuation, tools, history, media, structured reasoning, and streaming are
+explicit errors. No Responses events or TTFT/ITL are advertised. Generation
+uses `max_output_tokens` (at least 16) and the existing supported sampling
+controls. The reference perf-serving server does not expose this endpoint, so
+the optional matched reference-performance comparison is rejected for Responses;
+the unchanged family correctness prerequisite still runs.
+
+The pilot selects the first six fitting original prompts from the same pinned
+ShareGPT source/tokenizer as the single-turn corpus. Published AIPerf's existing
+`responses` endpoint and `single_turn` loader send six measured requests plus one
+separate warmup, concurrency one, greedy sampling, a sixteen-token cap and
+`store:false`. `corpus-verification.json` checks original text and native hashes;
+`responses-verification.json` additionally checks the typed response, model,
+unique request/response identities, output, native generation cap and Task timing.
+Failures preserve a verdict and the raw/joined request records. `report.json`
+keeps client end-to-end metrics separate from native `public_task_call_wall`.
+
+### SpecBench ordinary-generation baseline
+
+Use `config/text/qwen3-0.6b-specbench.yaml` with the same environment and
+already-built full Qwen3-0.6B FP16 bundle:
+
+```bash
+python -m trtmc_aiperf_qual text-profile \
+  --environment environment.yaml --config qwen3-0.6b-specbench.yaml \
+  --out artifacts/qwen-specbench
+```
+
+The configuration pins [Spec-Bench](https://github.com/hemingkx/Spec-Bench/tree/fd2c1cd7d2201ef71db4c5f4e455008f017967bf),
+Xia et al. (ACL 2024 Findings), at revision
+`fd2c1cd7d2201ef71db4c5f4e455008f017967bf`, the same source revision used by the
+tested AIPerf public loader. The upstream repository carries an Apache-2.0
+license. The JSONL checksum is recorded in the configuration. Selection keeps
+the first twelve distinct fitting original first-turn strings in source file
+order. `corpus.json` records question IDs, categories, original text/hashes,
+tokenizer lengths, rejected inputs and unexamined counts. There is no trimming,
+rewriting or truncation. This small context-bounded selection does not qualify
+the entire source corpus or a SpecBench quality score.
+
+Preparation materializes these exact strings for AIPerf's existing `single_turn`
+loader. The public SpecBench loader ordinarily downloads the full corpus and
+strips strings; the materialized selection keeps the existing 256-token bundle
+limit and original text explicit. No AIPerf source checkout or loader fork is
+required. The pilot runs twelve measured completions plus one separate warmup,
+concurrency one, greedy sampling and sixteen-token generation caps. Its unchanged
+owning-family checks run on the exact served bundle first.
+Use one output-token cap per profile; run separate configurations to compare caps
+so the recorded and native generation work remain aligned.
+
+This is **ordinary native generation**. The pilot does not configure or qualify
+a draft model, speculative orchestration or acceptance counters. `corpus.json`,
+the request verification report and `report.json` state `ordinary_native_generation`
+and retain a separate manual runtime audit with source-file/revision hashes.
+Speculative execution is unqualified and acceptance metrics are unavailable.
+The verifier checks exact source/wire/native input and output identity, generation
+caps and native Task timing. Client timing and `public_task_call_wall` remain
+separate; build/load/startup/warmup are excluded. A corpus name is not evidence
+of speculative acceleration. No draft/target model, model spec, or speculative
+runtime is added.
+
+### Text workload pilot coverage
+
+These workload configurations use the existing Qwen3-0.6B full FP16 profile.
+Hardware qualification evidence covers GB300; other families/targets are not
+implied by this pilot table. All clients use the published AIPerf package.
+
+| Workload | Native HTTP endpoint | Qualified workload scope | Capability limit |
+| --- | --- | --- | --- |
+| Real prompts | `completions` | Twelve original pinned ShareGPT prompts | Selected subset; ordinary generation |
+| Conversations | `chat/completions` | Six two-turn conversations, live answers and think time | Nonstreaming native text history |
+| Production arrivals | `completions` | Twelve eligible Azure rows; original and scaled arrivals | Length-only source; synthesized prompts; rejections retained |
+| Shared prefixes | `completions` | Literal prefix/suffix corpus, fresh/warm process comparison | Cross-request cache-hit telemetry unavailable |
+| Responses | `responses` | Six original prompts, stateless typed text responses | No storage, history, tools or streaming |
+| SpecBench corpus | `completions` | Twelve fitting original first turns | Ordinary generation only; speculative execution and acceptance metrics unqualified |

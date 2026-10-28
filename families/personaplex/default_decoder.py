@@ -279,13 +279,11 @@ def build_standard_decoder_engine(
             interleaved=interleaved_rope,
         )
         cos_half_tensor = graph_ops.add_constant(
-            network, cos_half_np.shape, cos_half_np, dtype=work_np_dtype
+            network, cos_half_np.shape, cos_half_np, dtype=np.float32
         )
-        cos_half_tensor = _cast_work_dtype(cos_half_tensor)
         sin_half_tensor = graph_ops.add_constant(
-            network, sin_half_np.shape, sin_half_np, dtype=work_np_dtype
+            network, sin_half_np.shape, sin_half_np, dtype=np.float32
         )
-        sin_half_tensor = _cast_work_dtype(sin_half_tensor)
     elif position_type == "learned":
         pos_embed_np = weights["position_embedding"]
         position_embed_table = const_in_work_dtype(
@@ -305,8 +303,9 @@ def build_standard_decoder_engine(
             dtype=np.float32,
         )
 
+    # RMSNorm computes in FP32; 1e-8 would underflow if stored as FP16 first.
     eps_tensor = graph_ops.add_constant(
-        network, (1, 1), np.array([config.rms_norm_eps], dtype=work_np_dtype), dtype=work_np_dtype
+        network, (1, 1), np.array([config.rms_norm_eps], dtype=np.float32), dtype=np.float32
     )
     attn_scale = (1.0 / np.sqrt(max(head_dim, 1))) if scale_attn_weights else 1.0
     # ---------------------------------------------------------------
@@ -667,10 +666,10 @@ def _add_decoder_layer(
         else:
             norm2 = attn["normed"]
     else:
-        residual1 = network.add_elementwise(hidden, attn_out, trt.ElementWiseOperation.SUM)
+        residual1 = graph_ops.add_residual_sum(network, hidden, attn_out)
         norm2 = _apply_norm(
             network,
-            residual1.get_output(0),
+            residual1,
             hidden_size,
             weights[f"{prefix}.post_attn_norm"],
             weights.get(f"{prefix}.post_attn_norm_beta"),
@@ -709,19 +708,15 @@ def _add_decoder_layer(
 
     # Final residual connection
     if parallel_residual:
-        sum_attn = network.add_elementwise(hidden, attn_out, trt.ElementWiseOperation.SUM)
-        residual2 = network.add_elementwise(
-            sum_attn.get_output(0), mlp_out, trt.ElementWiseOperation.SUM
-        )
-        post_attn_tensor = sum_attn.get_output(0)
+        sum_attn = graph_ops.add_residual_sum(network, hidden, attn_out)
+        residual2 = graph_ops.add_residual_sum(network, sum_attn, mlp_out)
+        post_attn_tensor = sum_attn
     else:
-        residual2 = network.add_elementwise(
-            residual1.get_output(0), mlp_out, trt.ElementWiseOperation.SUM
-        )
-        post_attn_tensor = residual1.get_output(0)
+        residual2 = graph_ops.add_residual_sum(network, residual1, mlp_out)
+        post_attn_tensor = residual1
 
     return {
-        "hidden": residual2.get_output(0),
+        "hidden": residual2,
         "post_attn": post_attn_tensor,
         "present_k": present_k,
         "present_v": present_v,

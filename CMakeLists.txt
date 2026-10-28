@@ -404,6 +404,7 @@ if(TRTMC_BUILD_SERVER)
     PRIVATE ${PROJECT_SOURCE_DIR}/core/runtime/include
   )
   target_link_libraries(trtmc_server
+    PRIVATE trtmc_core
     PUBLIC trtmc_runtime trtmc_c
     PRIVATE
       trtmc_media_io
@@ -552,6 +553,35 @@ if(TRTMC_BUILD_TESTS)
     target_compile_options(test_server_detection_worker PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME server_detection_worker COMMAND test_server_detection_worker)
     set_tests_properties(server_detection_worker PROPERTIES LABELS cpu)
+    add_executable(test_server_vision_worker apps/server/tests/test_vision_worker.cpp)
+    target_include_directories(test_server_vision_worker PRIVATE
+      ${PROJECT_SOURCE_DIR}/core/runtime/include ${PROJECT_SOURCE_DIR}/apps)
+    target_link_libraries(test_server_vision_worker PRIVATE trtmc_server trtmc_media_io nlohmann_json::nlohmann_json)
+    target_compile_options(test_server_vision_worker PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME server_vision_worker COMMAND test_server_vision_worker)
+    set_tests_properties(server_vision_worker PROPERTIES LABELS cpu)
+
+    add_executable(test_server_image_worker apps/server/tests/test_image_worker.cpp)
+    target_include_directories(test_server_image_worker PRIVATE
+      "${PROJECT_SOURCE_DIR}/apps" "${PROJECT_SOURCE_DIR}/apps/cli")
+    target_link_libraries(test_server_image_worker PRIVATE trtmc_server trtmc_media_io nlohmann_json::nlohmann_json)
+    target_compile_options(test_server_image_worker PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME server_image_worker COMMAND test_server_image_worker)
+    set_tests_properties(server_image_worker PROPERTIES LABELS cpu)
+    add_executable(test_server_video_worker apps/server/tests/test_video_worker.cpp)
+    target_include_directories(test_server_video_worker PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/apps" "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    target_link_libraries(test_server_video_worker PRIVATE trtmc_server trtmc_media_io nlohmann_json::nlohmann_json)
+    target_compile_options(test_server_video_worker PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME server_video_worker COMMAND test_server_video_worker)
+    set_tests_properties(server_video_worker PROPERTIES LABELS cpu)
+    add_executable(test_server_image_edit_worker apps/server/tests/test_image_edit_worker.cpp)
+    target_include_directories(test_server_image_edit_worker PRIVATE
+      ${PROJECT_SOURCE_DIR}/apps ${PROJECT_SOURCE_DIR}/core/runtime/include)
+    target_link_libraries(test_server_image_edit_worker PRIVATE trtmc_server trtmc_media_io nlohmann_json::nlohmann_json)
+    target_compile_options(test_server_image_edit_worker PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME server_image_edit_worker COMMAND test_server_image_edit_worker)
+    set_tests_properties(server_image_edit_worker PROPERTIES LABELS cpu)
   endif()
 
   add_library(trtmc_test_cli_fixture SHARED apps/cli/tests/test_family_cli.cpp)
@@ -725,6 +755,8 @@ if(TRTMC_BUILD_TESTS)
     add_dependencies(test_server_sdk_worker trtmc-server trtmc_api_test_backend
       trtmc_api_test_family trtmc_api_test_text_family trtmc_api_test_stream_family
       trtmc_api_test_audio_family trtmc_api_test_image_boxes_family)
+    add_dependencies(test_server_sdk_worker trtmc_api_test_language_family)
+    add_dependencies(test_server_sdk_worker trtmc_api_test_image_family)
     add_test(NAME server_sdk_worker
       COMMAND test_server_sdk_worker "${_trtmc_api_test_runtime_root}")
     add_test(NAME server_sdk_worker_process

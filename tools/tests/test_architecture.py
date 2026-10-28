@@ -549,6 +549,7 @@ def test_shared_python_and_native_trees_are_closed_minimal_sets() -> None:
         "tools/tests/test_new_ci.py",
         "tools/tests/test_model_benchmark.py",
         "tools/tests/test_pr_metadata.py",
+        "tools/tests/test_process_github_files.py",
         "tools/tests/test_public_source_hygiene.py",
     }
     expected_cmake = {
@@ -1516,17 +1517,22 @@ def test_family_tp_runtimes_load_nccl_only_for_collective_communicators() -> Non
             if 'getenv("RANK")' in source:
                 violations.append(f"{path.relative_to(REPO)}:RANK")
             loads_nccl = 'dlopen("libnccl.so.2"' in source
-            initializes_nccl = "ncclCommInitRank" in source
+            initializes_nccl = "ncclCommInitRank" in source or "ncclCommInitAll" in source
             if loads_nccl and not initializes_nccl:
                 violations.append(f"{path.relative_to(REPO)}:NCCL-without-communicator")
             if initializes_nccl:
                 communicator_implementations += 1
-                for token in (
-                    '"OMPI_COMM_WORLD_SIZE"',
-                    '"OMPI_COMM_WORLD_RANK"',
-                    '"OMPI_COMM_WORLD_LOCAL_RANK"',
-                    'dlopen("libnccl.so.2"',
-                ):
+                tokens = ['dlopen("libnccl.so.2"']
+                # Single-process ncclCommInitAll does not need MPI rank discovery.
+                if "ncclCommInitRank" in source:
+                    tokens.extend(
+                        (
+                            '"OMPI_COMM_WORLD_SIZE"',
+                            '"OMPI_COMM_WORLD_RANK"',
+                            '"OMPI_COMM_WORLD_LOCAL_RANK"',
+                        )
+                    )
+                for token in tokens:
                     if token not in source:
                         violations.append(f"{path.relative_to(REPO)}:missing:{token}")
 
@@ -1537,7 +1543,7 @@ def test_family_tp_runtimes_load_nccl_only_for_collective_communicators() -> Non
             if "tests" not in path.relative_to(family).parts
         )
         builds_collectives = "add_dist_collective" in build_source
-        initializes_nccl = "ncclCommInitRank" in runtime
+        initializes_nccl = "ncclCommInitRank" in runtime or "ncclCommInitAll" in runtime
         passes_communicator = "distributed_communicator" in runtime
         if builds_collectives != initializes_nccl or builds_collectives != passes_communicator:
             violations.append(f"{family.name}:collective-runtime-mismatch")
