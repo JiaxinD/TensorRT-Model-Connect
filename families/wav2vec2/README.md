@@ -18,7 +18,9 @@ The builder reads only single-file `model.safetensors`. For an older official
 python -m families.wav2vec2.convert_checkpoint MODEL_DIR/pytorch_model.bin MODEL_DIR/model.safetensors
 ```
 
-Conversion requires the family's PyTorch dependency, uses `weights_only=True`,
+Conversion requires PyTorch 2.10.0 or newer, including the
+[restricted-loading security fix](https://github.com/pytorch/pytorch/security/advisories/GHSA-63cw-57p8-fm3p).
+It uses `weights_only=True`,
 validates a nonempty tensor dictionary and refuses to overwrite its destination.
 It preserves tensor names and dtypes. The direct E2E performs this preparation
 in a temporary directory without modifying the cached official checkpoint.
