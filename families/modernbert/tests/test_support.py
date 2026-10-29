@@ -38,6 +38,22 @@ class Writer:
 
 @pytest.fixture
 def builder(tmp_path, monkeypatch):
+    # Note (Jiaxin Deng): Fresh imports must leave neither cached modules nor package attributes.
+    for module_name in (
+        "families.modernbert.model",
+        "families.modernbert.parallel",
+        "families.modernbert.graph.model",
+    ):
+        package_name, _, attribute = module_name.rpartition(".")
+        package = importlib.import_module(package_name)
+        previous = getattr(package, attribute, None)
+        monkeypatch.setattr(package, attribute, previous, raising=False)
+        if previous is None:
+            monkeypatch.delattr(package, attribute)
+        previous = sys.modules.get(module_name)
+        monkeypatch.setitem(sys.modules, module_name, previous)
+        if previous is None:
+            monkeypatch.delitem(sys.modules, module_name)
     monkeypatch.setitem(sys.modules, "tensorrt", SimpleNamespace())
     model = importlib.import_module("families.modernbert.model")
     config = dict(
