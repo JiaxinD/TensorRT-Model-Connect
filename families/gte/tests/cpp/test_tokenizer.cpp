@@ -21,7 +21,10 @@
 #include "families/gte/runtime/tokenizer.h"
 
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
 
@@ -50,9 +53,26 @@ void expect(bool condition, const char* name) {
     }
 }
 
+void check_unicode_normalization() {
+    const auto path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                      "fixtures/unicode_tokenizer.json";
+    std::ifstream input(path);
+    const auto fixture = nlohmann::json::parse(input);
+    auto definition = fixture.at("tokenizer");
+    for (const auto& sample : fixture.at("cases")) {
+        definition["normalizer"] = sample.at("normalizer");
+        const auto data = definition.dump();
+        auto tokenizer = trtmc::CreateWordPieceTokenizer(data.data(), data.size(), true);
+        const auto text = sample.at("input").get<std::string>();
+        const auto expected = sample.at("ids").get<std::vector<std::int32_t>>();
+        check(tokenizer->encode(text), expected, text.c_str());
+    }
+}
+
 } // namespace
 
 int main() {
+    check_unicode_normalization();
     // The real vocabulary is 30522 entries; this is the slice the checks
     // below need, with the same normalizer and post-processor the checkpoint
     // ships. The ids are renumbered to run from zero because the loader

@@ -4,6 +4,7 @@
  */
 
 #include "families/gte/runtime/tokenizer.h"
+#include "families/gte/runtime/unicode_data.h"
 
 #include <algorithm>
 #include <cassert>
@@ -85,10 +86,20 @@ inline bool in_ranges(char32_t cp, const UnicodeRange* ranges, size_t count) {
     return false;
 }
 
+constexpr UnicodeRange kOtherControlRanges[] = {
+    {0x00AD, 0x00AD},   {0x0600, 0x0605},   {0x061C, 0x061C},   {0x06DD, 0x06DD},
+    {0x070F, 0x070F},   {0x180E, 0x180E},   {0x200B, 0x200F},   {0x202A, 0x202E},
+    {0x2060, 0x2064},   {0x2066, 0x206F},   {0xE000, 0xF8FF},   {0xFEFF, 0xFEFF},
+    {0xFFF9, 0xFFFB},   {0x110BD, 0x110BD}, {0x1BCA0, 0x1BCA3}, {0x1D173, 0x1D17A},
+    {0xE0001, 0xE0001}, {0xE0020, 0xE007F}, {0xF0000, 0xFFFFD}, {0x100000, 0x10FFFD},
+};
+
 inline bool is_control_char(char32_t cp) {
     if (cp == '\t' || cp == '\n' || cp == '\r')
         return false;
-    return (cp <= 0x1F) || (cp >= 0x7F && cp <= 0x9F);
+    return (cp <= 0x1F) || (cp >= 0x7F && cp <= 0x9F) ||
+           in_ranges(cp, kOtherControlRanges,
+                     sizeof(kOtherControlRanges) / sizeof(kOtherControlRanges[0]));
 }
 
 constexpr UnicodeRange kWhitespaceRanges[] = {
@@ -102,19 +113,59 @@ inline bool is_whitespace(char32_t cp) {
                      sizeof(kWhitespaceRanges) / sizeof(kWhitespaceRanges[0]));
 }
 
+// Note (Jiaxin Deng): Whole blocks split non-punctuation letters and symbols.
 constexpr UnicodeRange kPunctuationRanges[] = {
-    {33, 47},         {58, 64},         {91, 96},         {123, 126}, // ASCII punctuation
-    {0x2000, 0x206F},                                                 // General Punctuation
-    {0x3000, 0x303F},                                                 // CJK Symbols and Punctuation
-    {0xFE30, 0xFE4F},                                                 // CJK Compatibility Forms
-    {0xFE50, 0xFE6F},                                                 // Small Form Variants
-    {0xFF00, 0xFF0F},                                                 // Fullwidth
-    {0xFF1A, 0xFF20}, {0xFF3B, 0xFF40}, {0xFF5B, 0xFF65},
+    {0x0021, 0x002F},   {0x003A, 0x0040},   {0x005B, 0x0060},   {0x007B, 0x007E},
+    {0x00A1, 0x00A1},   {0x00A7, 0x00A7},   {0x00AB, 0x00AB},   {0x00B6, 0x00B7},
+    {0x00BB, 0x00BB},   {0x00BF, 0x00BF},   {0x037E, 0x037E},   {0x0387, 0x0387},
+    {0x055A, 0x055F},   {0x0589, 0x058A},   {0x05BE, 0x05BE},   {0x05C0, 0x05C0},
+    {0x05C3, 0x05C3},   {0x05C6, 0x05C6},   {0x05F3, 0x05F4},   {0x0609, 0x060A},
+    {0x060C, 0x060D},   {0x061B, 0x061B},   {0x061E, 0x061F},   {0x066A, 0x066D},
+    {0x06D4, 0x06D4},   {0x0700, 0x070D},   {0x07F7, 0x07F9},   {0x0830, 0x083E},
+    {0x085E, 0x085E},   {0x0964, 0x0965},   {0x0970, 0x0970},   {0x0AF0, 0x0AF0},
+    {0x0DF4, 0x0DF4},   {0x0E4F, 0x0E4F},   {0x0E5A, 0x0E5B},   {0x0F04, 0x0F12},
+    {0x0F14, 0x0F14},   {0x0F3A, 0x0F3D},   {0x0F85, 0x0F85},   {0x0FD0, 0x0FD4},
+    {0x0FD9, 0x0FDA},   {0x104A, 0x104F},   {0x10FB, 0x10FB},   {0x1360, 0x1368},
+    {0x1400, 0x1400},   {0x166D, 0x166E},   {0x169B, 0x169C},   {0x16EB, 0x16ED},
+    {0x1735, 0x1736},   {0x17D4, 0x17D6},   {0x17D8, 0x17DA},   {0x1800, 0x180A},
+    {0x1944, 0x1945},   {0x1A1E, 0x1A1F},   {0x1AA0, 0x1AA6},   {0x1AA8, 0x1AAD},
+    {0x1B5A, 0x1B60},   {0x1BFC, 0x1BFF},   {0x1C3B, 0x1C3F},   {0x1C7E, 0x1C7F},
+    {0x1CC0, 0x1CC7},   {0x1CD3, 0x1CD3},   {0x2010, 0x2027},   {0x2030, 0x2043},
+    {0x2045, 0x2051},   {0x2053, 0x205E},   {0x207D, 0x207E},   {0x208D, 0x208E},
+    {0x2308, 0x230B},   {0x2329, 0x232A},   {0x2768, 0x2775},   {0x27C5, 0x27C6},
+    {0x27E6, 0x27EF},   {0x2983, 0x2998},   {0x29D8, 0x29DB},   {0x29FC, 0x29FD},
+    {0x2CF9, 0x2CFC},   {0x2CFE, 0x2CFF},   {0x2D70, 0x2D70},   {0x2E00, 0x2E2E},
+    {0x2E30, 0x2E42},   {0x3001, 0x3003},   {0x3008, 0x3011},   {0x3014, 0x301F},
+    {0x3030, 0x3030},   {0x303D, 0x303D},   {0x30A0, 0x30A0},   {0x30FB, 0x30FB},
+    {0xA4FE, 0xA4FF},   {0xA60D, 0xA60F},   {0xA673, 0xA673},   {0xA67E, 0xA67E},
+    {0xA6F2, 0xA6F7},   {0xA874, 0xA877},   {0xA8CE, 0xA8CF},   {0xA8F8, 0xA8FA},
+    {0xA8FC, 0xA8FC},   {0xA92E, 0xA92F},   {0xA95F, 0xA95F},   {0xA9C1, 0xA9CD},
+    {0xA9DE, 0xA9DF},   {0xAA5C, 0xAA5F},   {0xAADE, 0xAADF},   {0xAAF0, 0xAAF1},
+    {0xABEB, 0xABEB},   {0xFD3E, 0xFD3F},   {0xFE10, 0xFE19},   {0xFE30, 0xFE52},
+    {0xFE54, 0xFE61},   {0xFE63, 0xFE63},   {0xFE68, 0xFE68},   {0xFE6A, 0xFE6B},
+    {0xFF01, 0xFF03},   {0xFF05, 0xFF0A},   {0xFF0C, 0xFF0F},   {0xFF1A, 0xFF1B},
+    {0xFF1F, 0xFF20},   {0xFF3B, 0xFF3D},   {0xFF3F, 0xFF3F},   {0xFF5B, 0xFF5B},
+    {0xFF5D, 0xFF5D},   {0xFF5F, 0xFF65},   {0x10100, 0x10102}, {0x1039F, 0x1039F},
+    {0x103D0, 0x103D0}, {0x1056F, 0x1056F}, {0x10857, 0x10857}, {0x1091F, 0x1091F},
+    {0x1093F, 0x1093F}, {0x10A50, 0x10A58}, {0x10A7F, 0x10A7F}, {0x10AF0, 0x10AF6},
+    {0x10B39, 0x10B3F}, {0x10B99, 0x10B9C}, {0x11047, 0x1104D}, {0x110BB, 0x110BC},
+    {0x110BE, 0x110C1}, {0x11140, 0x11143}, {0x11174, 0x11175}, {0x111C5, 0x111C9},
+    {0x111CD, 0x111CD}, {0x111DB, 0x111DB}, {0x111DD, 0x111DF}, {0x11238, 0x1123D},
+    {0x112A9, 0x112A9}, {0x114C6, 0x114C6}, {0x115C1, 0x115D7}, {0x11641, 0x11643},
+    {0x1173C, 0x1173E}, {0x12470, 0x12474}, {0x16A6E, 0x16A6F}, {0x16AF5, 0x16AF5},
+    {0x16B37, 0x16B3B}, {0x16B44, 0x16B44}, {0x1BC9F, 0x1BC9F}, {0x1DA87, 0x1DA8B},
 };
 
 inline bool is_punctuation(char32_t cp) {
-    return in_ranges(cp, kPunctuationRanges,
-                     sizeof(kPunctuationRanges) / sizeof(kPunctuationRanges[0]));
+    if (cp < 0x80)
+        return (cp >= 33 && cp <= 47) || (cp >= 58 && cp <= 64) || (cp >= 91 && cp <= 96) ||
+               (cp >= 123 && cp <= 126);
+    const auto* end =
+        kPunctuationRanges + sizeof(kPunctuationRanges) / sizeof(kPunctuationRanges[0]);
+    const auto* found = std::lower_bound(
+        kPunctuationRanges, end, cp,
+        [](const UnicodeRange& range, char32_t value) { return range.hi < value; });
+    return found != end && found->lo <= cp;
 }
 
 constexpr UnicodeRange kCjkRanges[] = {
@@ -126,66 +177,51 @@ inline bool is_cjk_char(char32_t cp) {
     return in_ranges(cp, kCjkRanges, sizeof(kCjkRanges) / sizeof(kCjkRanges[0]));
 }
 
-constexpr UnicodeRange kMnRanges[] = {
-    {0x0300, 0x036F}, // Combining Diacritical Marks
-    {0x1AB0, 0x1AFF}, // Extended
-    {0x1DC0, 0x1DFF}, // Supplement
-    {0x20D0, 0x20FF}, // For Symbols
-    {0xFE20, 0xFE2F}, // Combining Half Marks
-};
-
 inline bool is_mn_category(char32_t cp) {
-    return in_ranges(cp, kMnRanges, sizeof(kMnRanges) / sizeof(kMnRanges[0]));
+    if (cp < 0x0300)
+        return false;
+    const auto* begin = gte::unicode_data::kNonspacingMarks;
+    const auto* end = begin + sizeof(gte::unicode_data::kNonspacingMarks) / sizeof(*begin);
+    const auto* found = std::lower_bound(
+        begin, end, cp, [](const auto& range, char32_t value) { return range.hi < value; });
+    return found != end && found->lo <= cp;
 }
 
-// Simple NFD decomposition for common accented Latin characters
 inline void nfd_decompose(char32_t cp, std::vector<char32_t>& out) {
-    // Pre-composed Latin letters → base + combining mark
-    // This covers the most common accented characters
-    struct Decomposition {
-        char32_t composed;
-        char32_t base;
-        char32_t mark;
-    };
-    static const Decomposition kDecomps[] = {
-        {0xC0, 'A', 0x0300}, {0xC1, 'A', 0x0301}, {0xC2, 'A', 0x0302}, {0xC3, 'A', 0x0303},
-        {0xC4, 'A', 0x0308}, {0xC5, 'A', 0x030A}, {0xC7, 'C', 0x0327}, {0xC8, 'E', 0x0300},
-        {0xC9, 'E', 0x0301}, {0xCA, 'E', 0x0302}, {0xCB, 'E', 0x0308}, {0xCC, 'I', 0x0300},
-        {0xCD, 'I', 0x0301}, {0xCE, 'I', 0x0302}, {0xCF, 'I', 0x0308}, {0xD1, 'N', 0x0303},
-        {0xD2, 'O', 0x0300}, {0xD3, 'O', 0x0301}, {0xD4, 'O', 0x0302}, {0xD5, 'O', 0x0303},
-        {0xD6, 'O', 0x0308}, {0xD9, 'U', 0x0300}, {0xDA, 'U', 0x0301}, {0xDB, 'U', 0x0302},
-        {0xDC, 'U', 0x0308}, {0xDD, 'Y', 0x0301}, {0xE0, 'a', 0x0300}, {0xE1, 'a', 0x0301},
-        {0xE2, 'a', 0x0302}, {0xE3, 'a', 0x0303}, {0xE4, 'a', 0x0308}, {0xE5, 'a', 0x030A},
-        {0xE7, 'c', 0x0327}, {0xE8, 'e', 0x0300}, {0xE9, 'e', 0x0301}, {0xEA, 'e', 0x0302},
-        {0xEB, 'e', 0x0308}, {0xEC, 'i', 0x0300}, {0xED, 'i', 0x0301}, {0xEE, 'i', 0x0302},
-        {0xEF, 'i', 0x0308}, {0xF1, 'n', 0x0303}, {0xF2, 'o', 0x0300}, {0xF3, 'o', 0x0301},
-        {0xF4, 'o', 0x0302}, {0xF5, 'o', 0x0303}, {0xF6, 'o', 0x0308}, {0xF9, 'u', 0x0300},
-        {0xFA, 'u', 0x0301}, {0xFB, 'u', 0x0302}, {0xFC, 'u', 0x0308}, {0xFD, 'y', 0x0301},
-        {0xFF, 'y', 0x0308},
-    };
-    for (const auto& d : kDecomps) {
-        if (cp == d.composed) {
-            out.push_back(d.base);
-            out.push_back(d.mark);
-            return;
-        }
+    if (cp < 0x00C0) {
+        out.push_back(cp);
+        return;
     }
-    out.push_back(cp);
+    if (cp >= 0xAC00 && cp <= 0xD7A3) {
+        const auto offset = cp - 0xAC00;
+        out.push_back(0x1100 + offset / 588);
+        out.push_back(0x1161 + (offset % 588) / 28);
+        if (offset % 28 != 0)
+            out.push_back(0x11A7 + offset % 28);
+        return;
+    }
+    const auto* begin = gte::unicode_data::kDecompositions;
+    const auto* end = begin + sizeof(gte::unicode_data::kDecompositions) / sizeof(*begin);
+    const auto* found = std::lower_bound(
+        begin, end, cp, [](const auto& entry, char32_t value) { return entry.composed < value; });
+    if (found == end || found->composed != cp) {
+        out.push_back(cp);
+        return;
+    }
+    nfd_decompose(found->first, out);
+    if (found->second != 0)
+        nfd_decompose(found->second, out);
 }
 
-// Simple ASCII lowercase (handles A-Z only; full Unicode tolower is complex)
 inline char32_t to_lower(char32_t cp) {
-    if (cp >= 'A' && cp <= 'Z')
-        return cp + 32;
-    // Latin-1 Supplement uppercase
-    if (cp >= 0xC0 && cp <= 0xD6)
-        return cp + 32;
-    if (cp >= 0xD8 && cp <= 0xDE)
-        return cp + 32;
-    return cp;
+    if (cp < 0x80)
+        return cp >= 'A' && cp <= 'Z' ? cp + 32 : cp;
+    const auto* begin = gte::unicode_data::kLowercase;
+    const auto* end = begin + sizeof(gte::unicode_data::kLowercase) / sizeof(*begin);
+    const auto* found = std::lower_bound(
+        begin, end, cp, [](const auto& entry, char32_t value) { return entry.upper < value; });
+    return found != end && found->upper == cp ? found->lower : cp;
 }
-
-// ─── BertNormalizer ───
 
 struct BertNormalizerConfig {
     bool clean_text = true;
@@ -232,24 +268,41 @@ std::string bert_lowercase(const std::string& text) {
     size_t pos = 0;
     while (pos < text.size()) {
         char32_t cp = utf8_to_char32(text, pos);
-        result += char32_to_utf8(to_lower(cp));
+        if (cp == 0x0130)
+            result += "i\xcc\x87";
+        else
+            result += char32_to_utf8(to_lower(cp));
     }
     return result;
 }
 
 std::string bert_strip_accents(const std::string& text) {
-    // NFD decompose, then remove Mn category characters
-    std::string result;
+    std::vector<char32_t> decomposed;
     size_t pos = 0;
     while (pos < text.size()) {
         char32_t cp = utf8_to_char32(text, pos);
-        std::vector<char32_t> decomposed;
         nfd_decompose(cp, decomposed);
-        for (char32_t dcp : decomposed) {
-            if (!is_mn_category(dcp)) {
-                result += char32_to_utf8(dcp);
-            }
+    }
+    const auto combining_class = [](char32_t cp) {
+        const auto* begin = gte::unicode_data::kCombiningClasses;
+        const auto* end = begin + sizeof(gte::unicode_data::kCombiningClasses) / sizeof(*begin);
+        const auto* found = std::lower_bound(
+            begin, end, cp, [](const auto& entry, char32_t value) { return entry.hi < value; });
+        return found != end && found->lo <= cp ? found->value : 0;
+    };
+    size_t segment_begin = 0;
+    for (size_t i = 0; i <= decomposed.size(); ++i) {
+        if (i == decomposed.size() || combining_class(decomposed[i]) == 0) {
+            std::stable_sort(
+                decomposed.begin() + segment_begin, decomposed.begin() + i,
+                [&](char32_t a, char32_t b) { return combining_class(a) < combining_class(b); });
+            segment_begin = i + 1;
         }
+    }
+    std::string result;
+    for (char32_t cp : decomposed) {
+        if (!is_mn_category(cp))
+            result += char32_to_utf8(cp);
     }
     return result;
 }
@@ -260,17 +313,13 @@ std::string bert_normalize(const std::string& text, const BertNormalizerConfig& 
         result = bert_clean_text(result);
     if (cfg.handle_chinese_chars)
         result = bert_handle_chinese(result);
-    if (cfg.lowercase)
-        result = bert_lowercase(result);
-    // strip_accents: if explicitly set, use that; otherwise strip when lowercase is true
     bool do_strip = cfg.strip_accents_set ? cfg.strip_accents_flag : cfg.lowercase;
     if (do_strip)
         result = bert_strip_accents(result);
+    if (cfg.lowercase)
+        result = bert_lowercase(result);
     return result;
 }
-
-// ─── BertPreTokenizer ───
-// Splits on whitespace and punctuation. Each punctuation char becomes its own token.
 
 std::vector<std::string> bert_pre_tokenize(const std::string& text) {
     std::vector<std::string> tokens;
