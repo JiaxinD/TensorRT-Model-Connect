@@ -467,6 +467,31 @@ def test_preflight_reports_missing_paths_and_interpreters(tmp_path):
     assert preflight.check_paths(environment)["worker"] == "missing key"
 
 
+@pytest.mark.parametrize("convolution, expected", [
+    ((0, "92300\n", ""), "ok (cuDNN 92300)"),
+    ((1, "", "RuntimeError: cudnn_status: CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH"), "convolution failed"),
+])
+def test_doctor_runs_one_cudnn_convolution_in_the_serving_interpreter(tmp_path, monkeypatch, convolution, expected):
+    from trtmc_aiperf_qual import preflight
+
+    fingerprint = {"fingerprint": {"gpu_arch": "sm110", "packages": {"torch": "2.12.0"}}}
+
+    def run(command, env, **_kwargs):
+        if command[1:3] == ["-m", "trtmc_perf_serving"]:
+            return subprocess.CompletedProcess(command, 0, json.dumps(fingerprint), "")
+        if command[-1] == preflight.CONVOLUTION_PROBE:
+            # The servers' interpreter and environment, serve_env included: the check is about those.
+            assert command[0] == "serve-python" and env["LD_PRELOAD"] == "/opt/cudnn/libcudnn.so.9"
+            return subprocess.CompletedProcess(command, *convolution)
+        return subprocess.CompletedProcess(command, 0, "[]", "")  # every serving package imports
+
+    monkeypatch.setattr(preflight.subprocess, "run", run)
+    checks = preflight.check_serving(Environment({"repo": str(tmp_path), "serve_python": "serve-python",
+                                                  "serve_env": {"LD_PRELOAD": "/opt/cudnn/libcudnn.so.9"}}))
+    assert checks["cudnn"].startswith(expected) and convolution[2][-40:] in checks["cudnn"]
+    assert preflight.problems(checks) == ([] if expected.startswith("ok") else ["cudnn"])
+
+
 def test_summary_fetches_remote_result_roots_over_ssh(tmp_path):
     fake_ssh = tmp_path / "fake-ssh"
     fake_ssh.write_text('#!/usr/bin/env bash\n# fake-ssh HOST COMMAND: run COMMAND locally\nexec bash -c "$2"\n')
