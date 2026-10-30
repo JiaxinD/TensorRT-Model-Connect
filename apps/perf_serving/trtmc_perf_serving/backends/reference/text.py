@@ -60,6 +60,18 @@ def _language_controls(tokenizer: Any, request: Mapping[str, Any]) -> tuple[dict
     return ({"forced_bos_token_id": target_id} if target_id is not None else {}), manual
 
 
+def _without_appended_eos(inputs: Any, tokenizer: Any, prompt: str) -> Any:
+    """A causal LM's plain prompt without the end-of-sequence token its tokenizer appends (OLMo, XGLM): the model
+    continues the prompt instead of starting a new document. An encoder's input keeps it."""
+    eos = tokenizer.eos_token_id
+    ids = inputs["input_ids"]
+    if eos is None or ids.shape[1] < 2 or int(ids[0, -1]) != eos or prompt.endswith(str(tokenizer.eos_token)):
+        return inputs
+    for key in list(inputs.keys()):
+        inputs[key] = inputs[key][:, :-1]
+    return inputs
+
+
 def _place_source_language(inputs: Mapping[str, torch.Tensor], token_id: int | None, tokenizer: Any) -> None:
     if token_id is None:
         return
@@ -85,7 +97,9 @@ class TextGeneration:
         config = transformers.AutoConfig.from_pretrained(spec.model, **spec.pretrained_kwargs())
         kwargs = spec.model_kwargs()
         if hasattr(config, "vision_config"):
-            self.processor = transformers.AutoProcessor.from_pretrained(spec.model, **spec.pretrained_kwargs())
+            # processor_kwargs (for example max_pixels) must match the candidate's declared image budget.
+            self.processor = transformers.AutoProcessor.from_pretrained(
+                spec.model, **spec.pretrained_kwargs(), **dict(spec.options.get("processor_kwargs", {})))
             self.tokenizer = self.processor.tokenizer
             model_cls = transformers.AutoModelForImageTextToText
         else:
@@ -94,7 +108,8 @@ class TextGeneration:
             model_cls = (transformers.AutoModelForSeq2SeqLM if config.is_encoder_decoder
                          else transformers.AutoModelForCausalLM)
         self.encoder_decoder = bool(config.is_encoder_decoder)
-        self.model = maybe_compile(model_cls.from_pretrained(spec.model, **kwargs).to(spec.device).eval(), spec)
+        self.model = maybe_compile(model_cls.from_pretrained(spec.model, **kwargs, device_map=spec.device_map).eval(),
+                                   spec)
         # The strong compiled baseline for causal LMs: a static KV cache (fixed shapes the compiled
         # forward reuses); models that cannot use one fall back to the dynamic cache.
         self.static_cache = spec.mode == "compile" and not self.encoder_decoder and self.processor is None
@@ -117,7 +132,8 @@ class TextGeneration:
             return self.tokenizer.apply_chat_template(
                 [{"role": "user", "content": prompt}], add_generation_prompt=True, return_tensors="pt",
                 return_dict=True, enable_thinking=bool(request.get("enable_thinking", False)))
-        return self.tokenizer(prompt, return_tensors="pt")
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        return inputs if self.encoder_decoder else _without_appended_eos(inputs, self.tokenizer, prompt)
 
     def invoke(self, request: Mapping[str, Any], artifact_base: Path) -> Invocation:
         language, manual_source = (_language_controls(self.tokenizer, request) if self.encoder_decoder
@@ -196,8 +212,8 @@ class TextEncoder:
         if config.model_type == "dpr" and config.architectures:
             # AutoModel maps every DPR checkpoint to the question encoder; use the declared encoder.
             model_cls = getattr(transformers, config.architectures[0])
-        model = model_cls.from_pretrained(spec.model, **spec.model_kwargs())
-        self.model = maybe_compile(model.to(spec.device).eval(), spec)
+        model = model_cls.from_pretrained(spec.model, **spec.model_kwargs(), device_map=spec.device_map)
+        self.model = maybe_compile(model.eval(), spec)
         # Remote-code embedding models may return a causal-LM output; they need hidden states requested.
         self.forward_kwargs: dict[str, Any] = {}
         # Longer inputs are cut at the model's position limit (an overflow is a device-side assert that
@@ -245,7 +261,7 @@ class Reranker:
         self.processor = transformers.AutoProcessor.from_pretrained(
             spec.model, **kwargs, **dict(spec.options.get("processor_kwargs", {})))
         self.model = maybe_compile(transformers.AutoModelForSequenceClassification.from_pretrained(
-            spec.model, **spec.model_kwargs()).to(spec.device).eval(), spec)
+            spec.model, **spec.model_kwargs(), device_map=spec.device_map).eval(), spec)
 
     def invoke(self, request: Mapping[str, Any], artifact_base: Path) -> Invocation:
         query = str(required(request, "query"))

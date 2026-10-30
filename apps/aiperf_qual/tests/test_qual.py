@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -193,7 +194,7 @@ REPOSITORY = __import__("pathlib").Path(__file__).resolve().parents[3]
 ])
 def test_verdict_categories(accuracy, lights, category):
     result = {"accuracy": [{"suite": "s", **item} for item in accuracy],
-              "performance_l1": [{"reference_mode": mode, "light": light} for mode, light in lights.items()]}
+              "performance": [{"reference_mode": mode, "light": light} for mode, light in lights.items()]}
     assert judge.verdict(result, expected_suites=["s"], expected_modes=1)["category"] == category
 
 
@@ -237,8 +238,8 @@ def test_models_are_derived_from_the_catalog_and_task_defaults():
     assert qwen["accuracy_source"] == "absolute"
     assert [(item["suite"], item["endpoint"]) for item in qwen["absolute"]] == [("mmlu-0shot", "chat")]
     assert qwen["candidate"]["bundle"] == "qwen3-0.6b-fp16/qwen3-0.6b-fp16.bundle" and not qwen["candidate"]["build"]
-    assert qwen["performance"]["l1"]["suite"]["source"] == {"kind": "catalog_testcase", "profile": "qwen3-0.6b-fp16"}
-    assert qwen["performance"]["l1"]["reference_modes"] == ["eager"] and "l2" not in qwen["performance"]
+    assert qwen["performance"]["suite"]["source"] == {"kind": "catalog_testcase", "profile": "qwen3-0.6b-fp16"}
+    assert qwen["performance"]["reference_modes"] == ["eager"] and "service_metrics" not in qwen["performance"]
     small = resolve_model("falcon-rw-1b", environment)  # MMLU is near chance: LAMBADA
     assert [item["suite"] for item in small["absolute"]] == ["lambada"] and small["candidate"]["max_sequence_length"] == 256
     detr = resolve_model("detr-resnet-50", environment)
@@ -263,7 +264,13 @@ def test_models_are_derived_from_the_catalog_and_task_defaults():
             resolve_model("mixtral-stories-15m", environment, root=root)
     random = resolve_model("qwen3-moe-tiny-random", environment)  # random weights: Perf only
     assert random["accuracy_source"] == "none" and not random["absolute"] and "random" in random["accuracy_note"]
-    assert random["performance"]["l1"]["suite"]["source"]["kind"] == "catalog_testcase"
+    assert random["performance"]["suite"]["source"]["kind"] == "catalog_testcase"
+    tiny = resolve_model("deepseek-v2-tiny", environment)
+    assert tiny["accuracy_source"] == "absolute" and [item["suite"] for item in tiny["absolute"]] == ["mmlu-0shot"]
+    assert tiny["candidate"]["max_sequence_length"] == 512
+    fnet = resolve_model("fnet-base", environment)
+    assert fnet["reference"]["adapter"] == "families/fnet/reference/adapter.py"
+    assert fnet["reference"]["options"]["max_sequence_length"] == fnet["candidate"]["max_sequence_length"]
     world = resolve_model("sana-wm-bidirectional", environment)  # the family's own native adapter
     assert world["reference"]["backend"] == "reference" and world["reference"]["adapter"].startswith("families/sana_wm/")
     with tempfile.TemporaryDirectory() as directory:  # without it no generic adapter serves a world model
@@ -334,13 +341,13 @@ def test_answer_line_accepts_identical_tokens_with_different_rendering():
 def test_perf_output_check_falls_back_to_the_eager_reference():
     from trtmc_aiperf_qual.runner import output_check
 
-    l1 = {"output_grader": "parity_token_exact"}
+    policy = {"output_grader": "parity_token_exact"}
     candidate = {"token_ids": [1, 2, 3]}
     references = {"eager": {"token_ids": [1, 2, 3]}, "compile": {"token_ids": [1, 9, 9]}}
-    match, reason = output_check(l1, candidate, references, "compile")
+    match, reason = output_check(policy, candidate, references, "compile")
     assert match and "eager reference" in reason
-    assert not output_check(l1, candidate, {"eager": {"token_ids": [7]}, "compile": {"token_ids": [8]}}, "compile")[0]
-    assert not output_check(l1, candidate, {"eager": {"token_ids": [7]}}, "eager")[0]
+    assert not output_check(policy, candidate, {"eager": {"token_ids": [7]}, "compile": {"token_ids": [8]}}, "compile")[0]
+    assert not output_check(policy, candidate, {"eager": {"token_ids": [7]}}, "eager")[0]
 
 
 def test_perf_only_models_have_conversion_parity_as_their_accuracy():
@@ -354,7 +361,7 @@ def test_perf_only_models_have_conversion_parity_as_their_accuracy():
             {"reference_mode": "compile", "request": "catalog", "light": "n/a", "output_check": {}}]
     [entry] = conversion_parity(perf)
     assert (entry["status"], entry["samples"], entry["passed"]) == ("fail", 2, 1)
-    result = {"accuracy_source": "none", "accuracy": [entry], "performance_l1": perf}
+    result = {"accuracy_source": "none", "accuracy": [entry], "performance": perf}
     assert judge.verdict(result, expected_suites=[CONVERSION_PARITY], expected_modes=2)["category"] == "acc-issue"
     assert conversion_parity([]) == []  # nothing compared: missing_results reports it
 
@@ -365,25 +372,25 @@ def test_a_task_without_an_accuracy_scheme_stays_an_error():
     model = {"accuracy_source": "missing", "task": "image_features", "absolute": [], "supplementary": []}
     [entry] = missing_results(model, [], {})
     assert entry["suite"] == "accuracy-scheme" and entry["status"] == "error" and "image_features" in entry["error"]
-    result = {"accuracy": [entry], "performance_l1": [{"reference_mode": "eager", "light": "green"}]}
+    result = {"accuracy": [entry], "performance": [{"reference_mode": "eager", "light": "green"}]}
     assert judge.verdict(result, expected_suites=list(expected_suites(model)), expected_modes=1)["category"] == "error"
 
 
 def test_perf_only_models_and_informational_entries():
     perf = [{"reference_mode": "eager", "light": "green"}]
-    perf_only = judge.verdict({"accuracy_source": "none", "accuracy": [], "performance_l1": perf},
+    perf_only = judge.verdict({"accuracy_source": "none", "accuracy": [], "performance": perf},
                               expected_suites=[], expected_modes=1)
     assert (perf_only["acc"], perf_only["category"]) == ("n/a", "pass")
     # Informational entries (pixel parity, a retired check) are reported, never judged.
     informational = judge.verdict({"accuracy": [{"suite": "geneval", "status": "pass"},
                                                 {"suite": "replay-parity", "status": "fail", "informational": True}],
-                                   "performance_l1": perf}, expected_suites=["geneval"], expected_modes=1)
+                                   "performance": perf}, expected_suites=["geneval"], expected_modes=1)
     assert (informational["acc"], informational["category"]) == ("pass", "pass")
 
 
 def test_errors_in_a_suite_make_the_accuracy_an_error():
     verdict = judge.verdict({"accuracy": [{"suite": "a", "status": "pass"}, {"suite": "b", "status": "error"}],
-                             "performance_l1": [{"reference_mode": "eager", "light": "green"}]},
+                             "performance": [{"reference_mode": "eager", "light": "green"}]},
                             expected_suites=["a", "b"], expected_modes=1)
     assert (verdict["acc"], verdict["category"]) == ("error", "error")
 
@@ -398,10 +405,10 @@ def test_sampled_perf_requests_compare_generated_length():
     from trtmc_aiperf_qual.runner import output_check, sampled_request
 
     assert sampled_request({"temperature": 0.7, "top_k": 50}) and not sampled_request({"temperature": 1.0, "top_k": 1})
-    l1 = {"output_grader": "parity_token_exact"}
+    policy = {"output_grader": "parity_token_exact"}
     refs = {"eager": {"token_ids": [5, 6, 7]}}
-    assert output_check(l1, {"token_ids": [1, 2, 3]}, refs, "eager", sampled=True)[0]
-    assert not output_check(l1, {"token_ids": [1, 2]}, refs, "eager", sampled=True)[0]
+    assert output_check(policy, {"token_ids": [1, 2, 3]}, refs, "eager", sampled=True)[0]
+    assert not output_check(policy, {"token_ids": [1, 2]}, refs, "eager", sampled=True)[0]
 
 
 def test_requests_with_top_k_one_are_greedy():
@@ -415,7 +422,8 @@ def test_requests_with_top_k_one_are_greedy():
 def _environment(tmp_path=None):
     from trtmc_aiperf_qual.config import Environment
 
-    return Environment({"repo": str(REPOSITORY), **({"data_root": str(tmp_path)} if tmp_path else {})})
+    return Environment({"repo": str(REPOSITORY),
+                        **({"data_root": str(tmp_path), "media_root": str(tmp_path / "media")} if tmp_path else {})})
 
 
 def _manifest(path, text):
@@ -444,7 +452,9 @@ def test_tsv_manifests_and_nested_file_fields(tmp_path):
                                     "records": "samples", "file_fields": ["media.0.path"]},
                          "fields": {"media.0.path": "image_path", "question": "prompt"}}, _environment(tmp_path))
     request = suite.samples[0]["request"]
-    assert request["prompt"] == "What text?" and request["image_path"]["$file"]["suffix"] == ".jpg"
+    assert request["prompt"] == "What text?"
+    # The image is kept once in the media store; the request names it by digest.
+    assert request["image_path"] == {"$file": {"suffix": ".jpg", "sha256": hashlib.sha256(b"jpg").hexdigest()}}
 
 
 def test_etth1_windows_follow_the_declared_window(tmp_path):
@@ -496,7 +506,30 @@ def test_quantized_candidates_get_the_benchmarks_quantization_gate():
     fp8 = resolve_model("qwen3-0.6b-fp8", _environment())
     assert fp8["candidate"]["quantization"] == "fp8"
     assert [(item["suite"], item["gate"]) for item in fp8["absolute"]] == [
-        ("mmlu-0shot", {"margin": 2.0, "min_native": 30.0})]
+        ("mmlu-0shot", {"margin": 2.0})]
+
+
+def test_stable_diffusion_uses_explicit_controls_on_its_actual_request(tmp_path):
+    import sys
+
+    from trtmc_aiperf_qual.config import Environment
+    from trtmc_aiperf_qual.models import resolve_model
+    from trtmc_aiperf_qual.suites import build_suite, unstated_defaults
+
+    environment = Environment({**_environment().values, "serve_python": sys.executable, "data_root": str(tmp_path)})
+    model = resolve_model("stable-diffusion-v1-5", environment)
+    suite = build_suite(model["performance"]["suite"], environment)
+    request = suite.samples[0]["request"]
+    assert request["num_steps"] == 10 and request["cfg_scale"] == request["guidance_scale"] == 7.5
+    assert not unstated_defaults(request)
+
+
+def test_rwkv_qualification_build_and_selection_use_the_same_capacity():
+    from trtmc_aiperf_qual.models import resolve_model
+
+    model = resolve_model("rwkv-169m", _environment())
+    assert model["candidate"]["build"]["max_sequence_length"] == model["candidate"]["max_sequence_length"] == 256
+    assert model["candidate"]["bundle"].startswith("rwkv-169m-qual/")
 
 
 def test_timing_reference_precision_can_differ_from_the_candidate_precision():
@@ -514,7 +547,7 @@ def test_always_sampling_tts_models_compare_duration_in_perf():
     for profile in ("bark-small", "bark-large", "magpie-tts-357m"):
         model = resolve_model(profile, _environment())
         assert [check["check"] for check in model["supplementary"]] == ["tts_intelligibility"]
-        assert model["performance"]["l1"]["output_grader_params"]["max_log_spectral_distance"] > 100
+        assert model["performance"]["output_grader_params"]["max_log_spectral_distance"] > 100
 
 
 def test_a_missing_mandatory_result_is_an_error_even_when_other_checks_add_rows():
@@ -530,9 +563,9 @@ def test_a_missing_mandatory_result_is_an_error_even_when_other_checks_add_rows(
     assert [(m["suite"], m["status"]) for m in missing] == [("mmlu-0shot", "error")]
     assert "startup failed" in missing[0]["error"]
     lights = [{"reference_mode": "eager", "light": "green"}]
-    assert judge.verdict({"accuracy": produced, "performance_l1": lights}, expected_suites=list(expected_suites(model)),
+    assert judge.verdict({"accuracy": produced, "performance": lights}, expected_suites=list(expected_suites(model)),
                          expected_modes=1)["category"] == "error"
-    assert judge.verdict({"accuracy": produced + missing, "performance_l1": lights},
+    assert judge.verdict({"accuracy": produced + missing, "performance": lights},
                          expected_suites=list(expected_suites(model)), expected_modes=1)["acc"] == "error"
     other = {**model, "family": "minimax"}  # no caller latents (and not a GenEval family): neither expected
     assert set(expected_suites(other)) == {"mmlu-0shot"}
@@ -562,7 +595,7 @@ def test_incomplete_perf_runs_and_missing_exports_are_errors_not_lights():
     late = judge.judge_performance({**fast, "exit_note": "AIPerf exited 1 after all requests succeeded"}, slow, **common)
     assert late["light"] == "green" and "exited 1" in late["notes"][0]
     result = {"accuracy": [{"suite": "s", "status": "pass"}],
-              "performance_l1": [{"reference_mode": "eager", "light": broken["light"]}]}
+              "performance": [{"reference_mode": "eager", "light": broken["light"]}]}
     assert judge.verdict(result, expected_suites=["s"], expected_modes=1)["category"] == "error"
 
 
@@ -607,9 +640,9 @@ def test_a_side_settles_on_its_request_before_the_first_timed_run(tmp_path, monk
     assert events == [("run", "run_01"), ("run", "run_02")] and "settle_requests" not in stats
 
     tasks = yaml.safe_load((Path(__file__).parents[1] / "config" / "tasks.yaml").read_text())
-    assert tasks["defaults"]["performance"]["l1"]["measurement"]["settle_s"] == 10
-    slow = [entry["performance"]["l1"]["measurement"] for entry in tasks["tasks"].values()
-            if "measurement" in ((entry.get("performance") or {}).get("l1") or {})]
+    assert tasks["defaults"]["performance"]["measurement"]["settle_s"] == 10
+    slow = [entry["performance"]["measurement"] for entry in tasks["tasks"].values()
+            if "measurement" in (entry.get("performance") or {})]
     assert slow and all(item["settle_s"] == 0 for item in slow) and LARGE_MODEL_MEASUREMENT["settle_s"] == 0
 
 
@@ -624,11 +657,11 @@ def test_a_large_checkpoint_takes_its_class_and_keeps_the_profile_measurement(tm
     shutil.copytree(Path(__file__).parents[1] / "config", root)
     environment = Environment({"repo": str(REPOSITORY)})
     monkeypatch.setattr(models, "checkpoint_bytes", lambda *args: 17 * 2**30)
-    measurement = lambda: models.resolve_model("albert-base", environment, root)["performance"]["l1"]["measurement"]  # noqa: E731
+    measurement = lambda: models.resolve_model("albert-base", environment, root)["performance"]["measurement"]  # noqa: E731
     assert measurement() == models.LARGE_MODEL_MEASUREMENT
-    (root / "models" / "albert-base.yaml").write_text("performance: {l1: {measurement: {settle_s: 20}}}\n")
+    (root / "models" / "albert-base.yaml").write_text("performance: {measurement: {settle_s: 20}}\n")
     assert measurement() == {**models.LARGE_MODEL_MEASUREMENT, "settle_s": 20}
-    (root / "models" / "albert-base.yaml").write_text("performance: {l1: {measurement: {requests: 3}}}\n")
+    (root / "models" / "albert-base.yaml").write_text("performance: {measurement: {requests: 3}}\n")
     assert measurement() == {**models.LARGE_MODEL_MEASUREMENT, "requests": 3}  # still the class, not the default
     monkeypatch.setattr(models, "checkpoint_bytes", lambda *args: 2**30)
     assert measurement()["settle_s"] == 10 and measurement()["requests"] == 3
@@ -639,8 +672,9 @@ def test_one_checkpoint_serves_the_bundle_and_the_reference():
     from trtmc_aiperf_qual.models import resolve_model
 
     environment = Environment({"repo": str(REPOSITORY)})
-    albert = resolve_model("albert-base", environment)  # unpinned in the catalog: both sides load the cached snapshot
-    assert albert["candidate"]["revision"] is None and albert["reference"]["revision"] is None
+    albert = resolve_model("albert-base", environment)
+    manifest = json.loads((REPOSITORY / "families/albert/tests/manifests/albert-base.json").read_text())
+    assert albert["candidate"]["revision"] == albert["reference"]["revision"] == manifest["hf_revision"]
     assert albert["candidate"]["bundle"] == "albert-base/albert-base.bundle" and not albert["candidate"]["build"]
     k2 = resolve_model("k2-horizon-7b-uno", environment)  # the adapter's native model is its base checkpoint
     assert (k2["reference"]["model"], k2["reference"]["revision"]) == (
@@ -655,7 +689,7 @@ def test_rejudging_reports_results_the_configuration_no_longer_asks_for(tmp_path
 
     model = {"catalog_profile": "demo", "task": "text_generation", "supplementary": [],
              "accuracy_source": "absolute", "absolute": [{"suite": "mmlu-0shot", "gate": {"margin": 1.0}}],
-             "performance": {"l1": {"reference_modes": ["eager"]}}}
+             "performance": {"reference_modes": ["eager"]}}
     perf = {"reference_mode": "eager", **judge.judge_performance(
         {"p50_ms": 1.0, "ci_percent": 0.0, "per_run_p50_ms": [1.0, 1.0], "work": [[]]},
         {"p50_ms": 2.0, "ci_percent": 0.0, "per_run_p50_ms": [2.0, 2.0], "work": [[]]}, margin_percent=5, max_ci_percent=5,
@@ -664,7 +698,7 @@ def test_rejudging_reports_results_the_configuration_no_longer_asks_for(tmp_path
                 {"suite": "clip-alignment", "source": "task", "status": "fail"}]  # a retired check
     (tmp_path / "model.json").write_text(json.dumps(model))
     (tmp_path / "report.json").write_text(json.dumps({"model": "demo", "task": "text_generation", "accuracy": accuracy,
-                                                      "performance_l1": [perf], "provenance": {}}))
+                                                      "performance": [perf], "provenance": {}}))
     monkeypatch.setattr(cli, "recheck_output", lambda *args: None)
     cli.rejudge_reports([tmp_path])
     after = json.loads((tmp_path / "report.json").read_text())
@@ -703,7 +737,7 @@ def test_a_new_run_sets_the_previous_directory_aside_so_its_pass_cannot_stand(tm
 
 
 def test_a_phase_past_its_deadline_runs_once_more_and_its_error_is_kept_on_resume(tmp_path):
-    """DESIGN.md Section 9: a run past its deadline fails its phase, which runs once more; failing again, the
+    """A run past its deadline fails its phase, which runs once more; failing again, the
     profile is an error, a result a resumed run-all keeps."""
     from trtmc_aiperf_qual import campaign, runner
 
@@ -754,7 +788,75 @@ def test_stated_catalog_controls_reach_every_suite_built_on_the_catalog_request(
 def test_smoke_fails_when_the_verdict_reports_an_error():
     from trtmc_aiperf_qual.runner import smoke_verdict
 
-    result = {"accuracy": [{"suite": "s", "status": "pass"}], "performance_l1": [], "errors": {},
+    result = {"accuracy": [{"suite": "s", "status": "pass"}], "performance": [], "errors": {},
               "verdict": {"acc": "pass", "perf": "error", "category": "error"}}
     verdict = smoke_verdict(result)
     assert verdict["category"] == "smoke-fail" and verdict["failing"] == ["verdict perf: error"]
+
+
+def test_a_sub_millisecond_request_runs_long_enough_for_a_stable_median():
+    from trtmc_aiperf_qual import runner
+
+    measurement = {"requests": 12, "min_run_s": 1.0}
+    assert runner.requests_per_run(measurement, settled=4000, settle_s=10) == 400  # 2.5 ms a request
+    assert runner.requests_per_run(measurement, settled=200000, settle_s=10) == runner.MAX_RUN_REQUESTS
+    assert runner.requests_per_run(measurement, settled=20, settle_s=10) == 12  # slow requests keep the count
+    assert runner.requests_per_run({"requests": 12}, settled=4000, settle_s=10) == 12
+    assert runner.requests_per_run(measurement, settled=0, settle_s=0) == 12
+    assert runner._audio_seconds({"audio_digest": {"seconds": 13.7}}) == 13.7 and runner._audio_seconds({}) is None
+
+
+def test_sampled_speech_is_valid_by_its_median_duration_not_each_utterance():
+    from trtmc_aiperf_qual.intelligibility import validity
+
+    problems = [{"sample_id": str(index)} for index in range(4)]
+    sound = lambda seconds: {"finite": True, "dbfs": -20.0, "seconds": seconds}  # noqa: E731
+    native = [sound(6.0), sound(14.0), sound(5.0), sound(6.0)]
+    sampled = validity(problems, [sound(13.6), sound(5.3), sound(5.0), sound(6.2)], native)  # two run to the limit
+    assert sampled["status"] == "pass" and "2 of 4 sentences beyond" in sampled["notes"][0]
+    halved = validity(problems, [sound(2.0), sound(4.0), sound(2.0), sound(2.0)], native)
+    assert halved["status"] == "fail" and "median duration ratio 0.33" in halved["reasons"][0]
+    silent = validity(problems, [{"finite": True, "dbfs": -80.0, "seconds": 6.0}, *map(sound, (14, 5, 6))], native)
+    assert silent["status"] == "fail" and silent["passed"] == 3
+    unpaired = validity(problems, [sound(6.0)] * 4, [{"finite": True, "dbfs": -1000.0, "seconds": 0.0}, None, None, None])
+    assert unpaired["status"] == "error" and "no sentence with both" in unpaired["error"]  # no duration evidence
+    assert validity([], [], [])["status"] == "error"
+
+
+def test_silent_speech_failure_reports_the_paired_native_baseline():
+    from trtmc_aiperf_qual.intelligibility import validity
+
+    problem = [{"sample_id": "same-request"}]
+    quiet = {"finite": True, "dbfs": -56.58, "seconds": 6.69}
+    native = {"finite": True, "dbfs": -56.52, "seconds": 6.69}
+    result = validity(problem, [quiet], [native])
+    assert result["status"] == "fail" and result["passed"] == 0
+    assert "native also silent (-56.5 dBFS)" in result["failures"][0]["explanation"]
+    assert result["failures"][0]["native_audio"] == native
+    # Native validity is evidence, not an additional absolute-quality floor.
+    good = {"finite": True, "dbfs": -20.0, "seconds": 6.69}
+    assert validity(problem, [good], [native])["status"] == "pass"
+
+
+def test_reports_label_a_timing_normalized_per_audio_second(tmp_path):
+    from trtmc_aiperf_qual import report_html
+    from trtmc_aiperf_qual.report import write_report
+
+    side = {"p50_ms": 40.0, "ci_percent": 1.0, "unit": "ms per audio second"}
+    item = {"reference_mode": "eager", "light": "green", "candidate": side, "reference": {**side, "p50_ms": 90.0},
+            "speedup": 2.25}
+    write_report(tmp_path, {"model": "m", "provenance": {}, "performance": [item]})
+    assert "| 40.000 per audio second |" in (tmp_path / "report.md").read_text()
+    assert "40.000 per audio second</td><td>90.000 per audio second" in report_html._performance([item])
+
+
+def test_lance_qualification_has_a_native_path_and_sizes_the_multimodal_benchmark():
+    from trtmc_aiperf_qual.config import Environment
+    from trtmc_aiperf_qual.models import resolve_model
+
+    repository = Path(__file__).resolve().parents[3]
+    model = resolve_model("lance-3b-x2t-image", Environment({"repo": str(repository)}))
+    assert model["reference"]["backend"] == "reference" and "not_covered" not in model["reference"]
+    assert (repository / model["reference"]["adapter"]).is_file()
+    assert model["candidate"]["benchmark_sequence_length"]["extra_tokens"] == 288
+    assert model["candidate"]["tokenizer_subfolder"] == "Lance_3B"

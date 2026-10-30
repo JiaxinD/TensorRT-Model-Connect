@@ -5,6 +5,7 @@
 
 #include "cli/cli.h"
 
+#include "bundle_provenance.h"
 #include "cli/family_cli.h"
 #include "cli/io.h"
 #include "cli/sdk_dispatch.h"
@@ -31,6 +32,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -95,7 +97,7 @@ const std::unordered_map<std::string, CommandSpec>& command_specs() {
          {CommandKind::kEmbed,
           {"--text", "--token-ids", "--image", "--title", "--body", "--role"}}},
         {"rerank", {CommandKind::kRerank, {"--query", "--document", "--image", "--documents"}}},
-        {"classify", {CommandKind::kClassify, {"--image"}}},
+        {"classify", {CommandKind::kClassify, {"--image", "--audio"}}},
         {"detect", {CommandKind::kDetect, {"--image", "--prompt"}}},
         {"extract-features", {CommandKind::kExtractFeatures, {"--image"}}},
         {"predict-structure",
@@ -395,6 +397,8 @@ void require_finite(const std::vector<float>& values, const std::string& field) 
 void write_json(std::ostream& output, const nlohmann::json& value) {
     output << value.dump() << '\n';
 }
+
+using app::read_provenance;
 
 nlohmann::json text_json(const TextResult& result) {
     nlohmann::json value{{"text", result.text},
@@ -1632,6 +1636,9 @@ void print_usage(std::ostream& output) {
               "  predict-structure BUNDLE --input REQUEST [--input-encoding ENCODING]\n"
               "  .yaml/.yml, .json and .b2rq select their declared encodings.\n"
               "  SDK output defaults to prediction.cif or prediction.pdb.\n\n"
+              "Audio classification input:\n"
+              "  classify BUNDLE --audio WAV scores an audio model's own classes;\n"
+              "  classify BUNDLE --image FILE stays the image path.\n\n"
               "BYOK options:\n"
               "  --byok-library DSO --byok-function FUNCTION --byok-name KERNEL\n\n"
               "Runtime-sized KV cache:\n"
@@ -1639,8 +1646,7 @@ void print_usage(std::ostream& output) {
               "TensorRT-RTX runtime options:\n"
               "  [--runtime-cache PATH] [--cuda-graphs]\n\n"
               "Task SDK options: [--task TASK_ID] [--set NAME=VALUE]...\n"
-              "Task SDK families default to the installed runtime directory.\n"
-              "Existing bundle modes still require an explicit --runtime-root.\n";
+              "Without --runtime-root, plugins load from the installed runtime directory.\n";
 }
 
 int run(int argc, char** argv, std::ostream& output, std::ostream& error) {
@@ -1670,7 +1676,8 @@ int run(int argc, char** argv, std::ostream& output, std::ostream& error) {
                                 {"family", bundle.family},
                                 {"task", bundle.task},
                                 {"backend", bundle.backend},
-                                {"sections", std::move(sections)}});
+                                {"sections", std::move(sections)},
+                                {"provenance", read_provenance(command.bundle)}});
             return EXIT_SUCCESS;
         }
         const bool has_byok_library = has_option(command, "--byok-library");
@@ -1690,8 +1697,7 @@ int run(int argc, char** argv, std::ostream& output, std::ostream& error) {
             const auto model = Model::load(command.bundle, options);
             return dispatch(command, model, output);
         }
-        if (command.runtime_root.empty())
-            throw std::invalid_argument("--runtime-root is required for an existing bundle mode");
+        // An empty runtime root selects the directory containing libtrtmc_runtime.
         std::unique_ptr<ITask> task =
             load_task(command.bundle, command.runtime_root, command.kv_cache_size_bytes,
                       command.runtime_cache_path, command.cuda_graphs);

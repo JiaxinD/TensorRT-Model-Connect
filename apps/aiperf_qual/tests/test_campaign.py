@@ -93,6 +93,41 @@ def test_retention_policies_are_validated():
         retention.policies(Environment({"retention": {"hf_cache": "delete_unused"}}))
 
 
+def test_temporary_cleanup_preserves_evidence_and_error_diagnostics(tmp_path):
+    out = tmp_path / "result"
+    scratch = out / "artifacts/geneval-candidate/scratch"
+    scratch.mkdir(parents=True)
+    (scratch / "output.npy").write_bytes(b"large output")
+    (scratch / "worker.stderr.log").write_text("diagnostic")
+    (scratch / "_worker").mkdir()
+    (scratch / "_worker/worker.stderr.log").write_text("real worker diagnostic")
+    (scratch.parent / "records.jsonl").write_text("original responses")
+    (out / "report.json").write_text("scores")
+    env = Environment({"retention": {"temporary_files": "delete_unless_error"}})
+    assert retention.cleanup_temporary(env, out, "error")["status"] == "retained"
+    assert scratch.is_dir()
+    receipt = retention.cleanup_temporary(env, out, "acc-issue")
+    assert receipt["status"] == "deleted" and receipt["bytes"] > 0
+    assert not scratch.exists()
+    assert (scratch.parent / "worker.stderr.log").read_text() == "diagnostic"
+    assert (scratch.parent / "_worker/worker.stderr.log").read_text() == "real worker diagnostic"
+    assert (scratch.parent / "records.jsonl").read_text() == "original responses"
+    assert (out / "report.json").read_text() == "scores"
+
+
+def test_temporary_cleanup_rejects_external_symlinks(tmp_path):
+    outside = tmp_path / "weights"
+    outside.mkdir()
+    (outside / "checkpoint").write_text("raw weights")
+    out = tmp_path / "result"
+    (out / "artifacts/native").mkdir(parents=True)
+    (out / "artifacts/native/scratch").symlink_to(outside, target_is_directory=True)
+    env = Environment({"retention": {"temporary_files": "delete_unless_error"}})
+    with pytest.raises(ConfigError, match="scratch"):
+        retention.cleanup_temporary(env, out, "pass")
+    assert (outside / "checkpoint").is_file()
+
+
 def test_delete_bundle_removes_only_the_model_directory_under_the_bundle_root(tmp_path):
     root = tmp_path / "engines"
     (root / "m").mkdir(parents=True)
@@ -146,7 +181,7 @@ def _record_runs(monkeypatch, events, category="pass"):
 
 def test_run_all_deletes_a_checkpoint_after_the_last_profile_using_it(tmp_path, monkeypatch):
     events = []
-    _record_runs(monkeypatch, events, category="error")  # checkpoints are reference-counted whatever the verdict
+    _record_runs(monkeypatch, events, category="pass")
     environment = Environment({"hf_hub_cache": str(tmp_path / "hub"), "retention": {"hf_cache": "delete_unused"}})
     models = [_model("a-fp16", "org/a"), _model("b", "org/b"), _model("a-fp8", "org/a")]
     records = campaign.run_all(environment, models, tmp_path / "out", prefetch_next=False)
@@ -154,6 +189,19 @@ def test_run_all_deletes_a_checkpoint_after_the_last_profile_using_it(tmp_path, 
     assert [record["profile"] for record in records] == ["a-fp16", "a-fp8", "b"]
     logged = [json.loads(line) for line in (tmp_path / "out/campaign.jsonl").read_text().splitlines()]
     assert logged[1]["checkpoints_deleted"] == [{"status": "deleted"}]
+
+
+def test_run_all_keeps_shared_checkpoint_when_any_profile_had_a_framework_error(tmp_path, monkeypatch):
+    events = []
+    _record_runs(monkeypatch, events, category="error")
+    def run_one(environment, model, out):
+        events.append(("run", model["model"]))
+        return {"category": "error" if model["model"] == "a-fp16" else "pass"}
+    monkeypatch.setattr(campaign, "run_one", run_one)
+    env = Environment({"hf_hub_cache": str(tmp_path / "hub"), "retention": {"hf_cache": "delete_unused"}})
+    campaign.run_all(env, [_model("a-fp16", "org/a"), _model("a-fp8", "org/a")],
+                     tmp_path / "out", prefetch_next=False)
+    assert events == [("run", "a-fp16"), ("run", "a-fp8")]
 
 
 def test_run_all_keeps_checkpoints_by_default(tmp_path, monkeypatch):
@@ -210,6 +258,53 @@ def test_run_one_builds_qualifies_and_applies_the_bundle_policy(tmp_path, monkey
     assert json.loads((tmp_path / "m/build.json").read_text())["status"] == "built"
 
 
+def test_build_capacity_resolution_does_not_change_the_resume_configuration(tmp_path, monkeypatch):
+    _stub_phases(monkeypatch)
+    model = _model("m", "org/m")
+    model["candidate"]["max_sequence_length"] = 256
+    environment = Environment({})
+    key = campaign.run_key(environment, model)
+
+    def build(environment, resolved, out, python=None):
+        resolved["candidate"]["max_sequence_length"] = 257
+        return {"status": "built"}
+
+    def qualify(resolved, environment, out):
+        assert resolved["candidate"]["max_sequence_length"] == 257
+        (out / "report.json").write_text(json.dumps({"verdict": {"category": "pass"}}))
+        return {"verdict": {"category": "pass"}}
+
+    monkeypatch.setattr(campaign.bundles, "ensure_bundle", build)
+    monkeypatch.setattr(campaign, "qualify", qualify)
+    campaign.run_one(environment, model, tmp_path / "out")
+    assert model["candidate"]["max_sequence_length"] == 256
+    assert campaign.run_key(environment, model) == key
+    assert campaign._finished(tmp_path / "out", key) == "pass"
+
+
+@pytest.mark.parametrize("acc, complete, timed, delete", [
+    ("pass", True, True, True),
+    ("pass", False, True, False),
+    ("pass", True, False, False),
+    ("inconclusive", True, True, False),
+    ("fail", True, True, False),
+])
+def test_delete_on_pass_uses_the_benchmark_verdict(tmp_path, monkeypatch, acc, complete, timed, delete):
+    from trtmc_aiperf_qual import judge
+
+    result = {"performance_source": "quality", "accuracy": [{"suite": "mmlu-0shot", "status": acc}],
+              "performance": [{"kind": "natural_dataset", "request": "mmlu-0shot", "gate": False,
+                               "complete": complete, "candidate": {"p50_ms": 10 if timed else None},
+                               "reference": {"p50_ms": 12}}]}
+    verdict = judge.verdict(result, expected_suites=["mmlu-0shot"], expected_modes=0)
+    deleted = _stub_phases(monkeypatch, qualify=lambda *args: {"verdict": verdict})
+    environment = Environment({"retention": {"bundle": "delete_on_pass"}})
+    record = campaign.run_one(environment, _model("m", "org/m"), tmp_path / "m")
+    assert deleted == (["m"] if delete else [])
+    assert record["category"] == verdict["category"]  # retention never rewrites the reported verdict
+    assert ("bundle_deleted" in record) is delete
+
+
 def test_run_one_records_build_failures_and_keeps_errored_bundles(tmp_path, monkeypatch):
     deleted = _stub_phases(monkeypatch, build="failed", qualify=lambda *a: pytest.fail("must not qualify"))
     environment = Environment({"retention": {"bundle": "delete_unless_error"}})
@@ -230,15 +325,17 @@ def test_summary_merges_result_roots(tmp_path):
     (first / "report.json").write_text(json.dumps({
         "task": "text_generation", "verdict": {"category": "pass"},
         "accuracy": [{"suite": "mmlu", "passed": 10, "samples": 10, "required_passes": 9}],
-        "performance_l1": [{"reference_mode": "eager", "light": "green", "speedup": 2.5}]}))
+        "performance": [{"reference_mode": "eager", "light": "green", "speedup": 2.5,
+                            "candidate": {"p50_ms": 4.0}, "reference": {"p50_ms": 10.0}}]}))
     failed = tmp_path / "gb300-2/b"
     failed.mkdir(parents=True)
     (failed / "build.json").write_text(json.dumps({"task": "classification", "status": "failed",
                                                    "reason": "error: checkpoint is gated"}))
     text, counts = campaign.summary([tmp_path / "gb300-1", tmp_path / "gb300-2"])
     assert counts == {"pass": 1, "build-failed": 1}
-    assert "| a | text_generation | gb300-1 | pass | mmlu 10/10 (need 9) | eager green 2.50x |" in text
-    assert "| b | classification | gb300-2 | build-failed |" in text and "checkpoint is gated" in text
+    assert "| Green | a | text_generation | gb300-1 | mmlu: 10/10 within tolerance | eager: TRTMC 4.0 ms · native 10.0 ms |" in text
+    assert "| White | b | classification | gb300-2 |" in text and "checkpoint is gated" in text
+    assert "1 pass (Green + conclusive Yellow)" in text and "| White | 1 |" in text
 
 
 CATALOG = [selection.Profile("qwen3-0.6b-fp16", "text_generation", "Qwen/Qwen3-0.6B", None),
@@ -289,7 +386,7 @@ def test_machine_model_list_is_validated(config, message):
         selection.select(config, CATALOG)
 
 
-def test_summary_lists_excluded_models_unless_a_result_exists(tmp_path):
+def test_summary_omits_exclusions_but_keeps_an_actual_result_from_another_host(tmp_path):
     root = tmp_path / "gb300-1"
     campaign.write_exclusions(root, [{"profile": "flux-2-dev", "task": "image_generation", "reason": "80 GB GPU"},
                                      {"profile": "qwen36-27b", "task": "text_generation", "reason": "80 GB GPU"}])
@@ -297,8 +394,54 @@ def test_summary_lists_excluded_models_unless_a_result_exists(tmp_path):
     other.mkdir(parents=True)
     (other / "report.json").write_text(json.dumps({"task": "text_generation", "verdict": {"category": "pass"}}))
     text, counts = campaign.summary([tmp_path / "gb300-2", root])
-    assert counts == {"pass": 1, "excluded": 1}
-    assert "| flux-2-dev | image_generation | gb300-1 | excluded |" in text and "80 GB GPU" in text
+    assert counts == {"pass": 1}
+    assert "flux-2-dev" not in text and "1 models" in text
+    assert "| Green | qwen36-27b |" in text
+    assert len(json.loads((root / campaign.EXCLUSIONS).read_text())) == 2
+
+
+def test_build_capacity_covers_prepared_benchmark_requests_and_extra_tokens(tmp_path, monkeypatch):
+    from trtmc_aiperf_qual import absolute
+    from trtmc_aiperf_qual.models import resolve_model
+
+    environment = Environment({"repo": str(REPOSITORY), "bundle_root": str(tmp_path / "engines"),
+                               "runtime_root": "/rt", "worker": "/rt/worker", "serve_python": "/py"})
+    model = resolve_model("qwen3-embedding-0.6b", environment)
+    plans = {"stsb": [{"request": {"prompt": "short"}}],
+             "scifact-retrieval": [{"request": {"prompt": "x" * 256}}]}
+    monkeypatch.setattr(absolute, "plan", lambda environment, model, item: plans[item["suite"]])
+
+    class Tokenizer:
+        def __call__(self, text, *, add_special_tokens):
+            assert add_special_tokens
+            return {"input_ids": list(range(len(text)))}
+
+    monkeypatch.setattr(absolute, "_candidate_tokenizer", lambda model: Tokenizer())
+    command = bundles.build_command(environment, model, tmp_path / "build")
+    descriptor = json.loads(Path(command[command.index("--model") + 1]).read_text())
+    assert descriptor["max_sequence_length"] == model["candidate"]["max_sequence_length"] == 261
+    assert model["candidate"]["bundle"].startswith("qwen3-embedding-0.6b-benchmark/")
+    assert plans["scifact-retrieval"][0]["request"]["prompt"] == "x" * 256
+    evidence = json.loads((tmp_path / "build/benchmark-capacity.json").read_text())
+    assert evidence["required_sequence_length"] == 261 and evidence["extra_tokens"] == 5
+
+
+def test_benchmark_capacity_planning_failure_prevents_a_catalog_fallback(tmp_path, monkeypatch):
+    from trtmc_aiperf_qual import absolute
+    from trtmc_aiperf_qual.models import resolve_model
+
+    environment = Environment({"repo": str(REPOSITORY), "bundle_root": str(tmp_path / "engines"),
+                               "runtime_root": "/rt", "worker": "/rt/worker", "serve_python": "/py"})
+    model = resolve_model("qwen3-embedding-0.6b", environment)
+    monkeypatch.setattr(absolute, "_candidate_tokenizer", lambda model: None)
+
+    def unavailable(*args):
+        raise ValueError("benchmark dataset unavailable")
+
+    monkeypatch.setattr(absolute, "plan", unavailable)
+    result = bundles.ensure_bundle(environment, model, tmp_path / "out")
+    assert result["status"] == "failed" and "benchmark dataset unavailable" in result["reason"]
+    assert not (tmp_path / "out/artifacts/build/candidate-model.json").exists()
 
 
 def test_preflight_reports_missing_paths_and_interpreters(tmp_path):
@@ -331,11 +474,13 @@ def test_summary_fetches_remote_result_roots_over_ssh(tmp_path):
     remote = tmp_path / "remote/results"
     (remote / "a").mkdir(parents=True)
     (remote / "a/report.json").write_text(json.dumps({"task": "classification", "verdict": {"category": "pass"}}))
+    (remote / "a/model.json").write_text(json.dumps({"candidate": {"precision": "fp16"}}))
     (remote / "a/big.bin").write_bytes(b"x" * 1000)  # only result files are fetched
     roots = campaign.fetch_roots([f"gb300-1=nvidia@host:{remote}"], str(fake_ssh), tmp_path / "fetched")
     assert roots == [tmp_path / "fetched/gb300-1"] and not (roots[0] / "a/big.bin").exists()
+    assert campaign.collect(roots)[0]["a"]["precision"]["trtmc"] == "fp16"  # the model's precision came along
     text, counts = campaign.summary(roots)
-    assert counts == {"pass": 1} and "| a | classification | gb300-1 | pass |" in text
+    assert counts == {"pass": 1} and "| Green | a | classification | gb300-1 |" in text
     local = tmp_path / "local-root"
     local.mkdir()
     assert campaign.fetch_roots([str(local)], str(fake_ssh), tmp_path / "fetched") == [local]
@@ -354,17 +499,17 @@ def test_rejudge_can_take_todays_judging_settings(monkeypatch):
 
     recorded = {"catalog_profile": "bark-small", "absolute": [{"suite": "s", "gate": {"margin": 1.0}}],
                 "supplementary": [{"check": "replay_parity"}],
-                "performance": {"l1": {"output_grader": "parity_audio", "reference_modes": ["eager"]}}}
+                "performance": {"output_grader": "parity_audio", "reference_modes": ["eager"]}}
     today = {"absolute": [{"suite": "s", "gate": {"margin": 2.0}}], "accuracy_source": "absolute",
              "supplementary": [{"check": "replay_parity", "informational": True}],
-             "performance": {"l1": {"output_grader": "parity_audio", "output_grader_params": {"max_rms_ratio": 9.0},
-                                    "reference_modes": ["eager", "compile"]}}}
+             "performance": {"output_grader": "parity_audio", "output_grader_params": {"max_rms_ratio": 9.0},
+                                    "reference_modes": ["eager", "compile"]}}
     monkeypatch.setattr(models, "resolve_model", lambda profile, environment: today)
     current = cli.current_settings(recorded, Environment({}))
     assert current["absolute"] == [{"suite": "s", "gate": {"margin": 2.0}}]
     assert current["supplementary"][0]["informational"]
-    assert current["performance"]["l1"]["output_grader_params"] == {"max_rms_ratio": 9.0}
-    assert current["performance"]["l1"]["reference_modes"] == ["eager"]  # what was measured stays
+    assert current["performance"]["output_grader_params"] == {"max_rms_ratio": 9.0}
+    assert current["performance"]["reference_modes"] == ["eager"]  # what was measured stays
 
 
 def test_summary_keeps_the_latest_result_of_a_profile_run_on_several_roots(tmp_path):
@@ -374,17 +519,20 @@ def test_summary_keeps_the_latest_result_of_a_profile_run_on_several_roots(tmp_p
             {"task": "image_generation", "started": started, "verdict": {"category": category}}))
     for order in ([tmp_path / "gb300-1", tmp_path / "gb300-2"], [tmp_path / "gb300-2", tmp_path / "gb300-1"]):
         text, counts = campaign.summary(order)
-        assert counts == {"acc-issue": 1} and "| m | image_generation | gb300-1 | acc-issue |" in text
+        assert counts == {"acc-issue": 1} and "| Red | m | image_generation | gb300-1 |" in text
 
 
 def test_summary_counts_every_planned_profile(tmp_path):
     root = tmp_path / "gb300-1"
-    campaign.write_plan(root, ["a", "b"], [{"profile": "c", "reason": "no Task defaults"}])
+    campaign.write_plan(root, ["a", "b"], [{"profile": "c", "reason": "no Task defaults for 'structured_decision' (c)"},
+                                           {"profile": "bad", "reason": "unknown benchmark 'typo'"}])
     (root / "a").mkdir()
     (root / "a/report.json").write_text(json.dumps({"task": "t", "started": 1.0, "verdict": {"category": "pass"}}))
     text, counts = campaign.summary([root])
     assert counts == {"pass": 1, "not-run": 1, "config-error": 1}
-    assert "| b | - | gb300-1 | not-run |" in text and "no Task defaults" in text
+    assert "| White | b | - | gb300-1 |" in text and "unknown benchmark 'typo'" in text
+    assert "| White | c |" not in text and "no Task defaults" not in text
+    assert len(json.loads((root / campaign.PLAN).read_text())["config_errors"]) == 2
 
 
 def test_run_all_exit_code_reports_harness_failures():
@@ -399,7 +547,7 @@ def test_summary_notes_trtmc_regressions_against_a_baseline(tmp_path):
         (tmp_path / root / "m").mkdir(parents=True)
         (tmp_path / root / "m/report.json").write_text(json.dumps({
             "task": "t", "started": 1.0, "verdict": {"category": "pass"},
-            "performance_l1": [{"reference_mode": "eager", "light": "green", "candidate": {"p50_ms": p50}}]}))
+            "performance": [{"reference_mode": "eager", "light": "green", "candidate": {"p50_ms": p50}}]}))
     text, _ = campaign.summary([tmp_path / "now"], [tmp_path / "before"])
     assert "regression: TRTMC eager p50 +10.0% vs baseline" in text
 
@@ -418,9 +566,57 @@ def test_html_report_lists_failures_first_with_evidence(tmp_path):
                                                               "explanation": "answer differs", "actual": "B",
                                                               "expected": "C"}]}]}))
     rows, counts, rank = campaign.collect([root])
-    page = render(rows, counts, rank, tmp_path / "report.html").read_text()
+    page = render(rows, counts, rank, tmp_path / "report.html", context=campaign.run_context([root]),
+                  links=[("Reruns", "reruns/report.html")], reruns={"bad": "green"}).read_text()
+    assert '<a href="reruns/report.html">Reruns</a>' in page and "<th>Rerun</th>" in page
     assert page.index(">bad<") < page.index(">good<") and "answer differs" in page
     assert 'href="gb300-1/bad/report.md"' in page and "trtmc-aiperf-qual run --profile bad" in page
+    bad = page[page.index(">bad<"):page.index(">good<")]
+    assert "<span class='signal signal-green'><span class='light'></span>Green</span>" in bad  # the rerun's result
+    assert "data-result='red' data-k='bad" in page and "<span>s</span><strong>1/2</strong>" in bad  # values only
+    assert "<div class='detail'>Acc outside tolerance</div>" in page  # a short label; the reason is in the evidence
+    assert "gb300-1: host -" in page and "Models <strong>2</strong>" in page
+    assert "<span class='signal signal-yellow' title='Yellow'><span class='light'></span></span><strong>1</strong>" in page
+    assert "Pass rate <strong>50.0%</strong>" in page  # Green + Yellow of every model
+    legend = page[page.index("<dl class='legend'>"):page.index("</dl>")]
+    assert legend.count("<div><dt>") == 4  # one line per result
+
+
+def test_html_pass_rate_excludes_inconclusive_accuracy(tmp_path):
+    from trtmc_aiperf_qual.report_html import render
+
+    categories = {"g": "pass", "y": "acc-inconclusive", "r": "acc-issue", "w": "error"}
+    rows = {name: {"category": category, "task": "t", "accuracy": [], "perf": [], "root": "h"}
+            for name, category in categories.items()}
+    page = render(rows, {}, {}, tmp_path / "report.html").read_text()
+    green, yellow = (f"<span class='signal signal-{result}' title='{result.title()}'><span class='light'></span></span>"
+                     for result in ("green", "yellow"))
+    assert f"Pass {green}<span class='none'>+</span>{yellow}<strong>1</strong>" in page  # lights, not words
+    assert "Pass rate <strong>25.0%</strong>" in page and "Valid comparisons <strong>3 / 4</strong>" in page
+    assert "Pass rate <strong>—</strong>" in render({}, {}, {}, tmp_path / "empty.html").read_text()
+
+
+def test_html_labels_say_in_a_few_words_why_a_result_is_not_green():
+    from trtmc_aiperf_qual.report_html import _issue
+
+    def timed(reason):
+        return {"category": "perf-inconclusive", "accuracy": [], "perf": [{"light": "white", "reasons": [reason]}]}
+
+    assert _issue("m", timed("TRTMC CI ±5.54% > 5.0%"), "white") == "Perf TRTMC CI ±5.54%"
+    assert _issue("m", timed("reference timed at bf16, TRTMC runs fp16"), "white") == "Perf precision differs"
+    assert _issue("m", timed("work differs: TRTMC [...] vs native [...]"), "white") == "Perf outputs differ"
+    assert _issue("m", timed("TRTMC: 1 responses report no work"), "white") == "Perf work not reported"
+    assert _issue("m", timed("native: no work evidence"), "white") == "Perf work not reported"
+    scored = {"category": "acc-issue", "perf": [], "accuracy": [{"status": "fail", "metrics": {"trtmc_score": 1.0}}]}
+    assert _issue("m", scored, "red") == "Acc below native"
+    parity = {"category": "acc-issue", "perf": [], "accuracy": [{"status": "fail", "passed": 398, "samples": 400}]}
+    assert _issue("m", parity, "red") == "Acc outside tolerance"
+    unfit = {"category": "error", "perf": [], "accuracy": [
+        {"status": "error", "error": "no lambada problem fits the bundle's 32-token sequence length"}]}
+    assert _issue("m", unfit, "white") == "no problem fits the bundle"
+    gated = {"category": "build-failed", "accuracy": [], "perf": [], "notes": "checkpoint: 403 Client Error"}
+    assert _issue("m", gated, "white") == "HTTP 403"
+    assert _issue("m", {"category": "not-covered", "accuracy": [], "perf": []}, "white") == "not covered"
 
 
 def test_aggregate_results_report_metrics_not_a_zero_pass_count():
@@ -532,10 +728,62 @@ def test_recheck_replaces_only_the_rechecked_entries(tmp_path, monkeypatch):
         {"suite": "geneval", "status": "pass"}])
     judged = []
     monkeypatch.setattr(cli, "rejudge_reports", lambda outs, environment: judged.append(outs) or 0)
-    assert cli.recheck_reports([out], environment=object()) == 0 and judged == [[out]]
+    assert cli.recheck_reports([out], environment=Environment({})) == 0 and judged == [[out]]
     suites = {item["suite"]: item["status"] for item in json.loads((out / "report.json").read_text())["accuracy"]}
     assert suites == {"family-case": "pass", "geneval": "pass", "replay-parity": "fail"}
     assert json.loads((out / "model.json").read_text())["supplementary"] == [check]
+
+
+def test_recheck_after_cleanup_requires_a_bundle_without_replacing_valid_scores(tmp_path, monkeypatch):
+    from trtmc_aiperf_qual import cli, models
+
+    out = tmp_path / "m"
+    out.mkdir()
+    report = '{"accuracy": [{"suite": "geneval", "status": "pass"}]}'
+    (out / "report.json").write_text(report)
+    (out / "model.json").write_text(json.dumps({"catalog_profile": "m", "supplementary": [],
+                                               "candidate": {"bundle": "m/m.bundle"}}))
+    (out / "retention.json").write_text(json.dumps({"temporary_files": {"media_recheck": "regenerate"}}))
+    monkeypatch.setattr(models, "resolve_model", lambda *args: {
+        "supplementary": [{"check": "geneval"}], "reference": {"backend": "reference"}})
+    with pytest.raises(ConfigError, match="bundle is missing"):
+        cli.recheck_reports([out], Environment({"bundle_root": str(tmp_path / "bundles")}))
+    assert (out / "report.json").read_text() == report
+
+
+@pytest.mark.parametrize("missing", ["bundle", "environment"])
+def test_batch_recheck_checks_all_prerequisites_before_changing_any_report(tmp_path, monkeypatch, missing):
+    from trtmc_aiperf_qual import cli, models, runner, services
+
+    outs = [tmp_path / name for name in ("a", "b")]
+    report = '{"accuracy": [{"suite": "geneval", "status": "pass"}]}'
+    for out in outs:
+        out.mkdir()
+        (out / "report.json").write_text(report)
+        (out / "model.json").write_text(json.dumps({"catalog_profile": out.name, "supplementary": [],
+            "candidate": {"bundle": f"{out.name}/{out.name}.bundle"}}))
+        (out / "retention.json").write_text(json.dumps({"temporary_files": {"media_recheck": "regenerate"}}))
+    bundle = tmp_path / "bundles/a/a.bundle"
+    bundle.parent.mkdir(parents=True)
+    bundle.write_bytes(b"available")
+    if missing == "environment":
+        other = tmp_path / "bundles/b/b.bundle"
+        other.parent.mkdir(parents=True)
+        other.write_bytes(b"available")
+    monkeypatch.setattr(models, "resolve_model", lambda *args: {
+        "supplementary": [{"check": "geneval"}], "reference": {"backend": "reference"}})
+    def native_python(environment, model):
+        if missing == "environment" and model["catalog_profile"] == "b":
+            raise ConfigError("reference environment unavailable")
+        return "/ref/python"
+    monkeypatch.setattr(services, "reference_python", native_python)
+    ran = []
+    monkeypatch.setattr(runner, "supplementary", lambda *args: ran.append(args[-1]) or [
+        {"suite": "geneval", "status": "fail"}])
+    with pytest.raises(ConfigError, match="missing|unavailable"):
+        cli.recheck_reports(outs, Environment({"bundle_root": str(tmp_path / "bundles")}))
+    assert not ran
+    assert all((out / "report.json").read_text() == report for out in outs)
 
 
 def test_recheck_reuses_a_generation_only_for_the_same_requests(tmp_path):
@@ -549,10 +797,202 @@ def test_recheck_reuses_a_generation_only_for_the_same_requests(tmp_path):
     (out / "scratch" / "r1").mkdir(parents=True)
     (out / "aiperf.inputs.jsonl").write_text(json.dumps({"text": json.dumps({"request": suite.samples[0]["request"]})}) + "\n")
     (out / "records.jsonl").write_text(json.dumps({"route": "/v1/tasks/generate_image", "request_id": "r1"}) + "\n")
+    (out / "aiperf").mkdir()
+    (out / "aiperf/inputs.json").write_text(json.dumps({"data": [{"session_id": "session_000000"}]}))
+    (out / "aiperf/profile_export_raw.jsonl").write_text(json.dumps({
+        "metadata": {"benchmark_phase": "profiling", "x_request_id": "r1",
+                     "conversation_id": "session_000000"}, "status": 200,
+        "payload": {"request": suite.samples[0]["request"]}}) + "\n")
     assert generation._earlier(out, suite) == [(out / "scratch" / "r1", {"route": "/v1/tasks/generate_image",
                                                                             "request_id": "r1"})]
     other = Suite("s", "k", [{"sample_id": "0", "request": {"prompt": "b"}}], {})
     assert generation._earlier(out, other) is None
+
+
+@pytest.fixture
+def media_recheck(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    from trtmc_aiperf_qual import aiperf_metrics, aiperf_runner, cli, execution, generation, models, runner, services
+    from trtmc_aiperf_qual.suites import single_request_suite
+
+    out = tmp_path / "result"
+    out.mkdir()
+    check = {"check": "geneval", "suite": "geneval"}
+    model = {**_model("m", "org/m", "image_generation"), "operation": "generate_image", "absolute": [],
+             "supplementary": [check], "accuracy_source": "task", "reference": {"backend": "reference"},
+             "performance": {"measurement": {"warmup": 1}}}
+    environment = Environment({"aiperf": "aiperf", "hf_datasets_cache": str(tmp_path),
+                               "bundle_root": str(tmp_path / "bundles")})
+    bundle = bundles.bundle_path(environment, model)
+    bundle.parent.mkdir(parents=True)
+    bundle.write_bytes(b"bundle")
+    suite = single_request_suite("geneval", {"prompt": "cat", "height": 8, "width": 8,
+                                             "num_steps": 2, "guidance_scale": 1.0}, {})
+    state = {"side": None, "calls": [], "times": {"candidate": 40, "reference": 20},
+             "passed": {"candidate": False, "reference": True}, "model": model, "suite": suite}
+
+    @contextmanager
+    def serving(environment, model, backend, directory, **kwargs):
+        directory.mkdir(parents=True, exist_ok=True)
+        state["side"] = "candidate" if backend == "trtmc" else "reference"
+        if state.get("startup_failure") == state["side"]:
+            raise RuntimeError("backend startup failed")
+        with execution.service({"side": state["side"], "operation": "generate_image", "mode": "eager",
+                                "precision": "fp16", "replicas": 1, "timing_scope": "task-call-wall"}):
+            yield {"url": "http://unused"}
+
+    def send(command, log, env, timeout):
+        directory = Path(command[command.index("--artifact-dir") + 1])
+        side = state["side"]
+        if state.get("client_failure") == side:
+            raise RuntimeError("client failed before exporting responses")
+        state["calls"].append(side)
+        request_id = f"r{len(state['calls'])}"
+        work = directory.parent / "scratch" / request_id
+        work.mkdir(parents=True)
+        ms = state["times"][side]
+        observation = {"passed": state["passed"][side], "media_digest": {"frames": 1, "height": 8, "width": 8}}
+        record = {"request_id": request_id, "route": "/v1/tasks/generate_image", "observation": observation}
+        (directory.parent / "records.jsonl").write_text(json.dumps(record) + "\n")
+        raw = {"metadata": {"benchmark_phase": "profiling", "conversation_id": "session_000000",
+                            "x_request_id": request_id}, "status": 200, "payload": {"request": suite.samples[0]["request"]},
+               "responses": [{"text": json.dumps({"id": request_id, "trtmc_timing": {"model_call_ms": ms},
+                                                   "trtmc_observation": observation})}]}
+        (directory / "inputs.json").write_text(json.dumps({"data": [{"session_id": "session_000000"}]}))
+        (directory / aiperf_runner.RAW_EXPORT).write_text(json.dumps(raw) + "\n")
+        (directory / "profile_export_aiperf.json").write_text(json.dumps({"request_latency": {"p50": ms}}))
+        return 0
+
+    def score(environment, model, check, python, work):
+        native = generation.generate(environment, model, "reference", work / "geneval-native", suite,
+                                     reuse=check.get("reuse_outputs", False))
+        candidate = generation.generate(environment, model, "trtmc", work / "geneval-candidate", suite,
+                                        reuse=check.get("reuse_outputs", False))
+        if state.get("score_failure"):
+            raise ValueError("scorer failed")
+        passed = native[0][1]["observation"]["passed"] and candidate[0][1]["observation"]["passed"]
+        return [{"suite": "geneval", "source": "task", "status": "pass" if passed else "fail"}]
+
+    monkeypatch.setattr(generation, "serving", serving)
+    monkeypatch.setattr(aiperf_runner, "_run", send)
+    monkeypatch.setattr(aiperf_runner, "_wait_ready", lambda out: None)
+    monkeypatch.setattr(runner, "gpu_busy_percent", lambda: 0)
+    monkeypatch.setattr(runner, "supplementary", score)
+    monkeypatch.setattr(models, "resolve_model", lambda *args: model)
+    monkeypatch.setattr(services, "reference_python", lambda *args: "/unused/python")
+    evidence = execution.Session(out, {"warmup": 1}, lambda: 0, lambda observation: (), lambda a, b: True)
+    with execution.session(evidence):
+        accuracy = score(environment, model, {**check, "reuse_outputs": False}, "/unused/python", out / "artifacts")
+        other = single_request_suite("untouched", suite.samples[0]["request"], {})
+        state["times"] = {"candidate": 7, "reference": 9}
+        for backend in ("reference", "trtmc"):
+            generation.generate(environment, model, backend, out / "artifacts" / f"untouched-{backend}", other)
+    report = {"model": "m", "operation": "generate_image", "provenance": {}, "performance_source": "quality",
+              "accuracy": accuracy, "performance": evidence.natural_performance(accuracy),
+              "aiperf_metrics": aiperf_metrics.entries(evidence.batches),
+              "execution": {"records": "execution.jsonl"}}
+    (out / "report.json").write_text(json.dumps(report))
+    (out / "model.json").write_text(json.dumps(model))
+    return out, environment, state, cli
+
+
+@pytest.mark.parametrize("mode, calls, native_ms", [("cleanup", 2, 100), ("regenerate", 2, 100), ("candidate", 1, 20)])
+def test_recheck_keeps_accuracy_timings_and_raw_evidence_aligned(media_recheck, mode, calls, native_ms):
+    import shutil
+
+    from trtmc_aiperf_qual import benchmark_perf
+
+    out, environment, state, cli = media_recheck
+    originals = {p: p.read_bytes() for p in out.rglob("profile_export_raw.jsonl")}
+    execution_before = (out / "execution.jsonl").read_bytes()
+    if mode == "cleanup":
+        cleanup = retention.cleanup_temporary(Environment({"retention": {"temporary_files": "delete_unless_error"}}),
+                                               out, "pass")
+        (out / "retention.json").write_text(json.dumps({"temporary_files": cleanup}))
+    elif mode == "candidate":
+        shutil.rmtree(out / "artifacts/geneval-candidate/scratch")
+    state["times"] = {"candidate": 50, "reference": 100}
+    state["passed"]["candidate"] = True
+    before = len(state["calls"])
+    assert cli.recheck_reports([out], environment, regenerate=mode == "regenerate") == 0
+    updated = json.loads((out / "report.json").read_text())
+    measured = next(item for item in updated["performance"] if item["request"] == "geneval")
+    assert measured["candidate"]["p50_ms"] == 50 and measured["reference"]["p50_ms"] == native_ms
+    assert len(state["calls"]) - before == calls
+    assert updated["accuracy"][0]["status"] == "pass" and updated["verdict"]["perf"] == "measured"
+    assert next(item for item in updated["performance"] if item["request"] == "untouched")["candidate"]["p50_ms"] == 7
+    assert (out / "execution.jsonl").read_bytes() == execution_before
+    assert all(p.read_bytes() == contents for p, contents in originals.items())
+    clients = {item["side"]: item["metrics"]["request_latency"]["p50"] for item in updated["aiperf_metrics"]
+               if item["workload"] == "geneval"}
+    assert clients == {"candidate": 50, "reference": native_ms}
+    assert benchmark_perf.refresh(out, updated)["performance"] == updated["performance"]
+    before = len(state["calls"])
+    assert cli.recheck_reports([out], environment) == 0
+    assert len(state["calls"]) == before  # rescore the latest saved outputs, without inference
+
+
+@pytest.mark.parametrize("failure", ["startup_failure", "client_failure", "score_failure"])
+def test_recheck_failures_keep_original_evidence_and_only_report_actual_timings(media_recheck, failure):
+    from trtmc_aiperf_qual import benchmark_perf
+
+    out, environment, state, cli = media_recheck
+    original = {p: p.read_bytes() for p in out.rglob("profile_export_raw.jsonl")}
+    state["times"] = {"candidate": 50, "reference": 100}
+    state[failure] = True if failure == "score_failure" else "candidate"
+    cli.recheck_reports([out], environment, regenerate=True)
+    result = json.loads((out / "report.json").read_text())
+    measured = next(item for item in result["performance"] if item["request"] == "geneval")
+    assert result["verdict"]["acc"] == "error"
+    assert measured["reference"]["p50_ms"] == 100
+    assert measured["candidate"]["p50_ms"] == (50 if failure == "score_failure" else None)
+    assert result["verdict"]["perf"] == ("measured" if failure == "score_failure" else "error")
+    assert all(p.read_bytes() == contents for p, contents in original.items())
+    assert benchmark_perf.refresh(out, result)["performance"] == result["performance"]
+
+
+def test_rechecked_measurements_survive_moving_the_model_result(media_recheck):
+    from trtmc_aiperf_qual import benchmark_perf
+    from trtmc_aiperf_qual.artifacts import resolve_path
+
+    out, environment, state, cli = media_recheck
+    cli.recheck_reports([out], environment, regenerate=True)
+    moved = out.with_name("moved")
+    out.rename(moved)
+    result = json.loads((moved / "report.json").read_text())
+    execution = moved / result["execution"]["records"]
+    for batch in map(json.loads, execution.read_text().splitlines()):
+        for row in batch["records"]:
+            assert resolve_path(moved, row["output_ref"]["aiperf_run"]).is_dir()
+    assert benchmark_perf.refresh(moved, result)["performance"] == result["performance"]
+
+
+def test_informational_recheck_keeps_the_selected_benchmark_measurements(media_recheck, monkeypatch):
+    from trtmc_aiperf_qual import generation, runner
+    from trtmc_aiperf_qual.suites import single_request_suite
+
+    out, environment, state, cli = media_recheck
+    state["model"]["supplementary"].append({"check": "replay_parity", "informational": True})
+    diagnostic = single_request_suite("diagnostic", state["suite"].samples[0]["request"], {})
+
+    def score(environment, model, check, python, work):
+        for backend in ("reference", "trtmc"):
+            generation.generate(environment, model, backend, work / f"diagnostic-{backend}", diagnostic,
+                                reuse=check["reuse_outputs"])
+        return [{"suite": "replay-parity", "source": "task", "status": "fail"}]
+
+    monkeypatch.setattr(runner, "supplementary", score)
+    state["times"] = {"candidate": 50, "reference": 100}
+    for _ in range(2):
+        cli.recheck_reports([out], environment, only=["replay_parity"], regenerate=True)
+        result = json.loads((out / "report.json").read_text())
+        selected = next(item for item in result["performance"] if item["request"] == "geneval")
+        assert selected["candidate"]["p50_ms"] == 40 and selected["reference"]["p50_ms"] == 20
+        assert result["verdict"]["perf"] == "measured"
+        assert not any(item["request"] == "diagnostic" for item in result["performance"])
+        assert next(item for item in result["accuracy"] if item["suite"] == "replay-parity")["informational"]
+        assert len([item for item in result["aiperf_metrics"] if item["workload"] == "diagnostic"]) == 2
 
 
 def test_replay_parity_runs_only_for_families_that_take_caller_latents(tmp_path):
@@ -591,9 +1031,22 @@ def test_gpu_busy_ignores_the_tail_of_our_own_request(monkeypatch):
 
     monkeypatch.setattr(runner.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(subprocess, "run", readings([71, 40, 0, 0, 0]))
-    assert runner.gpu_busy_percent() == 0  # our own request decayed
+    assert runner.gpu_busy_percent(samples=5) == 0  # our own request decayed
     monkeypatch.setattr(subprocess, "run", readings([62, 66, 60, 64, 61]))
-    assert runner.gpu_busy_percent() == 60  # another process keeps the GPU busy
+    assert runner.gpu_busy_percent(samples=5) == 60  # another process keeps the GPU busy
+
+
+def test_gpu_probe_selects_the_benchmark_device(monkeypatch):
+    from types import SimpleNamespace
+
+    from trtmc_aiperf_qual import runner
+
+    calls = []
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-selected")
+    monkeypatch.setattr(runner.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(subprocess, "run", lambda args, **kwargs: calls.append(args) or SimpleNamespace(stdout="0\n"))
+    assert runner.gpu_busy_percent() == 0
+    assert calls[0][1:3] == ["-i", "GPU-selected"]
 
 
 def test_media_sweep_steps_decomposition_and_light(tmp_path):
@@ -617,10 +1070,10 @@ def test_media_sweep_steps_decomposition_and_light(tmp_path):
     partial = sweep.compare_media(rejected, reference, 5)
     assert partial["light"] == "green" and partial["notes"] == ["candidate failed at 2 steps"]
     assert sweep.decompose(rejected) == {}
-    l2 = {"kind": "media", "endpoint": "image_generation", "prompts": 3, "requests": 3, "candidate": candidate,
+    service_metrics = {"kind": "media", "endpoint": "image_generation", "prompts": 3, "requests": 3, "candidate": candidate,
           "reference": reference, "decomposition": {"candidate": sweep.decompose(candidate), "reference": {}},
           **compared}
-    write_report(tmp_path, {"model": "m", "provenance": {}, "performance_l2": l2})
+    write_report(tmp_path, {"model": "m", "provenance": {}, "service_metrics": service_metrics})
     text = (tmp_path / "report.md").read_text()
     assert "AIPerf image_generation" in text and "100.0 ms per denoising step + 100.0 ms fixed" in text
     assert "| TRTMC | 4 | 500.000 |" in text
@@ -711,3 +1164,105 @@ def test_perf_is_white_when_the_native_model_ran_at_another_precision():
 def test_long_prompts_are_not_taken_for_asset_paths(tmp_path):
     long_prompt = "Context filler. " * 100
     assert bundles._absolute_assets([{"prompt": long_prompt}], tmp_path) == [{"prompt": long_prompt}]
+
+
+def test_results_follow_the_owners_four_colours_on_the_catalog_request():
+    def row(category, lights, acc=()):
+        return {"category": category, "accuracy": list(acc),
+                "perf": [{"request": f"m-{name}", "light": light} for name, light in lights.items()]}
+
+    green = {"catalog": "green"}
+    assert campaign.signal(row("pass", green)) == "green"
+    assert campaign.signal(row("perf-issue", {"catalog": "green", "catalog-near-capacity": "yellow"})) == "green"
+    assert campaign.signal(row("perf-issue", {"catalog": "yellow"})) == "yellow"  # about equal: a pass
+    assert campaign.signal(row("perf-issue", {"catalog": "red"})) == "red"
+    assert campaign.signal(row("perf-inconclusive", {"catalog": "white"})) == "white"
+    assert campaign.signal(row("acc-inconclusive", green)) == "yellow"
+    assert campaign.signal(row("acc-issue", green)) == "red"
+    assert campaign.signal(row("not-comparable", green)) == "white"
+    assert campaign.signal(row("error", green)) == "white" and campaign.signal(row("build-failed", {})) == "white"
+    assert campaign.signal(row("smoke-fail", green)) == "white"
+    wer = {"suite": "librispeech", "status": "fail", "metrics": {"trtmc_score": 50.0, "native_score": 10.0}}
+    assert campaign.signal_reason("m", row("acc-issue", green, [wer])) == "librispeech: TRTMC worse than native beyond the margin"
+    informational = {"suite": "replay", "status": "fail", "informational": True}
+    assert campaign.signal(row("pass", green, [informational])) == "green"
+    compiled = row("pass", green)
+    compiled["perf"].append({"request": "m-catalog", "light": "red", "reference_mode": "compile"})
+    assert campaign.signal(compiled) == "green"  # torch.compile timings are informational
+    shown = campaign.reported_perf(row("pass", {"catalog": "green", "catalog-near-capacity": "red"}))
+    assert [campaign.request_label("m", item) for item in shown] == ["catalog"]
+    assert campaign.signal_reason("m", row("perf-issue", {"catalog": "yellow"})) == "catalog: TRTMC about equal to native"
+
+
+def test_image_qualification_defaults_to_the_pinned_full_geneval_selection():
+    from trtmc_aiperf_qual.models import model_suite, resolve_model
+    from trtmc_aiperf_qual.config import load_suite
+
+    environment = Environment({"repo": str(REPOSITORY), "bundle_root": "/bundles",
+                               "runtime_root": "/rt", "worker": "/rt/worker", "serve_python": "/py"})
+    model = resolve_model("qwen-image", environment)
+    check = next(item for item in model["supplementary"] if item["check"] == "geneval")
+    suite = model_suite(check["suite"], model)
+    assert suite["suite"] == "geneval-full" and suite["selection"]["count"] >= 553
+    assert suite["source"] == load_suite("geneval-200")["source"]  # same pinned corpus and labels
+    assert check["gate"] == {"margin": 5.0}
+
+
+@pytest.mark.parametrize("complete, matched, warning", [
+    (True, 10, ""),
+    (True, 8, "work differs or is unknown on 2/10 pairs"),
+    (False, 8, "Native 10/10 timed; TRTMC 8/10 timed"),
+])
+def test_summary_surfaces_work_and_coverage_without_changing_the_verdict(tmp_path, complete, matched, warning):
+    from trtmc_aiperf_qual import report, report_html
+
+    out = tmp_path / "model"
+    out.mkdir()
+    item = {"request": "evaluation", "reference_mode": "eager", "kind": "natural_dataset", "gate": False,
+            "complete": complete, "comparable": matched == 10, "pairs": 10, "matched_pairs": matched,
+            "measurement_status": "measured" if complete else "partial", "light": "informational",
+            "reference": {"p50_ms": 123, "requests": 10, "valid_requests": 10},
+            "candidate": {"p50_ms": 45, "requests": 10, "valid_requests": 10 if complete else 8}}
+    result = {"model": "model", "provenance": {}, "performance_source": "quality", "performance": [item],
+              "accuracy": [{"suite": "evaluation", "status": "pass"}],
+              "verdict": {"acc": "pass", "perf": item["measurement_status"], "category": "measured"}}
+    report.write_report(out, result)
+    text, _ = campaign.summary([tmp_path])
+    rows, counts, rank = campaign.collect([tmp_path])
+    page = report_html.render(rows, counts, rank, tmp_path / "summary.html").read_text()
+    assert warning in text and warning in page
+    assert "123 ms" in page and "45.0 ms" in page and "Speedup" not in page
+    assert campaign.signal(rows["model"]) == "green"  # observed work never adds a performance gate
+
+
+def test_historical_preset_labels_show_the_actual_request_count():
+    item = {"request": "geneval-200", "kind": "natural_dataset",
+            "candidate": {"requests": 553}, "reference": {"requests": 553}}
+    assert campaign.request_label("model", item) == "geneval (553 requests)"
+    assert campaign.request_label("model", {**item, "request": "mmlu-0shot"}) == "mmlu-0shot"
+    assert campaign.request_label("model", {**item, "kind": "fixed"}) == "geneval-200"
+
+
+def test_quality_dataset_timings_are_the_main_report_and_keep_their_benchmark_label(tmp_path):
+    from trtmc_aiperf_qual import cli, report, report_html
+
+    out = tmp_path / "qwen"
+    out.mkdir()
+    item = {"request": "mmlu-0shot", "reference_mode": "eager", "kind": "natural_dataset", "gate": False,
+            "complete": True, "comparable": True, "light": "informational", "pairs": 2, "matched_pairs": 2,
+            "reference": {"p50_ms": 123.0, "precision": "fp16"},
+            "candidate": {"p50_ms": 45.0, "precision": "fp16"}}
+    result = {"model": "qwen", "task": "text_generation", "performance_source": "quality", "provenance": {},
+              "accuracy_source": "absolute", "accuracy": [{"suite": "mmlu-0shot", "source": "absolute", "status": "pass"}],
+              "performance": [item], "verdict": {"acc": "pass", "perf": "measured", "category": "measured"}}
+    model = {"absolute": [{"suite": "mmlu-0shot"}], "accuracy_source": "absolute", "performance": {}}
+    (out / "model.json").write_text(json.dumps(model))
+    report.write_report(out, result)
+    rows, counts, rank = campaign.collect([tmp_path])
+    assert campaign.reported_perf(rows["qwen"]) == [item]
+    page = report_html.render(rows, counts, rank, tmp_path / "summary.html").read_text()
+    assert "mmlu-0shot" in page and "123 ms" in page and "45.0 ms" in page
+    assert "p50 of the catalog" not in page and "Speedup" not in page
+    cli.rejudge_reports([out])
+    saved = json.loads((out / "report.json").read_text())
+    assert saved["verdict"]["perf"] == "measured" and saved["performance"] == [item]

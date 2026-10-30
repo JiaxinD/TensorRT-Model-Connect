@@ -9,6 +9,7 @@ import math
 import statistics
 from typing import Any, Mapping, Sequence
 
+from .compat import report as normalized_report
 from .noninferiority import t_quantile
 
 METRIC = "trtmc_model_call_time"
@@ -19,11 +20,11 @@ def light_key(item: Mapping[str, Any]) -> str:
     return f"{item['reference_mode']}/{item['request']}" if item.get("request") else item["reference_mode"]
 
 
-QUALIFYING_MODE = "eager"  # torch.compile lights are opt-in reports outside the category (DESIGN.md 4.6)
+QUALIFYING_MODE = "eager"  # torch.compile lights are opt-in reports outside the category
 
 
 def verdict(result: Mapping[str, Any], *, expected_suites: Sequence[str], expected_modes: int) -> dict[str, Any]:
-    """Model-level outcome (DESIGN.md 4.7): Acc (``n/a`` for a Perf-only model), the lights, and a category.
+    """Model-level outcome: Acc (``n/a`` for a Perf-only model), the lights, and a category.
     Only ``pass`` qualifies. ``expected_modes`` eager lights (one per timed request) decide Perf; a missing,
     unavailable (``n/a``), or ``error`` eager light is an error, and other reference modes are reported only.
 
@@ -32,7 +33,8 @@ def verdict(result: Mapping[str, Any], *, expected_suites: Sequence[str], expect
     ``informational`` entries are reported, never judged. A model without a native path is
     ``not-covered``.
     """
-    lights = {light_key(item): item["light"] for item in result.get("performance_l1", [])}
+    result = normalized_report(result)
+    lights = {light_key(item): item["light"] for item in result.get("performance", []) if item.get("gate", True)}
     if (result.get("reference") or {}).get("backend") == "unsupported":
         return {"acc": "n/a", "perf": "n/a", "lights": lights, "category": "not-covered"}
     accuracy = [item for item in result.get("accuracy", []) if not item.get("informational")]
@@ -45,8 +47,22 @@ def verdict(result: Mapping[str, Any], *, expected_suites: Sequence[str], expect
         statuses = {item["status"] for item in accuracy}
         acc = ("pass" if statuses == {"pass"} else "error" if "error" in statuses else "fail" if "fail" in statuses else
                "inconclusive" if "inconclusive" in statuses else "not-comparable")
-    qualifying = [item["light"] for item in result.get("performance_l1", [])
-                  if item.get("reference_mode") == QUALIFYING_MODE]
+    if result.get("performance_source") == "quality":
+        datasets = [item for item in result.get("performance", []) if item.get("kind") == "natural_dataset"]
+        names = {item.get("request") for item in datasets}
+        required = set(result.get("performance_expected", [item.get("suite") for item in accuracy
+                                                           if item.get("source") == "absolute"]))
+        unavailable = any(any((item.get(side) or {}).get("p50_ms") is None
+                              for side in ("candidate", "reference")) for item in datasets)
+        perf = ("error" if not datasets or not required <= names or unavailable else
+                "partial" if any(not item.get("complete") for item in datasets) else "measured")
+        # A dataset measurement is not a repeated-run performance acceptance test.
+        category = ("error" if "error" in (acc, perf) else "acc-issue" if acc == "fail" else
+                    "acc-inconclusive" if acc == "inconclusive" else "not-comparable" if acc == "not-comparable" else
+                    "measured")
+        return {"acc": acc, "perf": perf, "lights": {}, "category": category}
+    qualifying = [item["light"] for item in result.get("performance", [])
+                  if item.get("reference_mode") == QUALIFYING_MODE and item.get("gate", True)]
     perf = "error" if len(qualifying) < max(expected_modes, 1) or {"error", "n/a"} & set(qualifying) else (
         "green" if all(value == "green" for value in qualifying) else
         "red" if "red" in qualifying else "yellow" if "yellow" in qualifying else "white")
@@ -126,7 +142,7 @@ AUDIO_OPERATIONS = ("generate_audio", "speak")
 
 
 def work_signature(operation: str, observation: Mapping[str, Any] | None) -> tuple | None:
-    """What a response did (DESIGN.md 4.6), as (evidence, value) pairs from fields both backends report:
+    """What a response did, as (evidence, value) pairs from fields both backends report:
     for text (generation, translation, transcription) the generated token count and the generated text,
     two alternatives (equal counts: the same decode steps; equal texts: the same tokens, whichever way a
     backend counts the end-of-sequence token); for generated media ``media_digest`` frames / height / width;
@@ -196,7 +212,7 @@ def judge_performance(candidate: Mapping[str, Any], reference: Mapping[str, Any]
                       max_ci_percent: float, outputs_match: bool, output_reason: str,
                       not_equivalent: str | None = None, candidate_precision: str | None = None,
                       guard_percent: float = 0.0) -> dict[str, Any]:
-    """Light of one reference mode (DESIGN.md 4.6). white: the comparison is invalid (work or outputs
+    """Light of one reference mode. white: the comparison is invalid (work or outputs
     differ, the native model ran at another precision than ``candidate_precision``, a busy GPU) or a
     side's runs spread more than ``max_ci_percent``; otherwise green / red when the speedup interval lies
     beyond the margin widened by the guard (the server-instance effect the order check measured, which the

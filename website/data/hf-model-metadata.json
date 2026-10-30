@@ -15,6 +15,17 @@
       "architecture_source": "config.architectures"
     },
     {
+      "hf_id": "Cloudflare/clef-flash",
+      "revision": "fde727a287004204b7518dcc983fe64379776712",
+      "revision_source": "resolved",
+      "metadata_file": "config.json",
+      "model_type": "qwen3_5",
+      "architectures": [
+        "Qwen3_5ForConditionalGeneration"
+      ],
+      "architecture_source": "config.architectures"
+    },
+    {
       "hf_id": "Efficient-Large-Model/SANA-WM_bidirectional",
       "revision": "e96271d77398def8ebb9fc595e7c0056dc625ab7",
       "revision_source": "resolved",
@@ -563,6 +574,17 @@
       "architecture_source": "config.model_name"
     },
     {
+      "hf_id": "convaiinnovations/laya",
+      "revision": "7b928d828b7b0e022f929d9bd2e44165aa270148",
+      "revision_source": "resolved",
+      "metadata_file": "config.json",
+      "model_type": "laya",
+      "architectures": [
+        "LayaTypedDecisions"
+      ],
+      "architecture_source": "config.architectures"
+    },
+    {
       "hf_id": "deepseek-ai/DeepSeek-OCR-2",
       "revision": "aaa02f3811945a91062062994c5c4a3f4c0af2b0",
       "revision_source": "resolved",
@@ -906,6 +928,15 @@
     {
       "hf_id": "lerobot/act_aloha_sim_transfer_cube_human",
       "revision": "ba73b2766f1371cdc133ca4efb97eb090d744625",
+      "revision_source": "resolved",
+      "metadata_file": "config.json",
+      "model_type": null,
+      "architectures": [],
+      "architecture_source": null
+    },
+    {
+      "hf_id": "lerobot/pi05_libero_base",
+      "revision": "5fcf06fc42b6717e22ab885fd381a096574b12c7",
       "revision_source": "resolved",
       "metadata_file": "config.json",
       "model_type": null,

@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Direct build, native runtime, and ultralytics reference proof for YOLOv10."""
+"""Direct build, native runtime, and PyTorch reference proof for YOLOv10."""
 
 from __future__ import annotations
 
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -104,22 +105,6 @@ def _asset(case: dict) -> Path:
     return path
 
 
-def _reference_yaml(model_dir: Path) -> str:
-    config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
-    model = config.get("model") if isinstance(config, dict) else None
-    if not isinstance(model, str) or model not in {"yolov10n.yaml", "yolov10s.yaml", "yolov10x.yaml"}:
-        raise ValueError(f"unsupported YOLOv10 reference architecture: {model!r}")
-    record_evidence("checkpoint", {"configuration": config})
-    return model
-
-
-def _reference_tensors(model_dir: Path) -> dict:
-    from families.yolov10.checkpoint import Checkpoint
-
-    checkpoint = Checkpoint.open(model_dir, framework="pt")
-    return {name: reader.get_tensor(name) for name, reader in checkpoint.tensor_map.items()}
-
-
 def _record_reference_boxes(rows, scale: float, pad_x: float, pad_y: float) -> None:
     if not evidence_enabled():
         return
@@ -189,26 +174,17 @@ def test_official_checkpoint_e2e(case_name: str, tmp_path: Path) -> None:
     record_evidence("native", actual)
 
     with evidence_stage("reference"):
-        from ultralytics import YOLO
-
-        # The reference must run the checkpoint under test. YOLO(<directory>)
-        # quietly downloads its own weights instead, which would compare the engine
-        # against a different model.
-        reference = YOLO(_reference_yaml(model_dir), task="detect").model
-        raw = _reference_tensors(model_dir)
-        state = {key[len("model."):]: value for key, value in raw.items() if key.startswith("model.")}
-        missing, unexpected = reference.load_state_dict(state, strict=False)
-        assert not missing, f"reference is missing checkpoint tensors: {missing[:5]}"
-        reference = reference.eval()
-
-        import torch
-        from PIL import Image
-
-        source = Image.open(image).convert("RGB")
-        letterboxed, scale, pad_x, pad_y = _letterbox(source, 640)
-        with torch.no_grad():
-            expected = reference(torch.from_numpy(letterboxed))
-        expected = (expected[0] if isinstance(expected, (list, tuple)) else expected)[0].numpy()
+        record_evidence("checkpoint", {"configuration": json.loads((model_dir / "config.json").read_text())})
+        reference_output = tmp_path / "reference.npz"
+        subprocess.run(
+            [sys.executable, str(TEST_ROOT / "reference/e2e.py"),
+             str(model_dir), str(image), str(reference_output)],
+            check=True, timeout=600,
+            env={**os.environ, "PYTHONPATH": str(TEST_ROOT.parents[2]) + os.pathsep + os.environ.get("PYTHONPATH", "")},
+        )
+        with np.load(reference_output, allow_pickle=False) as result:
+            expected = result["expected"]
+            scale, pad_x, pad_y = (float(result[name]) for name in ("scale", "pad_x", "pad_y"))
 
     record_evidence("reference_raw", {"detections": expected, "coordinate_space": "letterboxed-image pixels", "scale": scale, "pad_x": pad_x, "pad_y": pad_y})
     threshold = 0.25
@@ -228,19 +204,3 @@ def test_official_checkpoint_e2e(case_name: str, tmp_path: Path) -> None:
                 # to come back out of the letterbox before they can be compared.
                 reference_pixel = (float(row[axis]) - (pad_x if axis % 2 == 0 else pad_y)) / scale
                 assert abs(float(actual["boxes"][index * 4 + axis]) - reference_pixel) < 1.0
-
-
-def _letterbox(image, size: int):
-    """Ultralytics preprocessing: keep aspect, pad with 114, scale to [0, 1]."""
-    from PIL import Image
-
-    scale = min(size / image.height, size / image.width)
-    resized = image.resize(
-        (round(image.width * scale), round(image.height * scale)), Image.BILINEAR
-    )
-    canvas = Image.new("RGB", (size, size), (114, 114, 114))
-    left = (size - resized.width) // 2
-    top = (size - resized.height) // 2
-    canvas.paste(resized, (left, top))
-    array = np.asarray(canvas, dtype=np.float32).transpose(2, 0, 1) / 255.0
-    return array[None].copy(), scale, float(left), float(top)

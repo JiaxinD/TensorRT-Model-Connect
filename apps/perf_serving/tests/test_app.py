@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import base64
+import hashlib
 import json
 import threading
 from pathlib import Path
@@ -70,6 +71,35 @@ def test_task_route_merges_base_request_materializes_files_and_records_request_i
     record = json.loads(config.records.read_text())
     assert record["request_id"] == "req-1" and record["timing"]["model_call_ms"] == 4.0
     assert not (config.scratch / "req-1").exists()  # artifacts are not kept by default
+
+
+def test_task_route_serves_media_store_references_from_its_own_store(tmp_path):
+    from trtmc_perf_serving.files import store_media
+
+    store = tmp_path / "store"
+    backend = FakeBackend()
+    client, config = client_for(tmp_path, backend, media_root=store)
+    body = {"request": {"image_path": store_media(store, b"stored", ".png")}}
+
+    response = client.post("/v1/tasks/classify", json=body, headers={"X-Request-ID": "req-ref"})
+
+    assert response.status_code == 200
+    assert backend.requests[0]["files"]["image_path"] == b"stored"
+    assert not (config.scratch / "req-ref").exists()
+
+
+def test_task_route_rejects_a_media_reference_the_server_cannot_resolve(tmp_path):
+    from trtmc_perf_serving.files import FILE_KEY
+
+    backend = FakeBackend()
+    reference = {FILE_KEY: {"suffix": ".png", "sha256": "ab" * 32}}
+    for config in ({}, {"media_root": tmp_path / "empty-store"}):
+        client, _ = client_for(tmp_path, backend, **config)
+
+        response = client.post("/v1/tasks/classify", json={"request": {"image_path": reference}})
+
+        assert response.status_code == 400 and "media" in response.json()["error"]["message"]
+    assert backend.requests == []
 
 
 @pytest.mark.parametrize("payload", [{"image_path": "/etc/hostname"},
@@ -197,12 +227,18 @@ def test_image_and_video_responses_carry_inference_time_and_probed_peak_memory(t
             nvml.used[0] = 1600 * 1024 * 1024  # transient memory during the call
             time.sleep(0.01)
             nvml.used[0] = 1100 * 1024 * 1024
+            from PIL import Image
+            Image.new("RGB", (8, 4), color="red").save(artifact_base.with_suffix(".png"))
             return Invocation({"artifact": "/out.png"}, 250.0)
 
     client, _ = client_for(tmp_path, Generator(operation="generate_image"), memory_probe=probe)
     image = client.post("/v1/images/generations", json={"prompt": "cat", "model": "m", "response_format": "b64_json"})
     assert image.status_code == 200
     body = image.json()
+    import io
+    from PIL import Image
+    with Image.open(io.BytesIO(base64.b64decode(body["data"][0]["b64_json"]))) as png:
+        assert png.size == (8, 4) and png.getpixel((7, 3)) == (255, 0, 0)
     assert body["inference_time_s"] == 0.25 and body["peak_memory_mb"] == 600.0
     assert body["trtmc_timing"]["peak_memory_mb"] == 600.0
     with client:  # keeps the event loop (and the background video job) alive between requests
@@ -231,6 +267,7 @@ def test_latent_seed_becomes_a_noise_file_or_is_dropped_and_reported(tmp_path):
     client, _ = client_for(tmp_path / "with", backend, latent_replay=replay)
     body = client.post("/v1/tasks/generate_image", json={"request": {"prompt": "cat", "latent_seed": 3}}).json()
     assert body["trtmc_observation"]["latent_replay"] is True
+    assert body["trtmc_observation"]["initial_latents_sha256"] == hashlib.sha256(b"\0" * 8).hexdigest()
     assert "latent_seed" not in backend.requests[0] and backend.requests[0]["initial_latents_path"].endswith("noise.f32")
     plain = Generator(operation="generate_image")
     client, _ = client_for(tmp_path / "without", plain)

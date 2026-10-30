@@ -45,6 +45,8 @@ def _serve_env(environment: Environment) -> dict[str, str]:
            "PYTHONPATH": f"{repo}/apps/perf_serving:{repo}/apps/benchmark:{repo}/core/builder:{repo}"}
     if environment.values.get("hf_hub_cache"):  # the cache that checkpoint retention manages
         env["HF_HUB_CACHE"] = str(environment["hf_hub_cache"])
+        # Remote-code modules are generated Python, separate from immutable checkpoint snapshots.
+        env.setdefault("HF_MODULES_CACHE", str(Path(environment["hf_hub_cache"]).parent / "hf-modules"))
     return env
 
 
@@ -111,12 +113,25 @@ def platform_id(fingerprint: Mapping[str, Any]) -> str:
 def serving(environment: Environment, model: dict[str, Any], backend: str, out: Path, *,
             mode: str = "eager", precision: str | None = None, deterministic: bool = False,
             isolate_requests: bool = False, python: str | None = None, keep_artifacts: bool = False, memory_probe: bool = False,
-            port: int | None = None, extra_env: Mapping[str, str] | None = None) -> Iterator[dict[str, Any]]:
+            port: int | None = None, extra_env: Mapping[str, str] | None = None,
+            service: str = "perf-serving", model_name: str = "trtmc") -> Iterator[dict[str, Any]]:
     """Run one server for the model; yields its URL and /v1/serving/info.
 
     backend: ``trtmc`` (candidate) or ``reference`` (generic HF adapters, run in ``python``: the model's
     reference environment).
     """
+    if service == "trtmc-server":
+        if backend != "trtmc" or isolate_requests or memory_probe or keep_artifacts:
+            raise ServiceError("trtmc-server supports persistent text candidate profiling only")
+        settings = {"bundle": str(environment.path("bundle_root") / model["candidate"]["bundle"]),
+                    "model_name": model_name, "binary": str(environment["server_binary"]),
+                    "runtime_root": str(environment["runtime_root"]),
+                    "port": port or int(environment["ports"]["candidate"])}
+        with text_serving(environment, settings, out, extra_env=extra_env) as running:
+            yield running
+        return
+    if service != "perf-serving":
+        raise ServiceError(f"unknown serving service: {service}")
     repo = environment.path("repo")
     port = port or int(environment["ports"]["candidate" if backend == "trtmc" else "reference"])
     out.mkdir(parents=True, exist_ok=True)
@@ -125,6 +140,8 @@ def serving(environment: Environment, model: dict[str, Any], backend: str, out: 
                "--backend", backend, "--port", str(port), "--full-observations",
                "--records", str(out / "records.jsonl"), "--scratch", str(out / "scratch")]
     reference = model["reference"]
+    if reference.get("latent_adapter"):
+        command += ["--latent-replay-adapter", str(repo / reference["latent_adapter"])]
     if model["candidate"].get("revision"):  # the pinned checkpoint (tokenizer, latent replay, reference)
         command += ["--revision", str(model["candidate"]["revision"])]
     if backend == "trtmc":
@@ -146,6 +163,8 @@ def serving(environment: Environment, model: dict[str, Any], backend: str, out: 
             command += ["--reference-options", json.dumps(reference["options"])]
         if reference.get("adapter"):  # the family's own native pipeline
             command += ["--reference-adapter", str(repo / reference["adapter"])]
+    if environment.media_root() is not None:  # requests name their media by digest
+        command += ["--media-root", str(environment.media_root())]
     if keep_artifacts:  # checks that read output artifacts (audio, images) after the run
         command.append("--keep-artifacts")
     if memory_probe:  # peak GPU memory per call; only meaningful while this server is alone on the GPU
@@ -168,7 +187,13 @@ def serving(environment: Environment, model: dict[str, Any], backend: str, out: 
             raise ServiceError(f"port {port} answered as {info.get('backend')!r}, not this {backend} server")
         if backend == "trtmc":  # which TensorRT and CUDA libraries the loaded bundle actually runs on
             (out / LOADED_LIBRARIES).write_text(json.dumps(loaded_libraries(process.pid), indent=2) + "\n")
-        yield {"url": url, "info": info, "records": out / "records.jsonl"}
+        from .execution import service as execution_service
+
+        identity = {**info, "side": "candidate" if backend == "trtmc" else "reference", "mode": mode,
+                    "precision": model["candidate"]["precision"] if backend == "trtmc" else
+                    info.get("precision", precision or reference.get("precision", "fp32"))}
+        with execution_service(identity):
+            yield {"url": url, "info": info, "records": out / "records.jsonl"}
     finally:
         try:  # the record never keeps a server from stopping
             (out / MEMORY_NODES).write_text(json.dumps(memory_nodes(process.pid), indent=2) + "\n")
@@ -212,13 +237,31 @@ def memory_nodes(group: int) -> dict[str, dict[str, float]]:
 LIBRARY_NAMES = ("libnvinfer", "libnvonnxparser", "libcudart", "libcublas", "libcudnn")
 
 
+def server_processes(group: int) -> set[int]:
+    """Include native workers that created their own process group."""
+    entries = {}
+    for stat in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            fields = stat.read_text().rsplit(") ", 1)[1].split()
+            entries[int(stat.parent.name)] = (int(fields[1]), int(fields[2]))
+        except (OSError, IndexError, ValueError):
+            continue
+    found = {pid for pid, (_, pgrp) in entries.items() if pgrp == group} | {group}
+    while True:
+        children = {pid for pid, (parent, _) in entries.items() if parent in found}
+        if children <= found:
+            return found
+        found.update(children)
+
+
 def loaded_libraries(group: int, names: tuple[str, ...] = LIBRARY_NAMES) -> list[str]:
     """The TensorRT and CUDA shared libraries mapped by the processes of a server's process group (its worker
     loads TensorRT at run time, from wherever the library path resolves it)."""
     found: set[str] = set()
+    processes = server_processes(group)
     for stat in Path("/proc").glob("[0-9]*/stat"):
         try:
-            if int(stat.read_text().rsplit(") ", 1)[1].split()[2]) != group:
+            if int(stat.parent.name) not in processes:
                 continue
             maps = (stat.parent / "maps").read_text()
         except (OSError, IndexError, ValueError):
@@ -491,3 +534,65 @@ def _stop(process: subprocess.Popen) -> None:
     except subprocess.TimeoutExpired:
         os.killpg(process.pid, signal.SIGKILL)
         process.wait()
+
+
+@contextmanager
+def text_serving(environment: Environment, settings: Mapping[str, Any], out: Path, *,
+                 extra_env: Mapping[str, str] | None = None) -> Iterator[dict[str, Any]]:
+    """Launch Vivian's server and verify its health and registered API model."""
+    repo = environment.path("repo")
+    out.mkdir(parents=True, exist_ok=True)
+    port = int(settings.get("port", 8000))
+    if not _port_free(port):
+        raise ServiceError(f"port {port} is in use")
+    command = [str(environment["serve_python"]), "-m", "trtmc_server", str(settings["bundle"]),
+               "--model-name", str(settings["model_name"]), "--worker-binary", str(settings["binary"]),
+               "--port", str(port), "--replicas", str(settings.get("replicas", 1)),
+               "--records", str(out / "records.jsonl"),
+               "--startup-timeout", str(settings.get("startup_timeout", 120)),
+               "--request-timeout", str(settings.get("request_timeout", 120))]
+    if settings.get("runtime_root"):
+        command += ["--runtime-root", str(settings["runtime_root"])]
+    if settings.get("cuda_graphs"):
+        command.append("--cuda-graphs")
+    if settings.get("max_body_bytes") is not None:
+        command += ["--max-body-bytes", str(settings["max_body_bytes"])]
+    env = {**_serve_env(environment), **dict(extra_env or {})}
+    env["PYTHONPATH"] = f"{repo}/apps/server/python:" + env["PYTHONPATH"]
+    (out / "command.json").write_text(json.dumps(command, indent=2) + "\n")
+    url = f"http://127.0.0.1:{port}"
+    with (out / "server.log").open("w") as log:
+        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env,
+                                   cwd=repo, start_new_session=True)
+        try:
+            info = _wait_text_ready(process, url, str(settings["model_name"]),
+                                    float(settings.get("startup_timeout", 120)))
+            (out / "models.json").write_text(json.dumps(info, indent=2) + "\n")
+            (out / LOADED_LIBRARIES).write_text(json.dumps(loaded_libraries(process.pid,
+                (*LIBRARY_NAMES, "libtrtmc")), indent=2) + "\n")
+            yield {"url": url, "info": info, "records": out / "records.jsonl"}
+        finally:
+            _stop(process)
+
+
+def _wait_text_ready(process: subprocess.Popen, url: str, model_name: str,
+                     timeout_s: float) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        cancel.check()
+        if process.poll() is not None:
+            raise ServiceError(f"text server exited {process.returncode} before readiness")
+        try:
+            with urllib.request.urlopen(f"{url}/health/ready", timeout=2) as response:
+                health = json.load(response)
+            if health.get("status") != "ready":
+                raise ServiceError("text server returned an invalid readiness record")
+            with urllib.request.urlopen(f"{url}/v1/models", timeout=2) as response:
+                models = json.load(response)
+            match = [item for item in models.get("data", []) if item.get("id") == model_name]
+            if len(match) != 1:
+                raise ServiceError(f"text server did not register model {model_name!r}")
+            return match[0]
+        except OSError:
+            time.sleep(0.2)
+    raise ServiceError("text server did not become ready")

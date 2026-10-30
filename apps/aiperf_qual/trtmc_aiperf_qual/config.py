@@ -42,9 +42,21 @@ class Environment:
     def __getitem__(self, key: str) -> Any:
         return require(self.values, key, "environment")
 
+    def media_root(self) -> Path | None:
+        """The media store of this machine, shared by every model, side and run: ``media_root``, else a folder of
+        the datasets cache. Each input image, clip and frame is kept once, named by its digest; requests,
+        AIPerf inputs and raw exports carry the digest only."""
+        if self.values.get("media_root"):
+            return Path(self.values["media_root"])
+        cache = self.values.get("hf_datasets_cache")
+        return Path(cache) / "trtmc-media" if cache else None
+
 
 def load_environment(path: Path) -> Environment:
-    return Environment(_load(path))
+    values = _load(path)
+    if "ledger" in values:  # a machine's file names no run's records
+        raise ConfigError(f"{path} names a ledger; pass a run's ledger with run-all --ledger")
+    return Environment(values)
 
 
 def load_suite(name: str, root: Path = CONFIG_ROOT) -> dict[str, Any]:

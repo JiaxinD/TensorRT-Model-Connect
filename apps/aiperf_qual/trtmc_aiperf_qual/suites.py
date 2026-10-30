@@ -101,7 +101,7 @@ def select(records: Sequence[dict[str, Any]], selection: Mapping[str, Any]) -> l
         chosen = [group[depth] for depth in range(max(map(len, groups.values()), default=0))
                   for group in groups.values() if depth < len(group)][:count]
         return [record for _, record in sorted(chosen, key=lambda pair: pair[0])]
-    if method == "seeded":  # DESIGN.md 4.4: seeded stratified sampling, records in their sampled order
+    if method == "seeded":  # seeded stratified sampling, records in their sampled order
         count, field = int(require(selection, "count", "selection")), selection.get("field")
         generator = random.Random(int(selection.get("seed", SELECTION_SEED)))
         groups = {}
@@ -136,7 +136,8 @@ def _aiperf_public_records(source: Mapping[str, Any], selection: Mapping[str, An
 def _hf_dataset_records(source: Mapping[str, Any], selection: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Selected rows of a Hugging Face dataset at a pinned revision (``hf_dataset``): ``dataset``,
     ``subset``, ``split``, ``revision``, and the ``prompt_column`` / ``image_column`` /
-    ``audio_column`` / ``label_column`` it reads; ``columns`` copies further fields."""
+    ``audio_column`` / ``label_column`` it reads; ``columns`` copies further fields;
+    ``audio_sample_rate`` resamples the audio once for both sides."""
     from types import SimpleNamespace
 
     meta = SimpleNamespace(hf_dataset_name=require(source, "dataset", "source"), hf_subset=source.get("subset"),
@@ -254,12 +255,15 @@ def _interior_point(polygon: Any, size: Sequence[int]) -> tuple[float, float]:
 
 def _hf_rows(name: str, meta: Any, revision: str, source: Mapping[str, Any],
              selection: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Only selected rows are decoded. Audio becomes WAV (the TRTMC worker reads WAV); images keep
-    their original encoded bytes."""
+    """Only selected rows are decoded. Audio becomes WAV (the TRTMC worker reads WAV), at the source's
+    ``audio_sample_rate`` when it sets one; images keep their original encoded bytes."""
+    sample_rate = source.get("audio_sample_rate")
+    if sample_rate is not None and (isinstance(sample_rate, bool) or not isinstance(sample_rate, int)
+                                    or sample_rate <= 0):
+        raise ConfigError(f"audio_sample_rate must be a positive integer, not {sample_rate!r}")
     import io
 
     import datasets
-    import soundfile
     # Streaming datasets (for example LibriSpeech, whose config spans ~30 GB of train splits) are read
     # from the requested split only; media stay encoded until a row is selected.
     # ``data_files`` limits the download to the split's shards (for example ImageNet's validation parquet).
@@ -309,12 +313,11 @@ def _hf_rows(name: str, meta: Any, revision: str, source: Mapping[str, Any],
         if "image" in roles:
             record["image"] = _encoded_media(row[roles["image"]], ".png")
         if "audio" in roles:
-            audio, rate = soundfile.read(io.BytesIO(row[roles["audio"]]["bytes"]), dtype="float32")
-            buffer = io.BytesIO()
-            soundfile.write(buffer, audio, rate, format="WAV", subtype="PCM_16")
-            record["audio"] = {"$file": {"suffix": ".wav", "b64": base64.b64encode(buffer.getvalue()).decode()}}
+            record["audio"] = _wav_media(row[roles["audio"]]["bytes"], sample_rate)
         if label_column:
             record["label"] = row[label_column]
+        if source.get("label_fields"):
+            record["label"] = {name: row[column] for name, column in source["label_fields"].items()}
         if source.get("label_image"):
             record["label"] = {"png_b64": base64.b64encode(row[label_column]["bytes"]).decode()}
         if source.get("polygon_label") and "image" in roles:  # an object mask as a polygon, with a point inside it
@@ -345,6 +348,24 @@ def _encoded_media(value: Mapping[str, Any], default_suffix: str) -> dict[str, A
     with Image.open(io.BytesIO(data)) as image:
         suffix = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp"}.get(image.format or "", default_suffix)
     return {"$file": {"suffix": suffix, "b64": base64.b64encode(data).decode()}}
+
+
+def _wav_media(data: bytes, sample_rate: int | None) -> dict[str, Any]:
+    """Encoded audio as a PCM16 WAV file, polyphase-resampled once to ``sample_rate`` when given: both the
+    native and the TRTMC side then read the same samples instead of resampling them differently."""
+    import numpy as np
+    import soundfile
+
+    audio, rate = soundfile.read(io.BytesIO(data), dtype="float32")
+    if sample_rate and rate != sample_rate:
+        from scipy.signal import resample_poly
+
+        divisor = math.gcd(rate, sample_rate)
+        audio = np.clip(resample_poly(audio, sample_rate // divisor, rate // divisor, axis=0), -1.0, 1.0)
+        rate = sample_rate
+    buffer = io.BytesIO()
+    soundfile.write(buffer, audio, rate, format="WAV", subtype="PCM_16")
+    return {"$file": {"suffix": ".wav", "b64": base64.b64encode(buffer.getvalue()).decode()}}
 
 
 def _field(record: Mapping[str, Any], name: str) -> Any:
@@ -441,7 +462,7 @@ def _square_crop(path: Path, cache: Path) -> Path:
     return target
 
 
-SELECTION_SEED = 20261003  # the seeded selections of every suite (DESIGN.md 4.4)
+SELECTION_SEED = 20261003  # the seeded selections of every suite
 ETTH1_TRAIN_ROWS = 8640  # the standard split's training months: the scaler of the scored MSE
 
 
@@ -463,7 +484,7 @@ def _etth1_window_records(source: Mapping[str, Any], environment: Environment) -
     train = [[float(row[column]) for row in rows[:ETTH1_TRAIN_ROWS]] for column in columns]
     scaler = {"mean": [statistics.fmean(values) for values in train], "std": [statistics.pstdev(values) for values in train]}
     # Windows overlap within context + horizon hours: the bootstrap resamples moving blocks of that many
-    # consecutive windows (DESIGN.md 4.3), so each record carries its position in the series.
+    # consecutive windows, so each record carries its position in the series.
     records, block = [], math.ceil((context + prediction) / stride)
     for index, first in enumerate(starts):
         values = [float(row[column]) for row in rows[first:first + context] for column in columns]
@@ -485,9 +506,21 @@ MODEL_DEFAULT_FIELDS = ("num_steps", "num_inference_steps", "num_sampling_steps"
                         "num_frames", "video_num_frames")
 
 
-def unstated_defaults(request: Mapping[str, Any]) -> list[str]:
-    """The generation controls ``request`` leaves to each side's default (-1)."""
-    return [field for field in MODEL_DEFAULT_FIELDS if request.get(field) in (-1, -1.0)]
+def unstated_defaults(request: Mapping[str, Any], operation: str | None = None) -> list[str]:
+    """Unresolved controls and fields required by the image/video request contract.
+
+    Text, speech and tensor operations do not inherit image-generation requirements.
+    """
+    problems = [field for field in MODEL_DEFAULT_FIELDS if request.get(field) in (-1, -1.0)]
+    if operation == "generate_image":
+        required = ["num_steps", "guidance_scale", "height", "width"]
+        if request.get("media_type") == "video":
+            required.append("num_frames")
+        problems += [field for field in required if request.get(field) in (None, "") and field not in problems]
+        problems += [field for field in ("num_steps", "height", "width", "num_frames")
+                     if field in request and (not isinstance(request[field], (int, float))
+                                              or request[field] <= 0) and field not in problems]
+    return problems
 
 
 def _catalog_testcase_records(source: Mapping[str, Any], environment: Environment) -> list[dict[str, Any]]:
@@ -622,7 +655,7 @@ def _family_input_records(source: Mapping[str, Any], selection: Mapping[str, Any
 
 
 def build_suite(definition: Mapping[str, Any], environment: Environment) -> Suite:
-    from trtmc_perf_serving.files import inline_files
+    from trtmc_perf_serving.files import externalize_files
 
     source = definition["source"]
     kind = require(source, "kind", "source")
@@ -673,7 +706,11 @@ def build_suite(definition: Mapping[str, Any], environment: Environment) -> Suit
             request[request_field] = record[source_field] if source_field in record else _field(record, source_field)
         if isinstance(request.get("prompt"), str) and (definition.get("prompt_prefix") or definition.get("prompt_suffix")):
             request["prompt"] = f"{definition.get('prompt_prefix', '')}{request['prompt']}{definition.get('prompt_suffix', '')}"
-        request = inline_files(request)
+        try:  # the media go to the shared store once; the request keeps their digests
+            request = externalize_files(request, environment.media_root())
+        except ValueError as error:
+            raise ConfigError(f"suite {definition['suite']}: {error}; set media_root (or hf_datasets_cache) "
+                              "in the environment") from error
         sample = {"sample_id": record["id"], "task": record.get("task", definition["suite"]),
                   "request": request, "request_sha": request_sha(request)}
         if "label" in record:

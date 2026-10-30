@@ -6,9 +6,9 @@ A model's configuration is its catalog entry (checkpoint, revision, precision, b
 with the defaults of its Task (config/tasks.yaml). The candidate is the catalog bundle as shipped;
 accuracy comes from the Task's gold-labelled benchmarks (``absolute``) and whole-output checks
 (``supplementary``); a model with neither declares ``accuracy_source: none`` (Perf only). The native
-reference is the generic Hugging Face adapter of the operation. config/models/<profile>.yaml holds the
-exceptions (a reference environment, remote code, another native checkpoint, a build override) and is
-deep-merged last.
+reference is the generic Hugging Face adapter of the operation. Family-owned exceptions live in
+families/<family>/tests/aiperf/<profile>.yaml. Legacy config/models/<profile>.yaml remains supported;
+the family's definition is merged last.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from typing import Any, Mapping
 import yaml
 
 from .config import CONFIG_ROOT, ConfigError, Environment, load_suite
+from .compat import configuration
 
 # Operations the generic Hugging Face reference adapters serve (trtmc_perf_serving.backends.reference).
 HF_OPERATIONS = {"generate", "translate", "encode", "embed", "rerank", "classify", "detect", "segment",
@@ -129,8 +130,6 @@ def _absolute(names: list[Any], definitions: Mapping[str, Any], testcase: Mappin
             suite = load_suite(suite) if isinstance(suite, str) else dict(suite)
             window = {**dict(suite["source"].get("window") or {}), **item.pop("window")}
             item["suite_definition"] = {**suite, "source": {**suite["source"], "window": window}}
-        if "min_native" in item:  # below it the native score is no baseline (half of chance)
-            item["gate"] = {**item["gate"], "min_native": item.pop("min_native")}
         item.setdefault("endpoint", "chat" if testcase.get("use_chat_template") else "completions")
         items.append(item)
     return items
@@ -150,8 +149,15 @@ def resolve_model(profile: str, environment: Environment, root: Path = CONFIG_RO
     if catalog_model.task not in tasks["tasks"]:
         raise ConfigError(f"no Task defaults for {catalog_model.task!r} ({profile})")
     override_path = root / "models" / f"{profile}.yaml"
-    override = (yaml.safe_load(override_path.read_text()) if override_path.is_file() else None) or {}
-    config = deep_merge(deep_merge(tasks["defaults"], tasks["tasks"][catalog_model.task]), override)
+    override = configuration((yaml.safe_load(override_path.read_text()) if override_path.is_file() else None) or {})
+    family_path = repository / "families" / catalog_model.family / "tests" / "aiperf" / f"{profile}.yaml"
+    if family_path.is_file():
+        owned = yaml.safe_load(family_path.read_text())
+        if not isinstance(owned, dict):
+            raise ConfigError(f"{family_path} must contain a mapping")
+        override = deep_merge(override, configuration(owned))
+    config = deep_merge(deep_merge(configuration(tasks["defaults"]),
+                        configuration(tasks["tasks"][catalog_model.task])), override)
     candidate = dict(config.get("candidate", {}))
     # Quantized candidates (the catalog's `quantization`, or a quantized checkpoint declared in
     # config/models) are held to the benchmarks' quantization gates.
@@ -174,7 +180,8 @@ def resolve_model(profile: str, environment: Environment, root: Path = CONFIG_RO
     if build:  # a bundle other than the catalog's: its own name, so the catalog bundle is never served instead
         build.setdefault("name", f"{profile}-qual")
 
-    absolute = _absolute(list(config.get("absolute") or []), tasks.get("benchmarks", {}),
+    definitions = deep_merge(tasks.get("benchmarks", {}), config.get("benchmarks", {}))
+    absolute = _absolute(list(config.get("absolute") or []), definitions,
                          (manifest.get("testcases") or [{}])[0], bool(quantization))
     for item in absolute:  # gold suites: the suite definition, with the benchmark's request settings
         if item.get("metric"):
@@ -191,26 +198,27 @@ def resolve_model(profile: str, environment: Environment, root: Path = CONFIG_RO
         accuracy_source, absolute, supplementary = "none", [], []
     elif absolute or supplementary:
         accuracy_source = "absolute"
-    else:  # reported as an error: the Task's contract is not implemented yet (DESIGN.md Section 6)
+    else:  # reported as an error: the Task's contract is not implemented yet
         accuracy_source = "missing"
 
-    l1 = dict(config["performance"]["l1"])
-    if isinstance(l1["suite"], Mapping) and l1["suite"].get("from_benchmark"):
+    policy = dict(config["performance"])
+    if isinstance(policy["suite"], Mapping) and policy["suite"].get("from_benchmark"):
         # The first problem of one of the model's benchmarks (a catalog testcase that is no workload,
         # for example a 28-value time series against a 512-step model).
-        name = l1["suite"]["from_benchmark"]
+        name = policy["suite"]["from_benchmark"]
         source = next((item for item in absolute if item.get("suite") == name or item.get("name") == name), None)
         if source is None or not isinstance(source.get("suite_definition"), Mapping):
-            raise ConfigError(f"{profile}: performance.l1.suite.from_benchmark {name!r} is not one of its gold suites")
-        l1["suite"] = {**source["suite_definition"], "suite": f"{profile}-{name}-first", "selection": {"method": "first", "count": 1}}
-    l1["suite"] = _suite(l1["suite"], profile, config.get("request"))
+            raise ConfigError(f"{profile}: performance.suite.from_benchmark {name!r} is not one of its gold suites")
+        policy["suite"] = {**source["suite_definition"], "suite": f"{profile}-{name}-first", "selection": {"method": "first", "count": 1}}
+    policy["suite"] = _suite(policy["suite"], profile, config.get("request"))
     size = checkpoint_bytes(catalog_model.hf_id, revision)
-    task_measurement = deep_merge(tasks["defaults"], tasks["tasks"][catalog_model.task])["performance"]["l1"]["measurement"]
+    task_measurement = deep_merge(configuration(tasks["defaults"]),
+                                  configuration(tasks["tasks"][catalog_model.task]))["performance"]["measurement"]
     if size and size > LARGE_CHECKPOINT_BYTES and task_measurement["requests"] > LARGE_MODEL_MEASUREMENT["requests"]:
         # The class replaces the Task's measurement; the profile's own measurement settings still apply on top.
-        stated = ((override.get("performance") or {}).get("l1") or {}).get("measurement") or {}
-        l1["measurement"] = deep_merge(LARGE_MODEL_MEASUREMENT, stated)
-        l1["measurement_reason"] = f"checkpoint {size / 2**30:.0f} GiB > {LARGE_CHECKPOINT_BYTES / 2**30:.0f} GiB"
+        stated = (override.get("performance") or {}).get("measurement") or {}
+        policy["measurement"] = deep_merge(LARGE_MODEL_MEASUREMENT, stated)
+        policy["measurement_reason"] = f"checkpoint {size / 2**30:.0f} GiB > {LARGE_CHECKPOINT_BYTES / 2**30:.0f} GiB"
     bundle = f"{build.get('name', profile)}/{build.get('bundle', catalog_model.bundle_name)}"
     reference_model = reference.pop("model", None)
     reference_revision = reference.pop("revision", None) or (None if reference_model else revision)
@@ -232,8 +240,8 @@ def resolve_model(profile: str, environment: Environment, root: Path = CONFIG_RO
         **({"accuracy_note": str(config["accuracy_note"])} if accuracy_source == "none" else {}),
         "absolute": absolute, "supplementary": supplementary,
         **({"coverage": str(config["coverage"])} if config.get("coverage") else {}),
-        "performance": {"l1": l1, **({"l2": dict(config["performance"]["l2"])}
-                                     if config["performance"].get("l2") else {})},
+        "performance": policy,
+        **({"service_metrics": dict(config["service_metrics"])} if config.get("service_metrics") else {}),
     }
 
 

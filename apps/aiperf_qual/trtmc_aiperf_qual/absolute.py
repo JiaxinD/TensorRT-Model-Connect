@@ -10,10 +10,10 @@ problems, and each side is scored against the gold answers:
 - ``metric`` entries send a suite with gold labels (images, audio, sentence pairs) through AIPerf's
   trtmc_task endpoint and score the outputs here (gold_metrics).
 
-Each entry is a paired non-inferiority decision (``noninferiority``, DESIGN.md Section 4): pass when
+Each entry is a paired non-inferiority decision (``noninferiority``): pass when
 TRTMC's regression against the native model is shown to be below the benchmark's margin, fail when it
-is shown to exceed it, inconclusive otherwise; ``not-comparable`` when the native score is below the
-benchmark's suitability floor ``min_native``. A sampled model answers once per seed on each side and
+is shown to exceed it, inconclusive otherwise. Native absolute capability does not veto the comparison.
+A sampled model answers once per seed on each side and
 is judged on the per-problem seed means.
 """
 
@@ -29,7 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from . import cancel, gold_metrics, noninferiority
+from . import cancel, execution, gold_metrics, noninferiority
 from .aiperf_runner import run_aiperf
 from .config import Environment
 from .judge import light
@@ -39,29 +39,18 @@ from .suites import SELECTION_SEED, build_suite, request_sha
 WORKLOAD_MARGIN_PERCENT = 5.0
 # A request answers within seconds; whole-benchmark runs of large native models take hours.
 RUN_TIMEOUT_S = 12 * 3600
-# DESIGN.md Section 9: a deadline is three times the ledger's time, at least ten minutes.
-DEADLINE_FACTOR, MIN_DEADLINE_S = 3, 600
-
-
-@functools.lru_cache(maxsize=None)
-def _ledger(path: str) -> dict[str, float]:
-    return {name: float(seconds) for name, seconds in json.loads(Path(path).read_text()).items()}
 
 
 def run_timeout(environment: Environment, model: Mapping[str, Any]) -> float:
-    """An AIPerf run's deadline: the profile's in the environment's ``deadlines``, else three times its time in the
-    environment's ``ledger`` (a ledger.json; relative to the repository), at least ten minutes, else
-    RUN_TIMEOUT_S. Every run of a profile gets its whole-profile deadline, so no single run is cut short."""
+    """An explicit per-profile deadline, else the whole-benchmark default.
+
+    Scheduling ledgers may come from rescoring recorded outputs and omit inference time. They cannot
+    safely bound a fresh Native run, so they affect assignment only.
+    """
     profile = model.get("catalog_profile")
     deadline = (environment.values.get("deadlines") or {}).get(profile)
     if deadline:
         return float(deadline)
-    ledger = environment.values.get("ledger")
-    if ledger:
-        path = Path(ledger) if Path(ledger).is_absolute() else environment.path("repo") / ledger
-        seconds = _ledger(str(path)).get(str(profile))
-        if seconds is not None:
-            return max(MIN_DEADLINE_S, DEADLINE_FACTOR * seconds)
     return RUN_TIMEOUT_S
 
 
@@ -132,7 +121,8 @@ def selection_environment(environment: Environment, model: Mapping[str, Any], it
     if item.get("endpoint") == "chat":
         environ["TRTMC_ACCURACY_CHAT"] = "1"
     for key, name in (("per_task", "TRTMC_ACCURACY_PER_TASK"), ("limit", "TRTMC_ACCURACY_LIMIT"),
-                      ("max_new_tokens", "TRTMC_ACCURACY_MAX_NEW_TOKENS")):
+                      ("max_new_tokens", "TRTMC_ACCURACY_MAX_NEW_TOKENS"),
+                      ("answer_tokens", "TRTMC_ACCURACY_ANSWER_TOKENS"), ("prompt_frame", "TRTMC_ACCURACY_PROMPT_FRAME")):
         if item.get(key):
             environ[name] = str(item[key])
     if environment.values.get("smoke"):  # one problem
@@ -170,7 +160,7 @@ def plan(environment: Environment, model: Mapping[str, Any], item: Mapping[str, 
 
 def _fitted(model: Mapping[str, Any], samples: Sequence[Mapping[str, Any]], min_new: int) -> list[dict[str, Any]]:
     """Samples whose prompt leaves at least ``min_new`` tokens to generate on the bundle, each generating at
-    most what is left (the same requests on both sides); the others are dropped (DESIGN.md Section 2)."""
+    most what is left (the same requests on both sides); the others are dropped (the shipped length decides)."""
     from transformers import AutoTokenizer
 
     length = int(model["candidate"].get("max_sequence_length") or 0)
@@ -197,7 +187,9 @@ def _candidate_tokenizer(model: Mapping[str, Any]) -> Any:
     from transformers import AutoTokenizer
 
     name, revision = tokenizer_source(model)
-    return AutoTokenizer.from_pretrained(name, revision=revision,
+    options = ({"subfolder": model["candidate"]["tokenizer_subfolder"]}
+               if model["candidate"].get("tokenizer_subfolder") else {})
+    return AutoTokenizer.from_pretrained(name, revision=revision, **options,
                                          trust_remote_code=bool(model["reference"].get("trust_remote_code")))
 
 
@@ -205,8 +197,7 @@ def _pairs_fitted(model: Mapping[str, Any], samples: Sequence[Mapping[str, Any]]
                   pair_format: str) -> list[dict[str, Any]]:
     """Reranking samples whose documents keep their head, so that each query-document pair, as the bundle's
     reranker forms it (``pair_format`` with ``{query}`` and ``{document}``), fits the bundle's
-    max_sequence_length (a margin of PAIR_MARGIN_TOKENS); the same documents go to both sides (DESIGN.md Section
-    2)."""
+    max_sequence_length (a margin of PAIR_MARGIN_TOKENS); the same documents go to both sides."""
     length = int(model["candidate"].get("max_sequence_length") or 0)
     if not length:
         return list(samples)
@@ -269,6 +260,8 @@ def _arguments(model: Mapping[str, Any], item: Mapping[str, Any], service: Mappi
         arguments.append("--tokenizer-trust-remote-code")
     if item.get("tasks"):
         arguments += ["--accuracy-tasks", *item["tasks"]]
+    if item.get("grader"):
+        arguments += ["--accuracy-grader", item["grader"]]
     # The serving base request is the catalog request: greedy as it is unless it samples (top_k 1 or temperature 0;
     # a family may pin its greedy contract, Qwen3-Omni: temperature 1 with top_k 1); a sampling model's runs are
     # repeated with distinct seeds.
@@ -278,7 +271,8 @@ def _arguments(model: Mapping[str, Any], item: Mapping[str, Any], service: Mappi
 
 
 def _suite_side(environment: Environment, service: Mapping[str, Any], model: Mapping[str, Any],
-                item: Mapping[str, Any], problems: Sequence[Mapping[str, Any]], out: Path) -> dict[str, Any]:
+                item: Mapping[str, Any], problems: Sequence[Mapping[str, Any]], out: Path, *,
+                capacity: bool = False) -> dict[str, Any]:
     """A gold suite through AIPerf's trtmc_task endpoint: the observation and timing of every problem."""
     out.parent.mkdir(parents=True, exist_ok=True)
     inputs = out.parent / f"{out.name}.inputs.jsonl"
@@ -289,43 +283,141 @@ def _suite_side(environment: Environment, service: Mapping[str, Any], model: Map
                                         *_targets(service, f"/v1/tasks/{model['operation']}"), "--input-file", str(inputs), "--custom-dataset-type", "single_turn",
                                         "--dataset-sampling-strategy", "sequential",
                                         "--request-count", str(len(problems))], timeout_s=run_timeout(environment, model))
-    by_request, timing_by_request = {}, {}
+    by_request, timing_by_request, rejected, failing = {}, {}, {}, []
     for record in run.raw_records():
         if record.get("status") != 200 or not record.get("responses"):
+            reason = capacity_rejection(record) if capacity else None
+            if reason and "request" in (record.get("payload") or {}):
+                rejected[request_sha(record["payload"]["request"])] = reason
+            else:
+                failing.append(record)
             continue
         body = json.loads(record["responses"][-1]["text"])
         key = request_sha(record["payload"]["request"])
         by_request[key] = body.get("trtmc_observation") or {}
+        if item.get("postprocess"):
+            by_request[key]["artifact_directory"] = str(Path(service["records"]).parent / "scratch" / body["id"])
         timing_by_request[key] = {"model_call_ms": float((body.get("trtmc_timing") or {}).get("model_call_ms", 0)),
                                   "completion_tokens": by_request[key].get("output_tokens")}
     observations = {index: by_request[problem["request_sha"]] for index, problem in enumerate(problems)
                     if problem["request_sha"] in by_request}
     found = {index: timing_by_request[problem["request_sha"]] for index, problem in enumerate(problems)
              if problem["request_sha"] in timing_by_request}
-    return {"observations": {"greedy": observations}, "exit": {"greedy": run.exit_code}, "timings": {"greedy": found}}
+    side = {"observations": {"greedy": observations}, "exit": {"greedy": run.exit_code}, "timings": {"greedy": found}}
+    out_of_capacity = {index: rejected[problem["request_sha"]] for index, problem in enumerate(problems)
+                       if problem["request_sha"] in rejected and problem["request_sha"] not in by_request}
+    if out_of_capacity:
+        side["rejected"] = {"greedy": out_of_capacity}
+    if failing:
+        side["failed"] = {"greedy": failed_reason(failing, len(failing))}
+    if item.get("postprocess"):
+        from .services import reference_python
+
+        postprocess(environment, item, observations, out, python=reference_python(environment, model))
+    return side
+
+
+def postprocess(environment: Environment, item: Mapping[str, Any], observations: dict[int, Any], out: Path, *,
+                python: str | None = None) -> None:
+    """Augment saved outputs after profiling; a separate process releases its model on exit."""
+    import subprocess
+
+    config = item["postprocess"]
+    source, target = out.parent / f"{out.name}.postprocess-input.json", out.parent / f"{out.name}.postprocess-output.json"
+    source.write_text(json.dumps(observations))
+    command = [str(environment.values.get("scoring_python") or python or environment["serve_python"]),
+               str(environment.path("repo") / config["script"]), "--input", str(source), "--output", str(target),
+               *config.get("arguments", [])]
+    with (out.parent / f"{out.name}.postprocess.log").open("w") as log:
+        subprocess.run(command, check=True, stdout=log, stderr=subprocess.STDOUT,
+                       timeout=float(config.get("timeout_s", 14400)))
+    updated = {int(index): value for index, value in json.loads(target.read_text()).items()}
+    if set(updated) != set(observations):
+        raise ValueError("output postprocessing changed the sample identities")
+    for index, original in observations.items():
+        if any(updated[index].get(key) != value for key, value in original.items()):
+            raise ValueError("output postprocessing changed original evidence")
+    observations.update(updated)
 
 
 def run_side(environment: Environment, service: Mapping[str, Any], model: Mapping[str, Any],
-             item: Mapping[str, Any], problems: Sequence[Mapping[str, Any]], out: Path) -> dict[str, Any]:
-    """Graded records per repetition ({seed or "greedy": {problem index: record}}) and the AIPerf exits."""
+             item: Mapping[str, Any], problems: Sequence[Mapping[str, Any]], out: Path, *,
+             capacity: bool = False) -> dict[str, Any]:
+    units = [problem.get("cluster", problem.get("series", index)) for index, problem in enumerate(problems)]
+    with execution.workload(item["suite"], "both", units=units):
+        return _run_side(environment, service, model, item, problems, out, capacity=capacity)
+
+
+def _run_side(environment: Environment, service: Mapping[str, Any], model: Mapping[str, Any],
+             item: Mapping[str, Any], problems: Sequence[Mapping[str, Any]], out: Path, *,
+             capacity: bool = False) -> dict[str, Any]:
+    """Graded records per repetition ({seed or "greedy": {problem index: record}}) and the AIPerf exits. With
+    ``capacity`` (TRTMC's side), problems the bundle rejects as beyond its capacity are recorded apart."""
     if item.get("metric"):
-        return _suite_side(environment, service, model, item, problems, out / item["suite"])
+        return _suite_side(environment, service, model, item, problems, out / item["suite"], capacity=capacity)
     count = len(problems)
     runs: dict[str, Any] = {"records": {}, "exit": {}, "timings": {}}
     for seed in item.get("seeds") or [None]:  # smoke too: the seed-mean scorer of a sampled model runs
         name = "greedy" if seed is None else f"seed{seed}"
         run = run_aiperf(environment, out / f"{item['suite']}-{name}", _arguments(model, item, service, count, seed),
                          env=selection_environment(environment, model, item), timeout_s=run_timeout(environment, model))
-        raw = run.raw_records()
-        # AIPerf grades a failed request as an empty (wrong) answer: it is a missing answer instead.
-        failed = {int(record["metadata"]["session_num"]) for record in raw if unanswered(record)}
-        runs["records"][name] = {int(record["session_num"]): record for record in run.accuracy_records()
-                                 if int(record["session_num"]) not in failed}
-        runs["exit"][name] = run.exit_code
-        runs["timings"][name] = timings(raw)
-        if failed:
-            runs.setdefault("failed", {})[name] = failed_reason(raw, len(failed))
+        side = plugin_side(run, problems, capacity=capacity)
+        for key in ("records", "exit", "timings", "rejected", "failed"):
+            if key in side:
+                runs.setdefault(key, {})[name] = side[key]
     return runs
+
+
+def plugin_side(run, problems: Sequence[Mapping[str, Any]], *, capacity: bool = False,
+                grades: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+    """Read one recorded benchmark pass, keyed by the actual dataset question."""
+    indices = run.conversation_indices()
+    if len(indices) != len(problems):
+        raise ValueError(f"accuracy inputs contain {len(indices)} questions, expected {len(problems)}")
+
+    def index(metadata):
+        identity = metadata.get("conversation_id")
+        if identity not in indices:
+            raise ValueError(f"accuracy conversation {identity!r} is absent from saved inputs")
+        return indices[identity]
+
+    raw = run.raw_records()
+    # Rejected capacity stays outside the comparison; other failed requests remain missing answers.
+    rejected = {index(record["metadata"]): reason for record in raw
+                if capacity and (reason := capacity_rejection(record))}
+    failing = [record for record in raw if unanswered(record) and index(record["metadata"]) not in rejected]
+    failed = {index(record["metadata"]) for record in failing}
+    records = {}
+    for record in run.accuracy_records() if grades is None else grades:
+        position = index(record)
+        if position in failed | set(rejected):
+            continue
+        if position in records:
+            raise ValueError(f"duplicate accuracy conversation {record['conversation_id']!r}")
+        expected = str(record.get("expected", "")).strip()
+        gold = str(problems[position]["gold"]).strip()
+        if expected != gold and record.get("grader_name"):
+            # Some graders export a canonical gold (for example normalized
+            # sentence punctuation). Validate with that same grader, not a new rule.
+            import asyncio
+
+            from aiperf.plugin import plugins
+            from aiperf.plugin.enums import PluginType
+
+            grader = plugins.get_class(PluginType.ACCURACY_GRADER, record["grader_name"])(run=None)
+            try:
+                gold = asyncio.run(grader.grade("", problems[position]["gold"])).ground_truth.strip()
+            finally:
+                asyncio.run(grader.aclose())
+        if expected != gold:
+            raise ValueError(f"accuracy conversation {record['conversation_id']!r} has a mismatched gold answer")
+        records[position] = record
+    side = {"records": records, "exit": run.exit_code, "timings": timings(raw, indices)}
+    if rejected:
+        side["rejected"] = rejected
+    if failed:
+        side["failed"] = failed_reason(failing, len(failed))
+    return side
 
 
 def unanswered(record: Mapping[str, Any]) -> bool:
@@ -337,6 +429,33 @@ def unanswered(record: Mapping[str, Any]) -> bool:
     return bool(error) and not (isinstance(error, Mapping) and error.get("type") == "InvalidInferenceResultError")
 
 
+# Words of TRTMC's prompt-length rejections (the near-capacity request's search).
+CAPACITY_WORDS = ("exceed", "capacity", "exhaust")
+# TRTMC's rejection of an input beyond the bundle's shipped capacity: exceeding its prompt or cache length or an
+# input limit ("prompt exceeds the prefill profile", "exceeds the model's fixed KV cache capacity", "exceeded its
+# fixed cache length", "exceeds the bundle's single-segment limit"), not any other rejected request.
+CAPACITY_LIMIT = re.compile(r"\b(exceed|exhaust)\w*\b.*\b(prefill profile|kv ?cache|cache length|max_length|max_seq_len"
+                            r"|max_input_duration|segment limit|engine capacity)", re.IGNORECASE)
+
+
+def capacity_rejection(record: Mapping[str, Any]) -> str | None:
+    """TRTMC's message when it rejected the request (HTTP 422, ``backend_rejected_request``) because the input
+    exceeds the bundle's capacity, else None (such a problem is out of scope)."""
+    error = record.get("error")
+    if record.get("status") != 422 or not isinstance(error, Mapping):
+        return None
+    try:  # the server's JSON error body inside AIPerf's error
+        body = json.loads(error.get("message") or "")["error"]
+    except (TypeError, ValueError, KeyError):
+        return None
+    if not isinstance(body, Mapping):
+        return None
+    message = str(body.get("message") or "")
+    if body.get("code") != "backend_rejected_request" or not CAPACITY_LIMIT.search(message):
+        return None
+    return message[:300]
+
+
 def failed_reason(raw_records: Sequence[Mapping[str, Any]], count: int) -> str:
     """How many requests failed, and the first error (e.g. the backend rejecting every request)."""
     first = next((record.get("error") for record in raw_records if unanswered(record)), None)
@@ -344,7 +463,7 @@ def failed_reason(raw_records: Sequence[Mapping[str, Any]], count: int) -> str:
     return f"{count} requests failed: {str(message)[:300]}"
 
 
-def timings(raw_records: Sequence[Mapping[str, Any]]) -> dict[int, dict[str, float]]:
+def timings(raw_records: Sequence[Mapping[str, Any]], indices: Mapping[str, int] | None = None) -> dict[int, dict[str, float]]:
     """Per problem: the server's model-call time and token counts (from the OpenAI response body)."""
     found = {}
     for record in raw_records:
@@ -355,7 +474,9 @@ def timings(raw_records: Sequence[Mapping[str, Any]]) -> dict[int, dict[str, flo
                 continue
             timing, usage = body.get("trtmc_timing") or {}, body.get("usage") or {}
             if timing.get("model_call_ms") is not None:
-                found[int(record["metadata"]["session_num"])] = {
+                metadata = record["metadata"]
+                position = indices[metadata["conversation_id"]] if indices is not None else int(metadata["session_num"])
+                found[position] = {
                     "model_call_ms": float(timing["model_call_ms"]), "prompt_tokens": usage.get("prompt_tokens"),
                     "completion_tokens": usage.get("completion_tokens")}
     return found
@@ -363,7 +484,7 @@ def timings(raw_records: Sequence[Mapping[str, Any]]) -> dict[int, dict[str, flo
 
 def workload_perf(candidate: Mapping[int, Mapping[str, Any]], native: Mapping[int, Mapping[str, Any]]) -> dict[str, Any]:
     """Model-call time on the benchmark's own requests, over the problems both sides answered with the
-    same number of tokens (informational: the Perf L1 gate times the catalog request)."""
+    same number of tokens (informational: the Perf performance gate times the catalog request)."""
     pairs = [(candidate[index], native[index]) for index in sorted(set(candidate) & set(native))
              if candidate[index].get("completion_tokens") == native[index].get("completion_tokens")]
     if not pairs:
@@ -377,6 +498,33 @@ def workload_perf(candidate: Mapping[int, Mapping[str, Any]], native: Mapping[in
             "speedup": round(theirs / mine, 3) if mine else None,
             "light": light(mine, theirs, WORKLOAD_MARGIN_PERCENT) if mine and theirs else "white",
             "prompt_tokens_p50": statistics.median(prompts) if prompts else None}
+
+
+NO_ANSWER = "(no TRTMC answer)"
+# Corpus metrics where a missing TRTMC output scores as an empty one (an empty transcript or translation).
+EMPTY_ANSWERS = {"wer": {"text": ""}, "chrf": {"text": ""}}
+
+
+def _unanswered_note(count: int, candidate: Mapping[str, Any]) -> str:
+    reason = next(iter((candidate.get("failed") or {}).values()), "")
+    return f"{count} problems without a TRTMC answer are counted as wrong" + (f" ({reason})" if reason else "")
+
+
+def _missing_as_wrong(candidate: Mapping[str, Any], native: Mapping[str, Any]) -> tuple[dict[str, Any], str | None]:
+    """``candidate`` with a wrong answer for every problem the native side answered and TRTMC did not: a
+    request TRTMC failed or rejected is TRTMC's miss, not missing evidence (a native miss stays one)."""
+    records, missed = {}, set()
+    for name, theirs in (native.get("records") or {}).items():
+        mine = dict((candidate.get("records") or {}).get(name) or {})
+        for index in theirs:
+            if index not in mine:
+                mine[index] = {"passed": False, "unparsed": True, "actual": NO_ANSWER}
+                missed.add(index)
+        records[name] = mine
+    if not missed:
+        return dict(candidate), None
+    filled = {**candidate, "records": {**(candidate.get("records") or {}), **records}}
+    return filled, _unanswered_note(len(missed), candidate)
 
 
 def _correct(record: Mapping[str, Any] | None) -> bool | None:
@@ -408,20 +556,17 @@ def _paired(problems: Sequence[Mapping[str, Any]], candidate: Mapping[int, Any],
 
 
 def status(entry: Mapping[str, Any]) -> tuple[str, list[str]]:
-    """pass / fail / inconclusive / not-comparable / error of a scored entry (also when re-judging a
-    report): every expected problem answered on both sides, a native score above the suitability
-    floor, then the entry's non-inferiority outcome under its gate."""
+    """Compare the conversion's scored difference, regardless of native absolute capability.
+
+    Old reports may carry ``min_native``; it no longer overrides the difference
+    test. Missing answers and statistical uncertainty retain their own outcomes.
+    """
     metrics, gate = entry.get("metrics") or {}, entry.get("gate") or {}
     expected, paired = int(entry.get("expected_samples") or 0), int(entry.get("samples") or 0)
     if paired < expected:
         return "error", [f"{expected - paired} of {expected} problems lack a graded answer on one side"
                          + (f" ({metrics['failed']})" if metrics.get("failed") else "")]
     native = metrics.get("native_score")
-    if native is not None and gate.get("min_native") is not None and native < float(gate["min_native"]):
-        # Too few right answers from the native model (at or near chance): the benchmark does not
-        # discriminate for this model, so it says nothing about TRTMC.
-        return "not-comparable", [f"the native model scores {native:g} (< {gate['min_native']:g}): the benchmark "
-                                  "does not fit this model"]
     test = metrics.get("test") or {}
     if test.get("outcome") is None:
         return "error", ["no non-inferiority outcome"]
@@ -462,6 +607,8 @@ def judge_corpus(item: Mapping[str, Any], problems: Sequence[Mapping[str, Any]],
     expected = len(problems)
     mine = gold_metrics.answered(item["metric"], problems, candidate["observations"]["greedy"])
     theirs = gold_metrics.answered(item["metric"], problems, native["observations"]["greedy"])
+    missed = sorted(set(theirs) - set(mine)) if item["metric"] in EMPTY_ANSWERS else []
+    mine = {**mine, **{index: dict(EMPTY_ANSWERS[item["metric"]]) for index in missed}}
     paired = len(set(mine) & set(theirs))
     entry: dict[str, Any] = {"suite": item["suite"], "source": "absolute", "benchmark": item["metric"],
                              "endpoint": "trtmc_task", "expected_samples": expected, "samples": paired, "passed": None,
@@ -478,6 +625,8 @@ def judge_corpus(item: Mapping[str, Any], problems: Sequence[Mapping[str, Any]],
                         "higher_is_better": comparison["higher_is_better"], "units": comparison["units"], "test": test}
     entry["workload_perf"] = workload_perf(candidate["timings"]["greedy"], native["timings"]["greedy"])
     entry["status"], entry["reasons"] = status(entry)
+    if missed:
+        entry["notes"] = [_unanswered_note(len(missed), candidate)]
     return entry
 
 
@@ -488,14 +637,24 @@ def judge_parity(item: Mapping[str, Any], problems: Sequence[Mapping[str, Any]],
     compare = gold_metrics.PARITY[item["metric"]]
     mine, theirs = candidate["observations"]["greedy"], native["observations"]["greedy"]
     expected = len(problems)
-    paired = sorted(set(mine) & set(theirs))
+
+    def usable(observation: Any) -> bool:  # a valid output agrees with itself (unreadable or not finite: it does not)
+        try:
+            return isinstance(observation, Mapping) and compare(observation, observation, item["gate"])[0] is True
+        except Exception:  # noqa: BLE001 - malformed values
+            return False
+
+    native_usable = [index for index in range(expected) if usable(theirs.get(index))]
+    missed = [index for index in native_usable if not usable(mine.get(index))]  # TRTMC's misses: outside it
+    paired = [index for index in native_usable if index not in missed]
     entry: dict[str, Any] = {"suite": item["suite"], "source": "absolute", "benchmark": item["metric"],
-                             "endpoint": "trtmc_task", "expected_samples": expected, "samples": len(paired),
+                             "endpoint": "trtmc_task", "expected_samples": expected, "samples": len(native_usable),
                              "gate": dict(item["gate"]), "aiperf_exit": {"trtmc": candidate["exit"], "native": native["exit"]}}
-    if len(paired) < expected:
+    if len(native_usable) < expected:
         return {**entry, "passed": None, "status": "error",
-                "reasons": [f"{expected - len(paired)} of {expected} problems lack an output on one side"]}
+                "reasons": [f"{expected - len(native_usable)} of {expected} problems lack a usable native output"]}
     results = [(index, *compare(mine[index], theirs[index], item["gate"])) for index in paired]
+    results += [(index, False, NO_ANSWER) for index in missed]
     unreadable = [reason for _, ok, reason in results if ok is None]
     if unreadable:  # an output missing or unreadable is missing evidence, never a failure
         return {**entry, "passed": None, "status": "error",
@@ -533,6 +692,7 @@ def judge(item: Mapping[str, Any], problems: Sequence[Mapping[str, Any]], candid
         return judge_corpus(item, problems, candidate, native)
     if item.get("metric"):
         candidate, native = _graded(item, problems, candidate), _graded(item, problems, native)
+    candidate, unanswered_note = _missing_as_wrong(candidate, native)
     expected = len(problems)
     entry: dict[str, Any] = {"suite": item["suite"], "source": "absolute",
                              "benchmark": item.get("plugin") or item["metric"],
@@ -574,7 +734,56 @@ def judge(item: Mapping[str, Any], problems: Sequence[Mapping[str, Any]], candid
     entry["workload_perf"] = workload_perf(candidate.get("timings", {}).get(first, {}),
                                            native.get("timings", {}).get(first, {}))
     entry["status"], entry["reasons"] = status(entry)
+    if unanswered_note:
+        entry["notes"] = [*entry.get("notes", []), unanswered_note]
     return entry
+
+
+def rejected(side: Mapping[str, Any]) -> dict[int, str]:
+    """The problems a side's backend rejected as beyond the bundle's capacity, in any repetition."""
+    return {index: reason for found in (side.get("rejected") or {}).values() for index, reason in found.items()}
+
+
+def _kept(side: Mapping[str, Any], keep: Sequence[int]) -> dict[str, Any]:
+    """``side`` with only the problems ``keep`` (old indices), renumbered in that order."""
+    new = {old: index for index, old in enumerate(keep)}
+    renumbered = {key: {name: {new[old]: value for old, value in found.items() if old in new}
+                        for name, found in (side.get(key) or {}).items()}
+                  for key in ("records", "observations", "timings") if key in side}
+    return {**side, **renumbered, "rejected": {}}
+
+
+# Corpus metrics whose rows refer to each other (sentence pairs, a query and its documents): a row cannot leave alone.
+STRUCTURED_METRICS = {"sts_spearman", "retrieval_ndcg", "retrieval_ndcg10"}
+
+
+def judge_in_capacity(item: Mapping[str, Any], problems: Sequence[Mapping[str, Any]], candidate: Mapping[str, Any],
+                      native: Mapping[str, Any]) -> dict[str, Any]:
+    """``judge`` over the problems within the bundle's capacity: one TRTMC rejected as exceeding it (prompt or
+    cache length, an input limit) leaves the comparison on both sides, and the entry reports how many did
+    (like an unfitted prompt). In a corpus whose rows refer to each other it stays a missing answer."""
+    beyond = rejected(candidate)
+    if not beyond:
+        return judge(item, problems, candidate, native)
+    note = (f"{len(beyond)} of {len(problems)} problems exceed the TRTMC bundle's capacity"
+            f" ({next(iter(beyond.values()))})")
+    if item.get("metric") in STRUCTURED_METRICS:
+        entry = judge(item, problems, candidate, native)
+        return {**entry, "out_of_capacity": len(beyond), "notes": [*entry.get("notes", []), note]}
+    keep = [index for index in range(len(problems)) if index not in beyond]
+    note += " and are left out on both sides"
+    if not keep:
+        return {**error_entry(item, len(problems), f"every problem exceeds the bundle's capacity: {note}"),
+                "out_of_capacity": len(beyond)}
+    entry = judge(item, [problems[index] for index in keep], _kept(candidate, keep), _kept(native, keep))
+
+    def original(sample_id: str) -> str:  # a right/wrong entry's task/index: the request's own index
+        task, _, index = str(sample_id).rpartition("/")
+        return f"{task}/{keep[int(index)]}" if "counts" in entry and task and index.isdigit() else sample_id
+
+    failures = [{**failure, "sample_id": original(failure.get("sample_id", ""))} for failure in entry.get("failures", [])]
+    return {**entry, **({"failures": failures} if "failures" in entry else {}), "out_of_capacity": len(beyond),
+            "notes": [*entry.get("notes", []), note]}
 
 
 def error_entry(item: Mapping[str, Any], expected: int, error: str) -> dict[str, Any]:
@@ -602,14 +811,15 @@ def _probe(service: Mapping[str, Any], operation: str, request: Mapping[str, Any
 
 def keeps_artifacts(model: Mapping[str, Any]) -> bool:
     """A benchmark reads the output files the servers write (their scratch is then kept)."""
-    return any(item.get("metric") in gold_metrics.ARTIFACT_METRICS for item in model.get("absolute", []))
+    return any(item.get("postprocess") or item.get("metric") in gold_metrics.ARTIFACT_METRICS
+               for item in model.get("absolute", []))
 
 
 def run_native(environment: Environment, model: Mapping[str, Any], python: str, plans: Mapping[str, Sequence],
                out: Path, probe_request: Mapping[str, Any] | None = None, *, mps_env: Mapping[str, str] | None = None,
                precisions: Sequence[str] | None = None, started: Callable[[Mapping[str, Any]], None] | None = None,
                go: threading.Event | None = None, finished: threading.Event | None = None,
-               release: threading.Event | None = None) -> dict[str, Any]:
+               release: threading.Event | None = None, copies: int | None = None) -> dict[str, Any]:
     """Every benchmark on the native model: the reference adapter, eager, at the first precision of
     ``timing_precisions`` it serves. The adapter runs as up to ``native_replicas`` (environment) copies
     that fit on the GPU, each answering one problem at a time: the answers do not change, its model-call
@@ -618,8 +828,9 @@ def run_native(environment: Environment, model: Mapping[str, Any], python: str, 
 
     errors = []
     for precision in precisions or timing_precisions(model["reference"]):
+        evidence_start = execution.checkpoint()
         try:
-            count = 1 if environment.values.get("smoke") else int(environment.values.get("native_replicas") or 1)
+            count = copies or native_copies(environment)
             with serving_replicas(environment, dict(model), "reference", out / f"absolute-native-server-{precision}",
                                   count=count, mode="eager", precision=precision, python=python,
                                   keep_artifacts=keeps_artifacts(model), mps_env=mps_env) as service:
@@ -633,6 +844,11 @@ def run_native(environment: Environment, model: Mapping[str, Any], python: str, 
                     runs = {item["suite"]: run_side(environment, service, model, item, plans[item["suite"]],
                                                     out / f"absolute-native-{precision}")
                             for item in model["absolute"]}
+                    for name, side in runs.items():
+                        answers = side.get("observations") or side.get("records") or {}
+                        if side.get("failed") and not any(answers.values()):
+                            raise RuntimeError(f"{name}: no successful native responses "
+                                               f"({next(iter(side['failed'].values()))})")
                 finally:  # sharing an MPS daemon, no copy leaves while the other side's copies still answer
                     if finished is not None:
                         finished.set()
@@ -642,8 +858,30 @@ def run_native(environment: Environment, model: Mapping[str, Any], python: str, 
                     "mps": bool(service.get("mps")),
                     **({"fallback_from": "; ".join(errors)[:600]} if errors else {})}
         except Exception as error:  # noqa: BLE001 - the next precision
+            execution.supersede(evidence_start)
             errors.append(f"{precision}: {type(error).__name__}: {str(error)[-300:]}")
     raise RuntimeError("; ".join(errors)[:1500])
+
+
+def native_copies(environment: Environment) -> int:
+    return 1 if environment.values.get("smoke") else int(environment.values.get("native_replicas") or 1)
+
+
+def run_native_alone(environment: Environment, model: Mapping[str, Any], python: str, plans: Mapping[str, Sequence],
+                     out: Path, probe_request: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """The native side on its own (no overlap, or it failed there). When its copies ran out of GPU memory on
+    some problems (a large input on each of several copies at once), it answers again as half as many copies,
+    down to one, each attempt in a directory of its own."""
+    copies, reduced = native_copies(environment), []
+    while True:
+        where = out / f"native-{copies}-copies" if reduced else out
+        native = run_native(environment, model, python, plans, where, probe_request, copies=copies)
+        started = int(native.get("replicas") or copies)  # fewer may have fit the GPU
+        gap = incomplete(model, plans, native["runs"])
+        if not gap or started == 1 or "out of memory" not in gap.lower():
+            return {**native, **({"copies_reduced": "; ".join(reduced)[:600]} if reduced else {})}
+        reduced.append(f"{started} copies: {gap}"[:300])
+        copies = max(1, started // 2)
 
 
 def incomplete(model: Mapping[str, Any], plans: Mapping[str, Sequence], runs: Mapping[str, Any]) -> str | None:
@@ -657,7 +895,8 @@ def incomplete(model: Mapping[str, Any], plans: Mapping[str, Sequence], runs: Ma
             return f"{item['suite']}: {next(iter(side['failed'].values()))}"
         answered = side.get("observations") if "observations" in side else side.get("records")
         for name, found in (answered or {}).items():
-            if len(found) < len(plans[item["suite"]]):
+            beyond = len((side.get("rejected") or {}).get(name) or {})  # out of scope: not a missing answer
+            if len(found) + beyond < len(plans[item["suite"]]):
                 return f"{item['suite']} ({name}): {len(found)} of {len(plans[item['suite']])} answered"
         if not answered:
             return f"{item['suite']}: no answers"
@@ -750,8 +989,20 @@ def overlapped_acc(environment: Environment, model: Mapping[str, Any], python: s
 
 def run_candidate(environment: Environment, service: Mapping[str, Any], model: Mapping[str, Any],
                   plans: Mapping[str, Sequence], out: Path) -> dict[str, Any]:
-    return {item["suite"]: run_side(environment, service, model, item, plans[item["suite"]], out / "absolute-trtmc")
+    return {item["suite"]: run_side(environment, service, model, item, plans[item["suite"]], out / "absolute-trtmc",
+                                    capacity=True)
             for item in model["absolute"]}
+
+
+def precision_gate(item: Mapping[str, Any], native_precision: str | None,
+                   candidate_precision: str | None) -> Mapping[str, Any]:
+    """The item with its mismatched-precision tolerance when the native model ran at another precision."""
+    if (native_precision and candidate_precision and native_precision != candidate_precision
+            and item.get("mismatched_precision_gate")):
+        return {**item, "gate": dict(item["mismatched_precision_gate"]),
+                "precision_note": f"native {native_precision} vs TRTMC {candidate_precision}: "
+                                  "the mismatched-precision tolerance applies"}
+    return item
 
 
 def entries(model: Mapping[str, Any], plans: Mapping[str, Sequence], candidate: Mapping[str, Any],
@@ -761,14 +1012,24 @@ def entries(model: Mapping[str, Any], plans: Mapping[str, Sequence], candidate: 
     runs = native.get("runs") or {}
     for item in model["absolute"]:
         problems = plans[item["suite"]]
+        if not problems:  # nothing to compare: not a score of zero on either side
+            length = model.get("candidate", {}).get("max_sequence_length")
+            results.append({**error_entry(item, 0, f"no {item['suite']} problem fits the bundle"
+                                          + (f"'s {length}-token sequence length" if length else "")),
+                            "candidate_replicas": candidate_replicas, "candidate_mps": candidate_mps})
+            continue
+        item = precision_gate(item, native.get("precision"), model.get("candidate", {}).get("precision"))
         if native_error or item["suite"] not in runs:
             results.append({**error_entry(item, len(problems), f"native side: {native_error or 'not run'}"),
                             "candidate_replicas": candidate_replicas, "candidate_mps": candidate_mps})
         else:
-            entry = judge(item, problems, candidate[item["suite"]], runs[item["suite"]])
+            entry = judge_in_capacity(item, problems, candidate[item["suite"]], runs[item["suite"]])
+            if item.get("precision_note"):
+                entry["notes"] = [*entry.get("notes", []), item["precision_note"]]
             entry["native"] = {"backend": native.get("backend"), "precision": native.get("precision"), "mode": "eager",
                                "replicas": native.get("replicas", 1), "mps": bool(native.get("mps")),
-                               **({"fallback_from": native["fallback_from"]} if native.get("fallback_from") else {})}
+                               **({"fallback_from": native["fallback_from"]} if native.get("fallback_from") else {}),
+                               **({"copies_reduced": native["copies_reduced"]} if native.get("copies_reduced") else {})}
             concurrent = [f"{side} ran as {copies} concurrent copies" for side, copies in
                           (("native", native.get("replicas", 1)), ("TRTMC", candidate_replicas)) if copies > 1]
             concurrent += ["both sides answered at once"] if concurrent_sides else []

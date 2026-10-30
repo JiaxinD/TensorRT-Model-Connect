@@ -12,6 +12,7 @@ directory holds a final result is skipped unless ``rerun`` (the old directory is
 from __future__ import annotations
 
 import collections
+import copy
 import functools
 import hashlib
 import json
@@ -28,8 +29,10 @@ from typing import Any, Mapping, Sequence
 from . import bundles, retention
 from .bundles import prefetch
 from .config import Environment
+from .judge import QUALIFYING_MODE
 from .models import checkpoints
-from .report import counted
+from .compat import report as normalized_report
+from .report import acc_value, plain
 from .services import reference_python
 
 KEPT_ASIDE = re.compile(r"\.\d{10}$")  # <profile>.<unix time> of a previous run
@@ -167,10 +170,11 @@ def run_one(environment: Environment, model: dict[str, Any], out: Path) -> dict[
     """Build the bundle when missing, qualify, and apply the bundle retention policy. A previous run
     in ``out`` is set aside first."""
     started = time.time()
+    model = copy.deepcopy(model)  # resolved build capacity must not mutate the caller's resume configuration
     set_aside(out)
     out.mkdir(parents=True, exist_ok=True)
     (out / RUN_KEY).write_text(run_key(environment, model) + "\n")
-    bundle_policy, _ = retention.policies(environment)
+    bundle_policy, hf_policy = retention.policies(environment)
     record: dict[str, Any] = {"profile": model["model"], "task": model.get("task")}
     with ThreadPoolExecutor(max_workers=1) as warm:
         warm.submit(warm_selections, environment, model)  # CPU work while the GPU builds
@@ -190,8 +194,20 @@ def run_one(environment: Environment, model: dict[str, Any], out: Path) -> dict[
         except Exception as error:  # noqa: BLE001
             record.update(category="error", reason=_error(error))
             (out / "error.json").write_text(json.dumps({**record, "traceback": traceback.format_exc()}, indent=2))
-        if retention.should_delete_bundle(bundle_policy, record["category"], built=build.get("status") == "built"):
+        category = record["category"]
+        if category == "measured" and record.get("acc") == "pass" and record.get("perf") == "measured":
+            category = "pass"
+        if retention.should_delete_bundle(bundle_policy, category, built=build.get("status") == "built"):
             record["bundle_deleted"] = retention.delete_bundle(environment, model)
+    category = record["category"]
+    if category == "measured" and record.get("acc") == "pass" and record.get("perf") == "measured":
+        category = "pass"
+    cleanup = {"bundle_policy": bundle_policy, "hf_cache_policy": hf_policy,
+               "temporary_files": retention.cleanup_temporary(environment, out, category)}
+    if "bundle_deleted" in record:
+        cleanup["bundle"] = record["bundle_deleted"]
+    (out / "retention.json").write_text(json.dumps(cleanup, indent=2))
+    record["temporary_files"] = cleanup["temporary_files"]
     record["seconds"] = round(time.time() - started)
     return record
 
@@ -233,6 +249,7 @@ def run_all(environment: Environment, models: Sequence[dict[str, Any]], out_root
     _, hf_policy = retention.policies(environment)
     ordered = list(models) if keep_order else order(models)
     remaining = collections.Counter(repo for model in ordered for repo in checkpoints(model))
+    failed_checkpoints: set[str] = set()
     out_root.mkdir(parents=True, exist_ok=True)
     records = []
     with ThreadPoolExecutor(max_workers=1) as downloads, open(out_root / "campaign.jsonl", "a") as log:
@@ -247,9 +264,11 @@ def run_all(environment: Environment, models: Sequence[dict[str, Any]], out_root
             else:
                 set_aside(out)
                 record = run_one(environment, model, out)
+            if record["category"] in ("error", "build-failed", "smoke-fail"):
+                failed_checkpoints.update(checkpoints(model))
             for repo in sorted(checkpoints(model)):
                 remaining[repo] -= 1
-                if remaining[repo] == 0 and hf_policy == "delete_unused":
+                if remaining[repo] == 0 and hf_policy == "delete_unused" and repo not in failed_checkpoints:
                     record.setdefault("checkpoints_deleted", []).append(
                         retention.delete_checkpoint(Path(environment["hf_hub_cache"]), repo))
             record = {**record, "host": socket.gethostname(), "position": index + 1, "started_at": started_at}
@@ -261,7 +280,7 @@ def run_all(environment: Environment, models: Sequence[dict[str, Any]], out_root
 
 
 CATEGORIES = ("error", "config-error", "build-failed", "not-run", "acc-issue", "not-covered", "acc-inconclusive",
-              "not-comparable", "perf-issue", "perf-inconclusive", "pass", "excluded", "smoke-fail", "smoke-pass")
+              "not-comparable", "perf-issue", "perf-inconclusive", "measured", "pass", "excluded", "smoke-fail", "smoke-pass")
 EXCLUSIONS = "excluded.json"
 PLAN = "plan.json"
 HARNESS_FAILURES = ("error", "build-failed")
@@ -289,9 +308,21 @@ def exit_code(records: Sequence[Mapping[str, Any]], config_errors: Sequence[Mapp
 
 
 def write_exclusions(out_root: Path, excluded: Sequence[Mapping[str, Any]]) -> None:
-    """Record the profiles the machine's model list leaves out, so the summary shows them."""
+    """Audit the profiles the machine's model list leaves out, outside result statistics."""
     out_root.mkdir(parents=True, exist_ok=True)
     (out_root / EXCLUSIONS).write_text(json.dumps(list(excluded), indent=2) + "\n")
+
+
+def _precision(report: Mapping[str, Any], directory: Path) -> dict[str, str | None]:
+    """Each side's precision: TRTMC's from the bundle the run built, the native model's as timed (else as it
+    answered the benchmarks)."""
+    model = directory / "model.json"
+    trtmc = (json.loads(model.read_text()).get("candidate") or {}).get("precision") if model.is_file() else None
+    native = next((precision for precision in [*((item.get("reference") or {}).get("precision")
+                                                for item in report.get("performance", [])),
+                                               *((item.get("native") or {}).get("precision")
+                                                 for item in report.get("accuracy", []))] if precision), None)
+    return {"trtmc": trtmc, "native": native}
 
 
 def _row(directory: Path) -> dict[str, Any] | None:
@@ -301,12 +332,15 @@ def _row(directory: Path) -> dict[str, Any] | None:
         path = directory / name
         if not path.is_file():
             continue
-        value = json.loads(path.read_text())
+        value = normalized_report(json.loads(path.read_text())) if name == "report.json" else json.loads(path.read_text())
         if name == "report.json":
             return {"task": value.get("task"), "category": value["verdict"]["category"],
-                    "directory": str(directory), "repro": value.get("repro"), "l2": value.get("performance_l2"),
+                    "precision": _precision(value, directory),
+                    "directory": str(directory), "repro": value.get("repro"), "service_metrics": value.get("service_metrics"),
+                    "aiperf_metrics": value.get("aiperf_metrics", []),
+                    "performance_source": value.get("performance_source"),
                     "time": float(value.get("started") or path.stat().st_mtime),
-                    "accuracy": value.get("accuracy", []), "perf": value.get("performance_l1", []),
+                    "accuracy": value.get("accuracy", []), "perf": value.get("performance", []),
                     "backend": (value.get("reference") or {}).get("backend", ""),
                     "notes": "; ".join([*([f"coverage: {value['coverage']}"] if value.get("coverage") else []),
                                         *(f"{key}: {text[:100]}" for key, text in value.get("errors", {}).items())])}
@@ -320,29 +354,151 @@ def _row(directory: Path) -> dict[str, Any] | None:
 
 
 def _accuracy_text(items: Sequence[Mapping[str, Any]]) -> str:
-    def one(item: Mapping[str, Any]) -> str:
-        extra = ", informational" if item.get("informational") else ""
-        need = (f"need {item['required_passes']}" if item.get("required_passes") is not None
-                else f"gate {json.dumps(item.get('gate', {}))}")
-        status = f"{item['status']} " if item.get("status") else ""
-        return f"{item['suite']} {status}{counted(item)} ({need}{extra})"
-    return "; ".join(one(item) for item in items)
+    return "; ".join(acc_value(item) for item in items if not item.get("informational"))
 
 
-def _perf_text(items: Sequence[Mapping[str, Any]]) -> str:
-    return ", ".join(f"{item['reference_mode']}{'/' + item['request'] if item.get('request') else ''} {item['light']}"
-                     + (f" {item['speedup']:.2f}x" if item.get("speedup") else "") for item in items)
+def ms(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return "—"
+    return f"{value:.0f} ms" if value >= 100 else f"{value:.1f} ms" if value >= 1 else f"{value:.3f} ms"
+
+
+def measurement_note(item: Mapping[str, Any]) -> str:
+    """Surface workload and coverage limits beside the summary's task-call timings."""
+    if item.get("kind") != "natural_dataset":
+        return ""
+    notes = []
+    pairs = item.get("pairs", 0)
+    unmatched = pairs - item.get("matched_pairs", 0)
+    if unmatched > 0:
+        notes.append(f"work differs or is unknown on {unmatched}/{pairs} pairs")
+    if item.get("measurement_status") in ("partial", "unavailable") or item.get("complete") is False:
+        notes.extend(f"{label} {side.get('valid_requests', 0)}/{side.get('requests', 0)} timed"
+                     for label, side in (("Native", item.get("reference") or {}),
+                                         ("TRTMC", item.get("candidate") or {})))
+    return "; ".join(notes)
+
+
+def _perf_text(profile: str, items: Sequence[Mapping[str, Any]]) -> str:
+    return "; ".join(f"{request_label(profile, item)}: TRTMC {ms((item.get('candidate') or {}).get('p50_ms'))} · "
+                     f"native {ms((item.get('reference') or {}).get('p50_ms'))}"
+                     + (" per audio second" if (item.get("candidate") or {}).get("unit") else "")
+                     + (f" ({note})" if (note := measurement_note(item)) else "") for item in items)
+
+
+# The owner's four results, worst first: White, no valid comparison (no verdict: an error or a failed build; or the
+# comparison does not apply: a Task without an Acc check, historical fixed timings that
+# cannot be compared); Red, Acc or Perf worse than the native model beyond its margin; Yellow, Perf about equal
+# (counts as a pass) or an Acc difference not shown either way; Green, a pass.
+SIGNALS = ("white", "red", "yellow", "green")
+SIGNAL_NAMES = {"white": "White", "red": "Red", "yellow": "Yellow", "green": "Green"}
+NO_VERDICT = {"error", "config-error", "build-failed", "not-run", "excluded", "smoke-fail"}
+NOT_COMPARED = {"not-comparable", "not-covered"}
+
+
+def reported_perf(row: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Quality-dataset timings for new runs; original fixed gates for historical reports."""
+    datasets = [item for item in row.get("perf", []) if item.get("kind") == "natural_dataset"]
+    if row.get("performance_source") == "quality":
+        return datasets
+    return [item for item in row.get("perf", []) if "near-capacity" not in str(item.get("request") or "")
+            and item.get("reference_mode", QUALIFYING_MODE) == QUALIFYING_MODE and item.get("gate", True)]
+
+
+def request_label(profile: str, item: Mapping[str, Any]) -> str:
+    """A timed request named without its model (``catalog``, ``catalog-en``)."""
+    name = str(item.get("request") or item.get("reference_mode") or "")
+    name = name[len(profile) + 1:] if name.startswith(profile + "-") else name
+    stem, separator, preset_count = name.rpartition("-")
+    mine, theirs = item.get("candidate") or {}, item.get("reference") or {}
+    count = mine.get("requests")
+    if (item.get("kind") == "natural_dataset" and separator and preset_count.isdecimal()
+            and count is not None and count == theirs.get("requests") and count != int(preset_count)):
+        return f"{stem} ({count} requests)"
+    return name
+
+
+def _judged(row: Mapping[str, Any], status: str) -> list[Mapping[str, Any]]:
+    return [item for item in row.get("accuracy", []) if item.get("status") == status and not item.get("informational")]
+
+
+def signal(row: Mapping[str, Any]) -> str:
+    """The row's result among ``SIGNALS``."""
+    category = row["category"]
+    if category in NO_VERDICT:
+        return "white"
+    perf = reported_perf(row)
+    lights = [item.get("light") for item in perf]
+    if category == "acc-issue" or _judged(row, "fail") or "red" in lights:
+        return "red"
+    if category in NOT_COMPARED or "white" in lights or (category == "perf-inconclusive" and not perf):
+        return "white"
+    if category == "acc-inconclusive" or "yellow" in lights:
+        return "yellow"
+    return "green"
+
+
+def is_pass(row: Mapping[str, Any]) -> bool:
+    """An inconclusive accuracy test is a Yellow result, not an accepted conversion."""
+    return (signal(row) in ("green", "yellow") and row["category"] != "acc-inconclusive"
+            and not _judged(row, "inconclusive"))
+
+
+def signal_reason(profile: str, row: Mapping[str, Any]) -> str:
+    """Why the row is not Green, in one plain sentence per benchmark or request."""
+    result, perf = signal(row), reported_perf(row)
+    if result == "green":
+        return plain(row.get("notes", ""))[:300]
+    if row["category"] in NO_VERDICT:
+        errors = [str(item.get("error") or "; ".join(item.get("reasons", []))) for item in _judged(row, "error")]
+        return plain(next((text for text in [row.get("notes", ""), *errors] if text), row["category"]))[:300]
+    parts: list[str] = []
+    if result == "red":
+        for item in _judged(row, "fail"):
+            why = ("TRTMC worse than native beyond the margin" if "trtmc_score" in (item.get("metrics") or {})
+                   else "; ".join(item.get("reasons", [])) or "failed")
+            parts.append(f"{item['suite']}: {why}" + "".join(f" ({plain(note)})" for note in item.get("notes", [])))
+        parts += [f"{request_label(profile, item)}: TRTMC slower than native" for item in perf if item.get("light") == "red"]
+    elif result == "white":
+        parts += [f"{item['suite']}: {plain('; '.join(item.get('reasons', [])))}"
+                  for status in ("not-comparable", "not-covered") for item in _judged(row, status)]
+        parts += [f"{request_label(profile, item)}: timings not comparable ({plain((item.get('reasons') or [''])[0])})"
+                  for item in perf if item.get("light") == "white"]
+    else:
+        parts += [f"{item['suite']}: difference not shown either way" for item in _judged(row, "inconclusive")]
+        parts += [f"{request_label(profile, item)}: TRTMC about equal to native" for item in perf
+                  if item.get("light") == "yellow"]
+    notes = plain(row.get("notes", ""))  # coverage, a regression against a baseline
+    return "; ".join(part for part in [*parts, notes] if part)[:400] or row["category"]
+
+
+def run_context(roots: Sequence[Path]) -> str:
+    """Which run the roots hold: each root's host, the assignment and campaign inputs it ran under (``plan.json``),
+    and when its first and last results started."""
+    import datetime
+    import hashlib
+
+    def day(stamp: float) -> str:
+        return datetime.datetime.fromtimestamp(stamp, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    parts = []
+    for root in roots:
+        plan = json.loads((root / PLAN).read_text()) if (root / PLAN).is_file() else {}
+        times = [row["time"] for row in (_row(path) for path in root.iterdir() if path.is_dir()) if row]
+        inputs = plan.get("inputs")
+        digest = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()[:12] if inputs else ""
+        parts.append(f"{root.name}: host {plan.get('host') or '-'}"
+                     + (f", assignment {str(plan['assignment'])[:12]}" if plan.get("assignment") else "")
+                     + (f", campaign inputs {digest}" if digest else "")
+                     + (f", {day(min(times))} to {day(max(times))}" if times else ""))
+    return " · ".join(parts)
 
 
 def collect(roots: Sequence[Path]) -> tuple[dict[str, dict[str, Any]], collections.Counter, dict[str, int]]:
-    """The latest result of every planned or reported profile under the given roots; profiles a
-    root's model list excluded are listed unless another root holds a result for them."""
+    """Latest results of configured profiles. Exclusions and absent Task configurations remain
+    in run metadata for coverage audit, outside result statistics; real results still count."""
     rows = {}
     for root in roots:
-        path = root / EXCLUSIONS
-        for item in json.loads(path.read_text()) if path.is_file() else []:
-            rows[item["profile"]] = {"task": item.get("task"), "category": "excluded", "accuracy": [], "perf": [],
-                                     "backend": "", "notes": item.get("reason", ""), "root": root.name}
         plan = json.loads((root / PLAN).read_text()) if (root / PLAN).is_file() else {}
         for name in plan.get("selected", []):
             rows.setdefault(name, {"task": None, "category": "not-run", "accuracy": [], "perf": [], "backend": "",
@@ -355,6 +511,9 @@ def collect(roots: Sequence[Path]) -> tuple[dict[str, dict[str, Any]], collectio
             row = _row(directory)
             if row and row["time"] >= rows.get(directory.name, {}).get("time", float("-inf")):
                 rows[directory.name] = {**row, "root": root.name}  # the latest run of a profile wins
+    rows = {profile: row for profile, row in rows.items()
+            if row["category"] != "excluded" and not (
+                row["category"] == "config-error" and str(row.get("notes", "")).startswith("no Task defaults"))}
     counts = collections.Counter(row["category"] for row in rows.values())
     ordered = [*CATEGORIES, *sorted(set(counts) - set(CATEGORIES))]
     return rows, counts, {category: position for position, category in enumerate(ordered)}
@@ -386,27 +545,42 @@ def summary(roots: Sequence[Path], baseline: Sequence[Path] = ()) -> tuple[str, 
     rows, counts, rank = collect(roots)
     if baseline:
         annotate_regressions(rows, collect(baseline)[0])
-    shown = sorted(counts, key=rank.get)
+    results = collections.Counter(signal(row) for row in rows.values())
     by_task: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
     for row in rows.values():
-        by_task[row["task"] or "-"][row["category"]] += 1
-    lines = ["# TRTMC vs native qualification", "", f"{len(rows)} models from {', '.join(r.name for r in roots)}.",
-             "", "| category | models |", "|---|---|", *(f"| {c} | {counts[c]} |" for c in shown),
-             "", "## By Task", "", "| Task | " + " | ".join(shown) + " |", "|---|" + "---|" * len(shown),
-             *(f"| {task} | " + " | ".join(str(by_task[task].get(c) or "") for c in shown) + " |"
+        by_task[row["task"] or "-"][signal(row)] += 1
+    names = [SIGNAL_NAMES[result] for result in SIGNALS]
+    lines = ["# TRTMC vs native qualification", "", f"{len(rows)} models from {', '.join(r.name for r in roots)}: "
+             f"{sum(is_pass(row) for row in rows.values())} pass (Green + conclusive Yellow).", "",
+             "Green: pass. Yellow: Perf about equal to native (counts as a pass) or an Acc difference not shown either "
+             "way; inconclusive Acc does not count as a pass. Red: Acc or Perf worse than native beyond its margin. White: no valid comparison (an error or a "
+             "failed build, or the comparison does not apply).", "",
+             "| result | models |", "|---|---|", *(f"| {SIGNAL_NAMES[r]} | {results[r]} |" for r in SIGNALS),
+             "", "## By Task", "", "| Task | " + " | ".join(names) + " |", "|---|" + "---|" * len(names),
+             *(f"| {task} | " + " | ".join(str(by_task[task].get(r) or "") for r in SIGNALS) + " |"
                for task in sorted(by_task)),
-             "", "## Per model", "", "| model | Task | root | category | Acc | Perf L1 (speedup vs native) | "
-             "reference | notes |", "|---|---|---|---|---|---|---|---|"]
-    for profile in sorted(rows, key=lambda p: (rank[rows[p]["category"]], rows[p]["task"] or "", p)):
+             "", "## Per model", "", "| result | model | Task | host | Acc (TRTMC · native) | Perf p50 (TRTMC · native) | "
+             "reason |", "|---|---|---|---|---|---|---|"]
+    for profile in sorted(rows, key=lambda p: (SIGNALS.index(signal(rows[p])), rows[p]["task"] or "", p)):
         row = rows[profile]
-        notes = row["notes"].replace("|", "/").replace("\n", " ")
-        lines.append(f"| {profile} | {row['task'] or '-'} | {row['root']} | {row['category']} | "
-                     f"{_accuracy_text(row['accuracy'])} | {_perf_text(row['perf'])} | {row['backend']} | {notes} |")
+        reason = signal_reason(profile, row).replace("|", "/").replace("\n", " ")
+        lines.append(f"| {SIGNAL_NAMES[signal(row)]} | {profile} | {row['task'] or '-'} | {row['root']} | "
+                     f"{_accuracy_text(row['accuracy'])} | {_perf_text(profile, reported_perf(row))} | {reason} |")
+    native = {profile: row["aiperf_metrics"] for profile, row in rows.items() if row.get("aiperf_metrics")}
+    if native:
+        from . import aiperf_metrics
+
+        lines += ["", "## AIPerf native client metrics (informational; no gate)", "", aiperf_metrics.NOTE]
+        for profile, items in sorted(native.items()):
+            lines += ["", f"### {profile}", "", *aiperf_metrics.markdown(items, profile,
+                                                                        (rows[profile].get("precision") or {}).get("native"), level=4)]
     return "\n".join(lines) + "\n", counts
 
 
 REMOTE_ROOT = re.compile(r"^(?:(?P<name>[\w.-]+)=)?(?P<host>[\w.@-]+):(?P<path>/.*)$")
-RESULT_FILES = ("report.json", "build.json", "error.json", EXCLUSIONS, PLAN)
+RESULT_FILES = ("report.json", "model.json", "build.json", "retention.json", "execution.jsonl",
+                "execution.timing-recovered.jsonl", "execution.aligned.jsonl", "execution.rechecked.jsonl",
+                "error.json", EXCLUSIONS, PLAN)
 EVIDENCE_FILES = ("report.md", "phase-errors.log", "build.log", "error.log", "server.log", "result.json")
 MAX_EVIDENCE_BYTES = "5M"
 

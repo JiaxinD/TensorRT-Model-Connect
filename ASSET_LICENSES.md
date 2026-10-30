@@ -41,6 +41,10 @@ distributed under the Apache License 2.0 with the rest of the project:
 
 - `families/deepseek_ocr/tests/data/orc_test_img.jpeg` — screenshot of
   project source text created for OCR regression testing
+- `families/phi4_multimodal/tests/data/dynamic-hd/synthetic-*.png` (7 images) —
+  synthetic test patterns written by the checked-in
+  `families/phi4_multimodal/tests/data/dynamic-hd/generate.py` for Dynamic-HD
+  preprocessing goldens
 
 ## Project overview media
 
@@ -168,6 +172,27 @@ revision, episode, frame, and tensor shapes.
 - `observation.images.top.png`: decoded RGB frame
 - `observation.state.f32`: little-endian float32 joint state
 - `recorded_observation.json`: source and shape metadata
+
+## LeRobot Pi 0.5 recorded-observation fixtures
+
+The files below `families/lerobot_pi05/tests/data/` are three recorded LIBERO
+observations from three different tasks, the outputs of the pinned LeRobot `pi05`
+policy for them, and LeRobot's prompt token ids for a set of test instructions.
+`recorded_observation/ep*_f*/` hold a lossless PNG re-encoding of the `image` and
+`wrist_image` columns and the exact `state` row and task text of episode 0 frame 0,
+episode 379 frame 60 and episode 807 frame 70 in `physical-intelligence/libero`
+revision `a4336d589d589045d1c56423ffdf3b88a0e19b1f`. That dataset is distributed
+under CC-BY-4.0. Each `observation.json` records the source. `noise_seed0.f32` is a
+`torch.randn` draw, `reference/*.f32` are LeRobot `lerobot[pi]==0.6.1` outputs, and
+`tokenizer_golden.json` holds instructions written for this test with the token ids
+LeRobot's preprocessor produced for them; none of these contains third-party content.
+
+- Dataset: https://huggingface.co/datasets/physical-intelligence/libero/tree/a4336d589d589045d1c56423ffdf3b88a0e19b1f
+- `recorded_observation/ep*_f*/image.png`, `wrist_image.png`: decoded RGB frames
+- `recorded_observation/ep*_f*/observation.json`: state, task and source
+- `noise_seed0.f32`: little-endian float32 flow noise, 50 x 32
+- `reference/ep*_f*.{fp32,bf16}.f32`: little-endian float32 actions, 50 x 7
+- `tokenizer_golden.json`: test instructions, states and expected token ids
 
 ## FoundationPose external model artifacts
 

@@ -3,7 +3,7 @@
 """World-model video parity (``world_model_parity``): both sides render each input with the same seed; every
 TRTMC video must have the native frame count, move (mean change between frames at least MIN_MOTION_RATIO of
 the native video's), and agree coarsely with the native video (PSNR and SSIM over sampled frames at least the
-check's floors). Action-conditional fidelity is not covered (DESIGN.md Section 6)."""
+check's floors). Action-conditional fidelity is not covered."""
 
 from __future__ import annotations
 
@@ -42,8 +42,9 @@ def run(environment: Environment, model: dict[str, Any], check: Mapping[str, Any
     from .models import model_suite
 
     suite = build_suite(model_suite(check["suite"], model), environment)
-    native, _, _ = generate_native(environment, model, suite, python, out, "world-model")
-    candidate = generate(environment, model, "trtmc", out / "world-model-candidate", suite)
+    reuse = bool(check.get("reuse_outputs"))
+    native, _, _ = generate_native(environment, model, suite, python, out, "world-model", reuse=reuse)
+    candidate = generate(environment, model, "trtmc", out / "world-model-candidate", suite, reuse=reuse)
     items = [(str(mine[0]), str(theirs[0])) for mine, theirs in zip(candidate, native)]
     completed = subprocess.run([str(environment["serve_python"]), "-c", SCRIPT, json.dumps(items), str(SAMPLED_FRAMES)],
                                capture_output=True, text=True, timeout=7200, env=_serve_env(environment))
